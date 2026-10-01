@@ -39,9 +39,27 @@ govflow execute --state ./treasury.json --id gip-7 --now 5001
 govflow balances --state ./treasury.json
 govflow balances --state ./treasury.json --account audits
 
-# 查询提案状态
+# 查询提案状态（register 与投票两种来源都可查询）
 govflow proposal  --state ./treasury.json --id gip-7
 govflow proposals --state ./treasury.json
+
+# 创建投票提案：成员名单与权重、可选委托、法定人数、投票窗口、时间锁与有序动作
+govflow create-vote --state ./treasury.json --id gip-8 \
+  --member alice:300 --member bob:200 --member carol:100 --member dave:400 \
+  --delegate bob:alice --delegate carol:alice \
+  --quorum 600 --start 100 --deadline 200 --timelock 300 \
+  --action transfer:audits:100
+
+# 按提案编号投票（时间由调用方通过 --now 提供）
+# 只有最终代表本人可投票；bob、carol 已委托给 alice，由 alice 代表其权重
+govflow vote  --state ./treasury.json --id gip-8 --voter alice  --choice for     --now 150
+govflow vote  --state ./treasury.json --id gip-8 --voter dave   --choice against --now 150
+
+# 截止时刻或之后计票；再次计票返回首次结论
+govflow tally --state ./treasury.json --id gip-8 --now 200
+
+# 通过后的提案直接交给 execute 执行，无须再 register；被拒绝的提案不能执行
+govflow execute --state ./treasury.json --id gip-8 --now 300
 
 # 查询执行凭据（按成功提交先后顺序）
 govflow receipt  --state ./treasury.json --id gip-7
@@ -61,6 +79,29 @@ govflow execute --state ./treasury.json --id gip-7 --now 5001 --json
 - 整项提案先完整预演再一次性提交：编号不存在、时间未到、状态不符、动作格式错误、
   余额不足或金额计算溢出都返回明确原因，不产生部分转账，失败不消耗执行机会。
 
+### 投票提案
+
+- 编号与成员编号必须非空，成员不得重复；权重为正整数；权重、法定人数与全部时间
+  均限定在有符号 64 位整数范围内，成员总权重不得溢出；法定人数在 1 至总权重之间；
+  时间满足 `0 <= 开始 < 截止 <= 时间锁`。任一非法条件整项拒绝，不落盘部分内容。
+- 成员与委托的输入次序不影响相等性比较，动作仍按原文及顺序比较。同编号、全部内容
+  相同的创建重试返回已有提案且不改变状态；内容不同报冲突。创建后规则与内容不可修改。
+- 每人最多委托一名名单内成员，委托可继续转交；自委托、重复指定与循环一律拒绝。
+  最终未再委托的人代表沿途全部成员投票，未委托者代表自己。查询展示每名成员的
+  委托路径、最终代表与原始权重。
+- 只有最终代表可以投赞成或反对：每位代表一张票，票重等于归到其名下的全部原始权重。
+  首次投票只接受 `开始 <= now < 截止`；不在名单或已委托出去的人投票报明确错误。
+  同一代表相同选择的重试始终返回首次记录；改投另一选择报冲突，不静默覆盖。
+- 首次计票必须在截止时刻或之后，否则报“时间未到”且状态不变；未投权重不计入参与量。
+  赞成与反对权重之和达到法定人数且赞成严格多于反对才通过；平票或参与不足均拒绝。
+  计票只确定状态，不转账；再次计票返回首次结论；计票后拒绝新票，即使传入窗口内时间。
+- 通过后的提案直接由 `execute` 执行，无须再登记；被拒绝的提案不能执行，
+  已执行提案不退回通过。`register` 与投票提案共用编号：任何一方都不能覆盖另一方
+  或绕过投票结论。
+- 查询（文本与 `--json`）展示逐票代表、票重、选择、首次投票时间，以及汇总权重与
+  首次计票时间。创建、投票、计票在多线程/多进程并发及重开后保持一致：成功重试不
+  追加记录，失败不留部分变化。
+
 ### 幂等性与并发
 
 - 一项提案只允许成功一次。再次执行即使传入不同时间，也返回首次成功凭据，
@@ -74,8 +115,10 @@ govflow execute --state ./treasury.json --id gip-7 --now 5001 --json
 
 - 保存失败保留上次完整状态；执行中进程退出，重开只能看到执行前或执行后的完整状态。
 - 已保存成功但尚未返回就退出，重试仍取得原凭据。
-- 状态文件损坏（截断、非法 JSON、未知字段、重复键、余额与凭据重放不一致等）
+- 状态文件损坏（截断、非法 JSON、未知字段、重复键、余额与凭据重放不一致、
+  投票票据的票重/代表与名单及委托明细不一致、计票结论与票据重放不一致等）
   一律拒绝打开，不会重建或覆盖原文件；对损坏文件执行 init 同样被拒绝。
+  旧版本写出的、不含投票提案字段的状态文件继续可读；旧提案不补造投票记录。
 - 提交采用临时文件、fsync、原子改名加目录 fsync；不同状态文件的资金与执行记录互不影响。
 
 ## 技术方向

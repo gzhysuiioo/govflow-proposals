@@ -78,13 +78,14 @@ type storedProposal struct {
 }
 
 type storedState struct {
-	Magic           string                     `json:"magic"`
-	Version         int                        `json:"version"`
-	InitialTreasury int64                      `json:"initial_treasury"`
-	Treasury        int64                      `json:"treasury"`
-	Balances        map[string]int64           `json:"balances"`
-	Proposals       map[string]*storedProposal `json:"proposals"`
-	Receipts        []*Receipt                 `json:"receipts"`
+	Magic           string                         `json:"magic"`
+	Version         int                            `json:"version"`
+	InitialTreasury int64                          `json:"initial_treasury"`
+	Treasury        int64                          `json:"treasury"`
+	Balances        map[string]int64               `json:"balances"`
+	Proposals       map[string]*storedProposal     `json:"proposals"`
+	Receipts        []*Receipt                     `json:"receipts"`
+	VoteProposals   map[string]*storedVoteProposal `json:"vote_proposals"`
 }
 
 // Store 是绑定到单个本地状态文件的资金库句柄。
@@ -277,6 +278,7 @@ func newStoredState(treasury int64) *storedState {
 		Balances:        map[string]int64{},
 		Proposals:       map[string]*storedProposal{},
 		Receipts:        []*Receipt{},
+		VoteProposals:   map[string]*storedVoteProposal{},
 	}
 }
 
@@ -306,6 +308,10 @@ func (s *Store) Register(id string, timelockEnd int64, actions []string) (existe
 			return true, nil
 		}
 		return false, fmt.Errorf("%w: proposal %s", ErrProposalConflict, id)
+	}
+	// 两种来源共用编号：register 不能覆盖投票提案或绕过其投票结论。
+	if vp, ok := state.VoteProposals[id]; ok {
+		return false, fmt.Errorf("%w: proposal id %s belongs to a voting proposal (state=%s)", ErrProposalConflict, id, vp.State)
 	}
 	state.Proposals[id] = &storedProposal{
 		ID:          id,
@@ -343,6 +349,46 @@ func sameActions(a, b []string) bool {
 
 // ---- 执行 ----
 
+// executionTarget 是 register 与投票两种来源提案在执行路径上的统一视图。
+type executionTarget struct {
+	state        string
+	timelockEnd  int64
+	actions      []string
+	markExecuted func()
+}
+
+// resolveExecutable 在两种提案表中按编号定位执行目标；不存在返回 nil。
+func resolveExecutable(state *storedState, id string) *executionTarget {
+	if p, ok := state.Proposals[id]; ok {
+		return &executionTarget{
+			state:        p.State,
+			timelockEnd:  p.TimelockEnd,
+			actions:      p.Actions,
+			markExecuted: func() { p.State = "executed" },
+		}
+	}
+	if vp, ok := state.VoteProposals[id]; ok {
+		return &executionTarget{
+			state:        vp.State,
+			timelockEnd:  vp.TimelockEnd,
+			actions:      vp.Actions,
+			markExecuted: func() { vp.State = "executed" },
+		}
+	}
+	return nil
+}
+
+// proposalOwners 将两个来源的提案编号映射到状态，供凭据重放交叉校验。
+func proposalOwnerState(state *storedState, id string) (string, []string, bool) {
+	if p, ok := state.Proposals[id]; ok {
+		return p.State, p.Actions, true
+	}
+	if vp, ok := state.VoteProposals[id]; ok {
+		return vp.State, vp.Actions, true
+	}
+	return "", nil, false
+}
+
 // Execute 按编号执行一项提案。调用方通过 now 提供当前时间。
 // 只有 passed 状态、now 已达到时间锁且动作非空的提案可以首次执行；
 // 成功后状态变为 executed 并返回凭据。资格不符、动作格式错误、余额不足、
@@ -359,23 +405,23 @@ func (s *Store) Execute(id string, now int64) (*Receipt, error) {
 	if err != nil {
 		return nil, err
 	}
-	proposal, ok := state.Proposals[id]
-	if !ok {
+	target := resolveExecutable(state, id)
+	if target == nil {
 		return nil, fmt.Errorf("%w: %s", ErrProposalNotFound, id)
 	}
-	if proposal.State == "executed" {
+	if target.state == "executed" {
 		if rcpt := findReceipt(state.Receipts, id); rcpt != nil {
 			return cloneReceipt(rcpt), nil
 		}
 		return nil, fmt.Errorf("%w: executed proposal %s has no receipt", ErrStateCorrupt, id)
 	}
-	if proposal.State != "passed" {
-		return nil, execReject(fmt.Sprintf("proposal %s is not passed (state=%s)", id, proposal.State))
+	if target.state != "passed" {
+		return nil, execReject(fmt.Sprintf("proposal %s is not passed (state=%s)", id, target.state))
 	}
-	if now < proposal.TimelockEnd {
-		return nil, execReject(fmt.Sprintf("timelock not reached for %s: now=%d timelock_end=%d", id, now, proposal.TimelockEnd))
+	if now < target.timelockEnd {
+		return nil, execReject(fmt.Sprintf("timelock not reached for %s: now=%d timelock_end=%d", id, now, target.timelockEnd))
 	}
-	if len(proposal.Actions) == 0 {
+	if len(target.actions) == 0 {
 		return nil, execReject(fmt.Sprintf("proposal %s has no actions", id))
 	}
 
@@ -393,8 +439,8 @@ func (s *Store) Execute(id string, now int64) (*Receipt, error) {
 	for k, v := range state.Balances {
 		simBalances[k] = v
 	}
-	steps := make([]step, 0, len(proposal.Actions))
-	for i, raw := range proposal.Actions {
+	steps := make([]step, 0, len(target.actions))
+	for i, raw := range target.actions {
 		account, amount, perr := ParseTransfer(raw)
 		if perr != nil {
 			// 双 %w：调用方既可按 ErrExecutionRejected 判定执行被拒，
@@ -432,7 +478,7 @@ func (s *Store) Execute(id string, now int64) (*Receipt, error) {
 	for i, st := range steps {
 		receipt.Actions = append(receipt.Actions, ActionReceipt{
 			Index:  i,
-			Action: proposal.Actions[i],
+			Action: target.actions[i],
 			Treasury: BalanceUpdate{
 				Account: "treasury",
 				Before:  st.treasuryBefore,
@@ -447,7 +493,7 @@ func (s *Store) Execute(id string, now int64) (*Receipt, error) {
 	}
 	state.Treasury = simTreasury
 	state.Balances = simBalances
-	proposal.State = "executed"
+	target.markExecuted()
 	state.Receipts = append(state.Receipts, receipt)
 
 	if err := s.commitLocked(state); err != nil {
@@ -694,6 +740,10 @@ func validateState(state *storedState) error {
 	if state.Receipts == nil {
 		return errors.New("receipts table is missing")
 	}
+	// VoteProposals 缺省视为空表：旧版本写出的状态文件不含投票提案，继续可读。
+	if state.VoteProposals == nil {
+		state.VoteProposals = map[string]*storedVoteProposal{}
+	}
 	for account, balance := range state.Balances {
 		if account == "" {
 			return errors.New("balance entry with empty account")
@@ -714,6 +764,9 @@ func validateState(state *storedState) error {
 		}
 		// 动作原文登记时原样保存；空串或非法原文留待执行时拒绝。
 	}
+	if err := validateVoteProposals(state); err != nil {
+		return err
+	}
 
 	// 重放凭据：从初始资金库余额出发，按成功顺序重放每笔转账，
 	// 校验凭据内的前后余额、最终资金库与各账户余额，并检查状态一致性。
@@ -731,21 +784,21 @@ func validateState(state *storedState) error {
 			return fmt.Errorf("duplicate receipt for %q at positions %d and %d", rcpt.ProposalID, prev, order)
 		}
 		seenReceipts[rcpt.ProposalID] = order
-		proposal, ok := state.Proposals[rcpt.ProposalID]
-		if !ok {
+		ownerState, ownerActions, found := proposalOwnerState(state, rcpt.ProposalID)
+		if !found {
 			return fmt.Errorf("receipt %q references an unregistered proposal", rcpt.ProposalID)
 		}
-		if proposal.State != "executed" {
-			return fmt.Errorf("proposal %q has receipt but state is %q", rcpt.ProposalID, proposal.State)
+		if ownerState != "executed" {
+			return fmt.Errorf("proposal %q has receipt but state is %q", rcpt.ProposalID, ownerState)
 		}
-		if len(rcpt.Actions) != len(proposal.Actions) {
-			return fmt.Errorf("receipt %q action count %d does not match proposal %d", rcpt.ProposalID, len(rcpt.Actions), len(proposal.Actions))
+		if len(rcpt.Actions) != len(ownerActions) {
+			return fmt.Errorf("receipt %q action count %d does not match proposal %d", rcpt.ProposalID, len(rcpt.Actions), len(ownerActions))
 		}
 		for i, ar := range rcpt.Actions {
 			if ar.Index != i {
 				return fmt.Errorf("receipt %q action %d has index %d", rcpt.ProposalID, i, ar.Index)
 			}
-			if ar.Action != proposal.Actions[i] {
+			if ar.Action != ownerActions[i] {
 				return fmt.Errorf("receipt %q action %d text does not match registered action", rcpt.ProposalID, i)
 			}
 			account, amount, err := ParseTransfer(ar.Action)
@@ -786,6 +839,12 @@ func validateState(state *storedState) error {
 		_, hasReceipt := seenReceipts[p.ID]
 		if p.State == "executed" && !hasReceipt {
 			return fmt.Errorf("proposal %q is executed without receipt", p.ID)
+		}
+	}
+	for _, p := range state.VoteProposals {
+		_, hasReceipt := seenReceipts[p.ID]
+		if p.State == "executed" && !hasReceipt {
+			return fmt.Errorf("voting proposal %q is executed without receipt", p.ID)
 		}
 	}
 	return nil

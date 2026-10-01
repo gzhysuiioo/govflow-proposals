@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -230,7 +231,178 @@ func TestCrossProcessCrashConsistency(t *testing.T) {
 	}
 }
 
-// TestStateFileDoesNotLeakLockArtifacts：锁文件与状态文件分离，
+// TestCrossProcessVotingLifecycle：通过 CLI 跨进程完成创建→委托投票→计票→执行，
+// 并验证重复创建/投票/计票的幂等与冲突语义。
+func TestCrossProcessVotingLifecycle(t *testing.T) {
+	binary := buildCLI(t)
+	state := filepath.Join(t.TempDir(), "treasury.json")
+	if _, _, code := runCLI(t, binary, state, "init", "--balance", "1000"); code != 0 {
+		t.Fatal("init failed")
+	}
+	create := []string{"create-vote", "--id", "gip-vote-1",
+		"--member", "alice:300", "--member", "bob:200", "--member", "carol:100", "--member", "dave:400",
+		"--delegate", "bob:alice", "--delegate", "carol:alice",
+		"--quorum", "600", "--start", "100", "--deadline", "200", "--timelock", "300",
+		"--action", "transfer:audits:100"}
+	if _, se, code := runCLI(t, binary, state, create...); code != 0 {
+		t.Fatalf("create-vote failed: %s", se)
+	}
+	// 成员与委托换序的完全相同重试：成功且不改动状态。
+	retry := []string{"create-vote", "--id", "gip-vote-1",
+		"--member", "dave:400", "--member", "carol:100", "--member", "bob:200", "--member", "alice:300",
+		"--delegate", "carol:alice", "--delegate", "bob:alice",
+		"--quorum", "600", "--start", "100", "--deadline", "200", "--timelock", "300",
+		"--action", "transfer:audits:100"}
+	if _, se, code := runCLI(t, binary, state, retry...); code != 0 {
+		t.Fatalf("identical create retry should succeed: %s", se)
+	}
+	// 内容不同的重试冲突（多一个动作，动作按原文及顺序比较）。
+	conflict := append(append([]string{}, create...), "--action", "transfer:legal:1")
+	if _, _, code := runCLI(t, binary, state, conflict...); code != 1 {
+		t.Fatalf("conflicting create should exit 1, got %d", code)
+	}
+	// register 不能占用投票提案编号。
+	if _, se, code := runCLI(t, binary, state, "register", "--id", "gip-vote-1",
+		"--timelock", "300", "--action", "transfer:audits:100"); code != 1 {
+		t.Fatalf("register over voting id should fail: %s", se)
+	}
+
+	// 委托出去的成员投票被拒；非名单成员被拒。
+	if _, se, code := runCLI(t, binary, state, "vote", "--id", "gip-vote-1",
+		"--voter", "bob", "--choice", "for", "--now", "150"); code != 1 || !strings.Contains(se, "delegated") {
+		t.Fatalf("delegated member vote code=%d: %s", code, se)
+	}
+	if _, se, code := runCLI(t, binary, state, "vote", "--id", "gip-vote-1",
+		"--voter", "ghost", "--choice", "for", "--now", "150"); code != 1 || !strings.Contains(se, "not on the member roster") {
+		t.Fatalf("non-member vote code=%d: %s", code, se)
+	}
+
+	// 代表 alice（归集 600）赞成；相同选择跨进程重试返回首次时间。
+	if so, se, code := runCLI(t, binary, state, "vote", "--id", "gip-vote-1",
+		"--voter", "alice", "--choice", "for", "--now", "120", "--json"); code != 0 ||
+		!strings.Contains(so, `"weight": 600`) {
+		t.Fatalf("alice vote code=%d so=%s se=%s", code, so, se)
+	}
+	if so, _, code := runCLI(t, binary, state, "vote", "--id", "gip-vote-1",
+		"--voter", "alice", "--choice", "for", "--now", "180", "--json"); code != 0 ||
+		!strings.Contains(so, `"voted_at": 120`) {
+		t.Fatalf("identical vote retry must return first record: %s", so)
+	}
+	// 改投冲突。
+	if _, se, code := runCLI(t, binary, state, "vote", "--id", "gip-vote-1",
+		"--voter", "alice", "--choice", "against", "--now", "120"); code != 1 ||
+		!strings.Contains(se, "changing the vote") {
+		t.Fatalf("change vote code=%d: %s", code, se)
+	}
+
+	// 截止前计票拒绝。
+	if _, se, code := runCLI(t, binary, state, "tally", "--id", "gip-vote-1", "--now", "199"); code != 1 ||
+		!strings.Contains(se, "still open") {
+		t.Fatalf("early tally code=%d: %s", code, se)
+	}
+	// 截止时刻计票：600 赞成、0 反对、达到法定人数 => passed。
+	if so, se, code := runCLI(t, binary, state, "tally", "--id", "gip-vote-1",
+		"--now", "200", "--json"); code != 0 || !strings.Contains(so, `"passed": true`) {
+		t.Fatalf("tally code=%d so=%s se=%s", code, so, se)
+	}
+	// 计票后窗口内新票也拒绝。
+	if _, se, code := runCLI(t, binary, state, "vote", "--id", "gip-vote-1",
+		"--voter", "dave", "--choice", "against", "--now", "150"); code != 1 ||
+		!strings.Contains(se, "already been tallied") {
+		t.Fatalf("post-tally vote code=%d: %s", code, se)
+	}
+	// 再次计票返回首次时间。
+	if so, _, code := runCLI(t, binary, state, "tally", "--id", "gip-vote-1",
+		"--now", "999", "--json"); code != 0 || !strings.Contains(so, `"tallied_at": 200`) {
+		t.Fatalf("repeat tally: %s", so)
+	}
+
+	// 通过后直接由 execute 执行，无需再登记；时间锁未到拒绝。
+	if _, _, code := runCLI(t, binary, state, "execute", "--id", "gip-vote-1", "--now", "299"); code != 1 {
+		t.Fatalf("execute before timelock should fail")
+	}
+	if _, _, code := runCLI(t, binary, state, "execute", "--id", "gip-vote-1", "--now", "300"); code != 0 {
+		t.Fatalf("execute voted proposal failed")
+	}
+	if so, _, _ := runCLI(t, binary, state, "balances", "--json"); !strings.Contains(so, `"treasury": 900`) ||
+		!strings.Contains(so, `"audits": 100`) {
+		t.Fatalf("balances after voted execution:\n%s", so)
+	}
+	// 已执行提案不退回通过：再次执行返回首次凭据。
+	if so, _, _ := runCLI(t, binary, state, "execute", "--id", "gip-vote-1",
+		"--now", "9999", "--json"); !strings.Contains(so, `"executed_at": 300`) {
+		t.Fatalf("re-execute should return first receipt: %s", so)
+	}
+	// 查询包含逐票明细、委托路径与已执行状态。
+	so, _, _ := runCLI(t, binary, state, "proposal", "--id", "gip-vote-1", "--json")
+	if !strings.Contains(so, `"state": "executed"`) ||
+		!strings.Contains(so, `"representative": "alice"`) ||
+		!pathJSONRe.MatchString(so) {
+		t.Fatalf("proposal query missing delegation path/ballot/state:\n%s", so)
+	}
+}
+
+var pathJSONRe = regexp.MustCompile(`"path": \[\s+"bob",\s+"alice"\s+\]`)
+
+// TestCrossProcessConcurrentTally：多进程同时计票，结论只产生一次且不追加任何记录。
+func TestCrossProcessConcurrentTally(t *testing.T) {
+	binary := buildCLI(t)
+	state := filepath.Join(t.TempDir(), "treasury.json")
+	if _, _, code := runCLI(t, binary, state, "init", "--balance", "1000"); code != 0 {
+		t.Fatal("init failed")
+	}
+	if _, _, code := runCLI(t, binary, state, "create-vote", "--id", "gip-c",
+		"--member", "a:600", "--member", "b:400",
+		"--quorum", "600", "--start", "0", "--deadline", "10", "--timelock", "10",
+		"--action", "transfer:x:1"); code != 0 {
+		t.Fatal("create failed")
+	}
+	if _, _, code := runCLI(t, binary, state, "vote", "--id", "gip-c",
+		"--voter", "a", "--choice", "for", "--now", "5"); code != 0 {
+		t.Fatal("vote failed")
+	}
+	const n = 16
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	outputs := make([]string, n)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			so, _, _ := runCLI(t, binary, state, "tally", "--id", "gip-c",
+				"--now", strconv.Itoa(10+i), "--json")
+			outputs[i] = so
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+	// 首个抢到锁的进程完成首次计票（其 now 未必最小）；其余进程必须拿到同一结论。
+	var winner string
+	for i, out := range outputs {
+		if !strings.Contains(out, `"passed": true`) {
+			t.Fatalf("tally %d diverged or failed: %s", i, out)
+		}
+		m := tallyTimeRe.FindStringSubmatch(out)
+		if m == nil {
+			t.Fatalf("tally %d missing tallied_at: %s", i, out)
+		}
+		if winner == "" {
+			winner = m[1]
+		} else if m[1] != winner {
+			t.Fatalf("tally %d tallied_at=%s, want first result %s", i, m[1], winner)
+		}
+	}
+	so, _, _ := runCLI(t, binary, state, "proposal", "--id", "gip-c", "--json")
+	if strings.Count(so, `"voted_at"`) != 1 {
+		t.Fatalf("ballot records changed under concurrent tally:\n%s", so)
+	}
+}
+
+var tallyTimeRe = mustRegexp(`"tallied_at": (\d+)`)
+
+func mustRegexp(pattern string) *regexp.Regexp { return regexp.MustCompile(pattern) }
+
 // 删除句柄后状态文件仍是完整 JSON 且可再次打开。
 func TestReopenAfterClose(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "treasury.json")

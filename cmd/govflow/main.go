@@ -9,11 +9,12 @@ import (
 	"os"
 	"sort"
 	"strconv"
+	"strings"
 
 	"github.com/gzhysuiioo/govflow-proposals/govflow"
 )
 
-const versionText = "govflow 0.1.0"
+const versionText = "govflow 0.2.0"
 
 func main() {
 	command := "demo"
@@ -32,6 +33,12 @@ func main() {
 		runInit(args)
 	case "register":
 		runRegister(args)
+	case "create-vote":
+		runCreateVote(args)
+	case "vote":
+		runVote(args)
+	case "tally":
+		runTally(args)
 	case "execute":
 		runExecute(args)
 	case "balances":
@@ -63,8 +70,20 @@ local treasury commands:
              create a new state file with the initial treasury balance
   register   --state FILE --id ID --timelock N --action A [--action A ...]
              register a passed proposal (idempotent; conflicting content errors)
+  create-vote --state FILE --id ID --member ID:W [--member ID:W ...]
+             [--delegate FROM:TO ...] --quorum N --start N --deadline N
+             --timelock N [--action A ...]
+             create a voting proposal with roster, weights, delegations and a
+             voting window (idempotent on identical content; conflict otherwise)
+  vote       --state FILE --id ID --voter M --choice for|against --now N
+             cast one ballot as a final representative (repeat same choice is
+             idempotent; changing choice errors)
+  tally      --state FILE --id ID --now N
+             tally a proposal at/after its deadline; repeat calls return the
+             first result
   execute    --state FILE --id ID --now N
              execute a passed proposal whose timelock has elapsed
+             (works for both registered and voted proposals)
   balances   --state FILE [--account ACCT]
              show treasury and recipient account balances
   proposal   --state FILE --id ID
@@ -195,6 +214,182 @@ func runRegister(args []string) {
 	}
 }
 
+// memberList 收集重复的 --member ID:WEIGHT 参数，保持提交顺序。
+type memberList []govflow.VoteMember
+
+func (m *memberList) String() string { return fmt.Sprint([]govflow.VoteMember(*m)) }
+func (m *memberList) Set(v string) error {
+	id, weight, err := splitMember(v)
+	if err != nil {
+		return err
+	}
+	*m = append(*m, govflow.VoteMember{ID: id, Weight: weight})
+	return nil
+}
+
+func splitMember(raw string) (string, int64, error) {
+	idx := strings.LastIndex(raw, ":")
+	if idx <= 0 || idx == len(raw)-1 {
+		return "", 0, fmt.Errorf("malformed member %q, expected ID:WEIGHT", raw)
+	}
+	id := raw[:idx]
+	weight, err := strconv.ParseInt(raw[idx+1:], 10, 64)
+	if err != nil {
+		return "", 0, fmt.Errorf("malformed member %q: weight must be int64: %v", raw, err)
+	}
+	return id, weight, nil
+}
+
+// delegationList 收集重复的 --delegate FROM:TO 参数，保持提交顺序。
+type delegationList []govflow.Delegation
+
+func (d *delegationList) String() string { return fmt.Sprint([]govflow.Delegation(*d)) }
+func (d *delegationList) Set(v string) error {
+	from, to, ok := strings.Cut(v, ":")
+	if !ok || from == "" || to == "" {
+		return fmt.Errorf("malformed delegation %q, expected FROM:TO", v)
+	}
+	*d = append(*d, govflow.Delegation{From: from, To: to})
+	return nil
+}
+
+func runCreateVote(args []string) {
+	cf := newCmdFlags("create-vote")
+	id := cf.fs.String("id", "", "proposal id (non-empty)")
+	var members memberList
+	cf.fs.Var(&members, "member", "member ID:WEIGHT with positive int64 weight (repeatable, order irrelevant to equality)")
+	var delegations delegationList
+	cf.fs.Var(&delegations, "delegate", "delegation FROM:TO (repeatable, order irrelevant to equality)")
+	quorumRaw := cf.fs.String("quorum", "", "required turnout weight between 1 and total member weight")
+	startRaw := cf.fs.String("start", "", "voting start timestamp (int64, >= 0)")
+	deadlineRaw := cf.fs.String("deadline", "", "voting deadline timestamp (int64, > start)")
+	timelockRaw := cf.fs.String("timelock", "", "timelock end timestamp (int64, >= deadline)")
+	var actions actionList
+	cf.fs.Var(&actions, "action", "action text transfer:<account>:<amount> (repeatable, order preserved)")
+	cf.parse(args)
+	if *id == "" {
+		fmt.Fprintf(os.Stderr, "usage error: --id is required\n")
+		os.Exit(2)
+	}
+	quorum := parseIntFlag(cf.fs, "quorum", *quorumRaw)
+	start := parseIntFlag(cf.fs, "start", *startRaw)
+	deadline := parseIntFlag(cf.fs, "deadline", *deadlineRaw)
+	timelock := parseIntFlag(cf.fs, "timelock", *timelockRaw)
+	if len(members) == 0 {
+		fmt.Fprintf(os.Stderr, "usage error: at least one --member ID:WEIGHT is required\n")
+		os.Exit(2)
+	}
+
+	store, err := govflow.Open(cf.state)
+	if err != nil {
+		fail(err)
+	}
+	defer store.Close()
+	in := &govflow.CreateVoteInput{
+		ID:          *id,
+		Members:     []govflow.VoteMember(members),
+		Delegations: []govflow.Delegation(delegations),
+		Quorum:      quorum,
+		StartAt:     start,
+		Deadline:    deadline,
+		TimelockEnd: timelock,
+		Actions:     []string(actions),
+	}
+	view, existed, err := store.CreateVoteProposal(in)
+	if err != nil {
+		fail(err)
+	}
+	if cf.asJSON {
+		emitJSON(map[string]any{"proposal": view, "already_exists": existed})
+		return
+	}
+	if existed {
+		fmt.Printf("voting proposal %s already exists with identical content (state=%s)\n", view.ID, view.State)
+	} else {
+		fmt.Printf("created voting proposal %s: %d member(s), total_weight=%d, quorum=%d, voting=[%d,%d), timelock_end=%d, %d action(s)\n",
+			view.ID, len(view.Members), view.TotalWeight, view.Quorum, view.StartAt, view.Deadline, view.TimelockEnd, len(view.Actions))
+	}
+}
+
+func runVote(args []string) {
+	cf := newCmdFlags("vote")
+	id := cf.fs.String("id", "", "proposal id to vote on")
+	voter := cf.fs.String("voter", "", "voting member (must be a final representative)")
+	choice := cf.fs.String("choice", "", "vote choice: for or against")
+	nowRaw := cf.fs.String("now", "", "current timestamp provided by the caller (int64)")
+	cf.parse(args)
+	if *id == "" || *voter == "" {
+		fmt.Fprintf(os.Stderr, "usage error: --id and --voter are required\n")
+		os.Exit(2)
+	}
+	var support bool
+	switch *choice {
+	case "for":
+		support = true
+	case "against":
+		support = false
+	default:
+		fmt.Fprintf(os.Stderr, "usage error: --choice must be %q or %q\n", "for", "against")
+		os.Exit(2)
+	}
+	now := parseIntFlag(cf.fs, "now", *nowRaw)
+
+	store, err := govflow.Open(cf.state)
+	if err != nil {
+		fail(err)
+	}
+	defer store.Close()
+	ballot, err := store.CastVote(*id, *voter, support, now)
+	if err != nil {
+		fail(err)
+	}
+	if cf.asJSON {
+		emitJSON(ballot)
+		return
+	}
+	fmt.Printf("recorded vote proposal=%s representative=%s choice=%s weight=%d voted_at=%d\n",
+		*id, ballot.Representative, choiceWord(ballot.Support), ballot.Weight, ballot.VotedAt)
+}
+
+func choiceWord(support bool) string {
+	if support {
+		return "for"
+	}
+	return "against"
+}
+
+func runTally(args []string) {
+	cf := newCmdFlags("tally")
+	id := cf.fs.String("id", "", "proposal id to tally")
+	nowRaw := cf.fs.String("now", "", "current timestamp provided by the caller (int64, >= deadline)")
+	cf.parse(args)
+	if *id == "" {
+		fmt.Fprintf(os.Stderr, "usage error: --id is required\n")
+		os.Exit(2)
+	}
+	now := parseIntFlag(cf.fs, "now", *nowRaw)
+
+	store, err := govflow.Open(cf.state)
+	if err != nil {
+		fail(err)
+	}
+	defer store.Close()
+	result, err := store.TallyVote(*id, now)
+	if err != nil {
+		fail(err)
+	}
+	if cf.asJSON {
+		emitJSON(map[string]any{"id": *id, "result": result})
+		return
+	}
+	verdict := "rejected"
+	if result.Passed {
+		verdict = "passed"
+	}
+	fmt.Printf("tally proposal=%s for=%d against=%d turnout=%d quorum=%d => %s (tallied_at=%d)\n",
+		*id, result.ForWeight, result.AgainstWeight, result.Turnout, result.Quorum, verdict, result.TalliedAt)
+}
+
 func runExecute(args []string) {
 	cf := newCmdFlags("execute")
 	id := cf.fs.String("id", "", "proposal id to execute")
@@ -283,14 +478,27 @@ func runProposal(args []string) {
 	if err != nil {
 		fail(err)
 	}
-	if !ok {
+	if ok {
+		// 保持既有 JSON 形状：直接输出登记提案记录。
+		if cf.asJSON {
+			emitJSON(record)
+			return
+		}
+		printProposalText(record)
+		return
+	}
+	voteView, vok, verr := store.VoteProposal(*id)
+	if verr != nil {
+		fail(verr)
+	}
+	if !vok {
 		fail(fmt.Errorf("%w: %s", govflow.ErrProposalNotFound, *id))
 	}
 	if cf.asJSON {
-		emitJSON(record)
+		emitJSON(voteView)
 		return
 	}
-	printProposalText(record)
+	printVoteProposalText(voteView)
 }
 
 func runProposals(args []string) {
@@ -301,16 +509,31 @@ func runProposals(args []string) {
 		fail(err)
 	}
 	defer store.Close()
-	records, err := store.Proposals()
+	registered, err := store.Proposals()
+	if err != nil {
+		fail(err)
+	}
+	voting, err := store.VoteProposals()
 	if err != nil {
 		fail(err)
 	}
 	if cf.asJSON {
-		emitJSON(records)
+		// 保持既有 JSON 形状：一个数组；登记记录字段不变，投票提案带额外字段。
+		merged := make([]any, 0, len(registered)+len(voting))
+		for _, r := range registered {
+			merged = append(merged, r)
+		}
+		for _, v := range voting {
+			merged = append(merged, v)
+		}
+		emitJSON(merged)
 		return
 	}
-	for _, record := range records {
+	for _, record := range registered {
 		printProposalText(record)
+	}
+	for _, view := range voting {
+		printVoteProposalText(view)
 	}
 }
 
@@ -366,6 +589,34 @@ func printProposalText(p govflow.ProposalRecord) {
 	fmt.Printf("proposal %s state=%s timelock_end=%d actions=%d\n", p.ID, p.State, p.TimelockEnd, len(p.Actions))
 	for i, action := range p.Actions {
 		fmt.Printf("  action %d: %s\n", i, action)
+	}
+}
+
+func printVoteProposalText(v *govflow.VoteProposalView) {
+	fmt.Printf("proposal %s source=vote state=%s quorum=%d voting=[%d,%d) timelock_end=%d actions=%d total_weight=%d\n",
+		v.ID, v.State, v.Quorum, v.StartAt, v.Deadline, v.TimelockEnd, len(v.Actions), v.TotalWeight)
+	for _, m := range v.Members {
+		chain := strings.Join(m.Path, "->")
+		if len(m.Path) == 1 {
+			fmt.Printf("  member %s weight=%d representative=self\n", m.ID, m.Weight)
+		} else {
+			fmt.Printf("  member %s weight=%d path=%s\n", m.ID, m.Weight, chain)
+		}
+	}
+	for i, action := range v.Actions {
+		fmt.Printf("  action %d: %s\n", i, action)
+	}
+	for _, b := range v.Ballots {
+		fmt.Printf("  ballot representative=%s choice=%s weight=%d voted_at=%d\n",
+			b.Representative, choiceWord(b.Support), b.Weight, b.VotedAt)
+	}
+	if v.Tally != nil {
+		verdict := "rejected"
+		if v.Tally.Passed {
+			verdict = "passed"
+		}
+		fmt.Printf("  tally for=%d against=%d turnout=%d => %s tallied_at=%d\n",
+			v.Tally.ForWeight, v.Tally.AgainstWeight, v.Tally.Turnout, verdict, v.Tally.TalliedAt)
 	}
 }
 
