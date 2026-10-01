@@ -258,3 +258,88 @@ func TestReopenAfterClose(t *testing.T) {
 		t.Fatalf("balance after reopen = %d", bal)
 	}
 }
+
+// TestCrossProcessVoting：多个进程同时对同一投票提案投票，
+// 同一代表只能有一份票记录；计票只产生一份结论。
+func TestCrossProcessVoting(t *testing.T) {
+	binary := buildCLI(t)
+	state := filepath.Join(t.TempDir(), "treasury.json")
+	if _, _, code := runCLI(t, binary, state, "init", "--balance", "1000"); code != 0 {
+		t.Fatal("init failed")
+	}
+	if _, _, code := runCLI(t, binary, state, "propose", "--id", "gip-1",
+		"--member", "alice:60", "--member", "bob:40", "--member", "carol:20",
+		"--quorum", "80", "--start", "100", "--end", "200", "--timelock", "500",
+		"--action", "transfer:audits:10"); code != 0 {
+		t.Fatal("propose failed")
+	}
+
+	const n = 12
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			// 同一代表、相同选择并发投，只有首次成功，其余幂等返回。
+			_, _, code := runCLI(t, binary, state, "vote", "--id", "gip-1",
+				"--member", "alice", "--choice", "for", "--now", "150")
+			if code != 0 {
+				t.Errorf("vote failed with code %d", code)
+			}
+		}()
+	}
+	// 另一代表正常投票。
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, _, code := runCLI(t, binary, state, "vote", "--id", "gip-1",
+				"--member", "bob", "--choice", "against", "--now", "150")
+			if code != 0 {
+				t.Errorf("bob vote failed with code %d", code)
+			}
+		}()
+	}
+	wg.Wait()
+
+	// 并发计票：只有一份结论。
+	var tallyWG sync.WaitGroup
+	for i := 0; i < n; i++ {
+		tallyWG.Add(1)
+		go func() {
+			defer tallyWG.Done()
+			_, _, code := runCLI(t, binary, state, "tally", "--id", "gip-1", "--now", "200")
+			if code != 0 {
+				t.Errorf("tally failed with code %d", code)
+			}
+		}()
+	}
+	tallyWG.Wait()
+
+	store, err := Open(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	record, ok, err := store.Voting("gip-1")
+	if err != nil || !ok {
+		t.Fatalf("Voting: ok=%v err=%v", ok, err)
+	}
+	if record.Result != "passed" {
+		t.Fatalf("result=%s, want passed (60 for > 40 against, turnout 100 >= quorum 80)", record.Result)
+	}
+	// 每名代表至多一条票记录。
+	seen := map[string]bool{}
+	for _, v := range record.Votes {
+		if seen[v.Voter] {
+			t.Fatalf("duplicate vote from %s", v.Voter)
+		}
+		seen[v.Voter] = true
+	}
+	if len(record.Votes) != 2 {
+		t.Fatalf("votes=%d, want 2", len(record.Votes))
+	}
+	if record.TalliedAt == nil || *record.TalliedAt != 200 {
+		t.Fatalf("tallied_at=%v", record.TalliedAt)
+	}
+}

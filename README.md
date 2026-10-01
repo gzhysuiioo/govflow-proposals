@@ -35,6 +35,26 @@ govflow register --state ./treasury.json \
 # 只有 passed、时间已达时间锁、动作非空的提案可首次执行；成功后变为 executed
 govflow execute --state ./treasury.json --id gip-7 --now 5001
 
+# 创建投票提案：成员名单与权重、可选委托（from:to）、法定人数、
+# 投票起止时间 [start, end)、执行时间锁与有序动作
+govflow propose --state ./treasury.json --id gip-1 \
+  --member alice:60 --member bob:40 --member carol:20 \
+  --delegate carol:bob --delegate bob:alice \
+  --quorum 80 --start 100 --end 200 --timelock 500 \
+  --action transfer:audits:10
+
+# 投票：仅最终代表可投，票重为归到其名下的全部原始权重
+govflow vote --state ./treasury.json --id gip-1 --member alice --choice for --now 150
+
+# 计票：首次计票须在截止时刻或之后；赞成反对权重之和达到法定人数
+# 且赞成严格多于反对才通过，否则拒绝；再次计票返回首次结论
+govflow tally --state ./treasury.json --id gip-1 --now 200
+
+# 查询投票提案：成员委托路径、最终代表、原始权重；逐票代表、票重、
+# 选择、首次投票时间；汇总与首次计票时间
+govflow voting  --state ./treasury.json --id gip-1
+govflow votings --state ./treasury.json
+
 # 查询余额（未出现过的收款账户为 0）
 govflow balances --state ./treasury.json
 govflow balances --state ./treasury.json --account audits
@@ -69,6 +89,15 @@ govflow execute --state ./treasury.json --id gip-7 --now 5001 --json
 - 多线程或多进程同时操作同一状态文件时：同一提案只产生一份成功记录；
   不同提案依据实际已提交余额判断能否支出，查询不会看到部分转账。
   串行化由进程内互斥锁与 `flock` 文件锁共同保证。
+
+### 投票幂等性与一致性
+
+- 创建投票提案：相同编号且全部内容相同（成员与委托按集合比较、与输入次序无关，
+  动作按原文及顺序比较）的重试返回已有提案且不改变当前状态；内容不同报冲突。
+- 投票：同一代表相同选择的重试始终返回首次记录（含首次投票时间），改投另一选择
+  报冲突；计票后拒绝新票，即使传入窗口内时间。
+- 计票：首次计票须在截止时刻或之后，否则报时间未到且状态不变；再次计票返回首次结论。
+- 保存的票重、代表归属或计票结论与名单及明细不一致时拒绝打开，保留原文件。
 
 ### 故障与损坏处理
 

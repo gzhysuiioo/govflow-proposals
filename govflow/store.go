@@ -84,6 +84,7 @@ type storedState struct {
 	Treasury        int64                      `json:"treasury"`
 	Balances        map[string]int64           `json:"balances"`
 	Proposals       map[string]*storedProposal `json:"proposals"`
+	Votings         map[string]*storedVoting   `json:"votings,omitempty"`
 	Receipts        []*Receipt                 `json:"receipts"`
 }
 
@@ -299,6 +300,9 @@ func (s *Store) Register(id string, timelockEnd int64, actions []string) (existe
 	state, err := s.loadLocked()
 	if err != nil {
 		return false, err
+	}
+	if _, ok := state.Votings[id]; ok {
+		return false, fmt.Errorf("%w: proposal %s was created via voting and cannot be registered", ErrProposalConflict, id)
 	}
 	stored := copyActions(actions)
 	if existing, ok := state.Proposals[id]; ok {
@@ -694,6 +698,10 @@ func validateState(state *storedState) error {
 	if state.Receipts == nil {
 		return errors.New("receipts table is missing")
 	}
+	// 旧状态文件没有 votings 字段，按空表处理。
+	if state.Votings == nil {
+		state.Votings = map[string]*storedVoting{}
+	}
 	for account, balance := range state.Balances {
 		if account == "" {
 			return errors.New("balance entry with empty account")
@@ -709,10 +717,33 @@ func validateState(state *storedState) error {
 		if p.ID != key || p.ID == "" {
 			return fmt.Errorf("proposal key %q does not match id %q", key, p.ID)
 		}
-		if p.State != "passed" && p.State != "executed" {
+		if p.State != "passed" && p.State != "executed" && p.State != "voting" && p.State != "rejected" {
 			return fmt.Errorf("proposal %q has unknown state %q", p.ID, p.State)
 		}
 		// 动作原文登记时原样保存；空串或非法原文留待执行时拒绝。
+	}
+
+	// 校验投票记录，并与提案登记交叉核对：投票提案必须有同名提案条目，
+	// 且时间锁、动作原文一致；计票结论必须与提案状态吻合。
+	for key, v := range state.Votings {
+		if err := validateVotingRecord(v, key); err != nil {
+			return fmt.Errorf("voting proposal %q is corrupt: %v", key, err)
+		}
+		proposal, ok := state.Proposals[key]
+		if !ok {
+			return fmt.Errorf("voting proposal %q has no registered proposal entry", key)
+		}
+		if proposal.TimelockEnd != v.Timelock || !sameActions(proposal.Actions, v.Actions) {
+			return fmt.Errorf("voting proposal %q timelock/actions do not match its proposal entry", key)
+		}
+		switch {
+		case v.TalliedAt == nil && proposal.State != "voting":
+			return fmt.Errorf("voting proposal %q has not concluded but proposal state is %q", key, proposal.State)
+		case v.TalliedAt != nil && v.Result == "passed" && proposal.State != "passed" && proposal.State != "executed":
+			return fmt.Errorf("voting proposal %q passed but proposal state is %q", key, proposal.State)
+		case v.TalliedAt != nil && v.Result == "rejected" && proposal.State != "rejected":
+			return fmt.Errorf("voting proposal %q was rejected but proposal state is %q", key, proposal.State)
+		}
 	}
 
 	// 重放凭据：从初始资金库余额出发，按成功顺序重放每笔转账，
