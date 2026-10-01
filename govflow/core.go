@@ -5,14 +5,14 @@ import "sort"
 
 // Proposal is one governance proposal with its voting window.
 type Proposal struct {
-	ID           string
-	Title        string
-	State        string
-	ForVotes     int64
-	AgainstVotes int64
-	Quorum       int64
-	TimelockEnd  int64
-	Actions      []string
+	ID           string   `json:"id"`
+	Title        string   `json:"title"`
+	State        string   `json:"state"`
+	ForVotes     int64    `json:"for_votes"`
+	AgainstVotes int64    `json:"against_votes"`
+	Quorum       int64    `json:"quorum"`
+	TimelockEnd  int64    `json:"timelock_end"`
+	Actions      []string `json:"actions"`
 }
 
 // Vote records a weighted vote against an open proposal.
