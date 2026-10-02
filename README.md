@@ -9,8 +9,66 @@
 ```bash
 go run ./cmd/govflow demo
 go run ./cmd/govflow version
+go run ./cmd/govflow help
 go test ./...
 ```
+
+## 供应链批次登记：batch-register
+
+把供应链中的一个批次登记到指定的本地 JSON 登记文件。一次调用登记一个批次：
+
+```bash
+govflow batch-register \
+  --registry batches.json \
+  --batch B-001 \
+  --product P-7 \
+  --quantity 120 \
+  --unit kg
+```
+
+- `--registry`：登记文件路径。文件不存在时在首次登记时创建。
+- `--batch`：批次编号，在同一登记文件内唯一。
+- `--product`：产品编号。
+- `--quantity`：数量，仅接受 `0`–`9` 组成的十进制正整数，允许前导零（如 `000120` 保存为 `120`），按整数值保存与比对，最大为 `9223372036854775807`。零、负数、小数、非 ASCII 数字和超范围值一律拒绝。
+- `--unit`：计量单位。
+
+`--batch`、`--product`、`--unit` 会先去掉首尾空白，去掉后不能为空；内部字符（含内部空白）保留，大小写不同视为不同值（`B1` 与 `b1` 是两个批次）。
+
+### 成功输出
+
+标准输出只输出一个 JSON 对象，退出码为 0：
+
+```json
+{"batch":"B-001","product":"P-7","quantity":120,"unit":"kg","status":"created"}
+```
+
+`status` 为 `created`（新增）或 `duplicate`（重复登记）。
+
+- 同一编号再次提交，且规范化后的产品编号、数量、单位与已存记录**完全一致**时，返回已有记录和 `"duplicate"`，不新增记录、不改写文件——可以安全重试。
+- 同一编号但产品、数量、单位中**任意一项不同**时，登记被拒绝，错误信息指出批次编号和不一致的字段，原记录和其他批次都不受影响。重复登记不能用于修改数量或产品归属，例如：
+
+```text
+govflow: batch "B-001" is already registered with conflicting field(s): quantity; the existing record cannot be overwritten
+```
+
+失败时退出码非零，原因写入标准错误，标准输出不出现任何成功结果。缺少必需参数或参数非法时，不会创建或修改登记文件。
+
+### 登记文件格式（公开）
+
+登记文件是人类可检查的 UTF-8 JSON：
+
+```json
+{
+  "version": 1,
+  "batches": [
+    {"batch": "B-001", "product": "P-7", "quantity": 120, "unit": "kg"}
+  ]
+}
+```
+
+保存采用临时文件加原子替换，写入失败时已有批次仍然可用。不同登记文件各自管理编号，向已有文件登记新批次时保留其中其他批次的完整信息。
+
+以下已有文件会被**明确拒绝**，绝不会当作空登记表覆盖：空文件或纯空白、内容无法按上述格式读取、`version` 不受支持、同一批次编号出现多条记录。
 
 ## 技术方向
 

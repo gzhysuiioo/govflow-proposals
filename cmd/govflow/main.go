@@ -2,33 +2,219 @@
 package main
 
 import (
+	"encoding/json"
+	"errors"
+	"flag"
 	"fmt"
+	"io"
 	"os"
+	"strings"
 
 	"github.com/gzhysuiioo/govflow-proposals/govflow"
+	"github.com/gzhysuiioo/govflow-proposals/govflow/batchreg"
 )
 
+const batchRegisterUsage = `usage: govflow batch-register --registry FILE --batch ID --product ID --quantity N --unit UNIT
+run 'govflow help' for the full description and the registry file format.
+`
+
 func main() {
+	if err := run(os.Args[1:]); err != nil {
+		fmt.Fprintln(os.Stderr, "govflow:", err)
+		var ue *usageError
+		if errors.As(err, &ue) {
+			fmt.Fprint(os.Stderr, ue.usage)
+		}
+		os.Exit(1)
+	}
+}
+
+type usageError struct {
+	msg   string
+	usage string
+}
+
+func (e *usageError) Error() string { return e.msg }
+
+func run(args []string) error {
 	command := "demo"
-	if len(os.Args) > 1 {
-		command = os.Args[1]
+	if len(args) > 0 {
+		command = args[0]
 	}
 	switch command {
 	case "demo":
 		runDemo()
+		return nil
 	case "version":
 		fmt.Println("govflow 0.1.0")
+		return nil
 	case "help", "-h", "--help":
-		usage()
+		fmt.Print(rootUsage())
+		return nil
+	case "batch-register":
+		return runBatchRegister(args[1:], os.Stdout)
 	default:
 		fmt.Fprintf(os.Stderr, "unknown command %q\n", command)
-		usage()
+		fmt.Fprint(os.Stderr, rootUsage())
 		os.Exit(2)
+		return nil
 	}
 }
 
-func usage() {
-	fmt.Println("usage: govflow [demo|version|help]")
+func rootUsage() string {
+	return `govflow - DAO 治理提案与执行平台 / supply-chain batch registry
+
+usage:
+  govflow                                  run the built-in demo (default)
+  govflow demo                             run the built-in demo
+  govflow version                          print the version
+  govflow help                             show this help
+  govflow batch-register --registry FILE \
+      --batch ID --product ID --quantity N --unit UNIT
+                                           register one supply-chain batch in
+                                           the registry FILE (see below)
+
+batch-register flags:
+  --registry FILE   registry file to read and write (required)
+  --batch ID        batch number; unique within one registry file (required)
+  --product ID      product number the batch belongs to (required)
+  --quantity N      positive decimal integer, digits 0-9 only, leading
+                    zeros allowed, max 9223372036854775807 (required)
+  --unit UNIT       measurement unit, e.g. kg or box (required)
+
+Batch, product and unit values have leading and trailing whitespace removed
+and must be non-empty afterwards; interior characters and casing are kept
+("B1" and "b1" are different batches). One invocation registers one batch.
+
+On success stdout contains a single JSON object, e.g.
+  {"batch":"B-001","product":"P-7","quantity":120,"unit":"kg","status":"created"}
+status is "created" for a new record and "duplicate" when the same batch was
+already registered with the identical product, quantity and unit; a duplicate
+does not rewrite the file and is safe to retry. Registering an existing batch
+with any different field is rejected; the error names the batch and the
+mismatching field(s) and no record is changed.
+
+registry file format (UTF-8 JSON, human-inspectable):
+  {
+    "version": 1,
+    "batches": [
+      {"batch": "B-001", "product": "P-7", "quantity": 120, "unit": "kg"}
+    ]
+  }
+A missing file is created on first registration. An existing file that is
+empty, cannot be read in this format, or contains several records with the
+same batch number is rejected outright and never overwritten. Failures print
+the reason to stderr and exit non-zero without touching the registry.
+`
+}
+
+func runBatchRegister(args []string, stdout io.Writer) error {
+	fs := flag.NewFlagSet("batch-register", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	registryPath := fs.String("registry", "", "registry `file` to read and write")
+	batchRaw := fs.String("batch", "", "batch number (unique within the registry)")
+	productRaw := fs.String("product", "", "product number")
+	quantityRaw := fs.String("quantity", "", "positive decimal integer quantity")
+	unitRaw := fs.String("unit", "", "measurement unit")
+	if err := fs.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			fmt.Fprint(stdout, rootUsage())
+			return nil
+		}
+		return &usageError{msg: "batch-register: " + err.Error(), usage: batchRegisterUsage}
+	}
+	if fs.NArg() != 0 {
+		return &usageError{
+			msg:   fmt.Sprintf("batch-register: unexpected positional argument(s): %s", strings.Join(fs.Args(), " ")),
+			usage: batchRegisterUsage,
+		}
+	}
+
+	// Missing or malformed input must never create or modify the registry
+	// file, so required flags are checked before reading or writing anything.
+	required := []struct {
+		name  string
+		value string
+	}{
+		{"--registry", *registryPath},
+		{"--batch", *batchRaw},
+		{"--product", *productRaw},
+		{"--quantity", *quantityRaw},
+		{"--unit", *unitRaw},
+	}
+	var missing []string
+	for _, f := range required {
+		if f.value == "" {
+			missing = append(missing, f.name)
+		}
+	}
+	if len(missing) > 0 {
+		return &usageError{
+			msg:   "batch-register: missing required flag(s): " + strings.Join(missing, ", "),
+			usage: batchRegisterUsage,
+		}
+	}
+
+	batch, err := batchreg.NormalizeField(*batchRaw)
+	if err != nil {
+		return &usageError{msg: "batch-register: invalid --batch: " + err.Error(), usage: batchRegisterUsage}
+	}
+	product, err := batchreg.NormalizeField(*productRaw)
+	if err != nil {
+		return &usageError{msg: "batch-register: invalid --product: " + err.Error(), usage: batchRegisterUsage}
+	}
+	unit, err := batchreg.NormalizeField(*unitRaw)
+	if err != nil {
+		return &usageError{msg: "batch-register: invalid --unit: " + err.Error(), usage: batchRegisterUsage}
+	}
+	quantity, err := batchreg.ParseQuantity(*quantityRaw)
+	if err != nil {
+		return &usageError{msg: "batch-register: invalid --quantity: " + err.Error(), usage: batchRegisterUsage}
+	}
+
+	reg, existed, err := batchreg.Load(*registryPath)
+	if err != nil {
+		return err
+	}
+	outcome, err := batchreg.Register(reg, batchreg.Input{
+		Batch: batch, Product: product, Quantity: quantity, Unit: unit,
+	})
+	if err != nil {
+		return err
+	}
+	if outcome.Created {
+		if err := batchreg.Save(*registryPath, reg); err != nil {
+			if !existed {
+				// Nothing was registered before; drop any partial new file.
+				os.Remove(*registryPath)
+			}
+			return err
+		}
+	}
+
+	status := "duplicate"
+	if outcome.Created {
+		status = "created"
+	}
+	result := struct {
+		Batch    string `json:"batch"`
+		Product  string `json:"product"`
+		Quantity int64  `json:"quantity"`
+		Unit     string `json:"unit"`
+		Status   string `json:"status"`
+	}{
+		Batch:    outcome.Batch.Batch,
+		Product:  outcome.Batch.Product,
+		Quantity: outcome.Batch.Quantity,
+		Unit:     outcome.Batch.Unit,
+		Status:   status,
+	}
+	payload, err := json.Marshal(result)
+	if err != nil {
+		return err
+	}
+	_, err = fmt.Fprintln(stdout, string(payload))
+	return err
 }
 
 func runDemo() {
