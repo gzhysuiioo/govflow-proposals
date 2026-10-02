@@ -18,6 +18,10 @@ const batchRegisterUsage = `usage: govflow batch-register --registry FILE --batc
 run 'govflow help' for the full description and the registry file format.
 `
 
+const batchImportUsage = `usage: govflow batch-import --registry FILE --input FILE
+run 'govflow help' for the full description and the registry file format.
+`
+
 func main() {
 	if err := run(os.Args[1:]); err != nil {
 		fmt.Fprintln(os.Stderr, "govflow:", err)
@@ -53,6 +57,8 @@ func run(args []string) error {
 		return nil
 	case "batch-register":
 		return runBatchRegister(args[1:], os.Stdout)
+	case "batch-import":
+		return runBatchImport(args[1:], os.Stdout)
 	default:
 		fmt.Fprintf(os.Stderr, "unknown command %q\n", command)
 		fmt.Fprint(os.Stderr, rootUsage())
@@ -73,6 +79,10 @@ usage:
       --batch ID --product ID --quantity N --unit UNIT
                                            register one supply-chain batch in
                                            the registry FILE (see below)
+  govflow batch-import --registry FILE --input FILE
+                                           register every batch listed in the
+                                           JSON manifest FILE into the registry
+                                           FILE, all records or none
 
 batch-register flags:
   --registry FILE   registry file to read and write (required)
@@ -81,6 +91,24 @@ batch-register flags:
   --quantity N      positive decimal integer, digits 0-9 only, leading
                     zeros allowed, max 9223372036854775807 (required)
   --unit UNIT       measurement unit, e.g. kg or box (required)
+
+batch-import flags:
+  --registry FILE   registry file to read and write (required)
+  --input FILE      read-only JSON manifest (required); a non-empty array of
+                    objects carrying exactly batch, product, quantity and
+                    unit. Text fields must be non-blank after trimming, and
+                    quantity must be a JSON integer from 1 to
+                    9223372036854775807 (no strings, fractions or exponents)
+
+The whole manifest is rejected unless every record can be registered or
+confirmed as a duplicate: a batch id already stored or seen earlier in the
+manifest must match product, quantity and unit exactly, or none of the new
+batches are saved and the error names the 1-based record position, the batch
+id and the mismatching field(s). On success stdout contains one JSON object
+whose results array keeps manifest order, each entry carrying the normalized
+four fields plus status "created" or "duplicate"; new batches are appended
+in first-occurrence order and an all-duplicate manifest leaves the registry
+file byte-for-byte untouched.
 
 Batch, product and unit values have leading and trailing whitespace removed
 and must be non-empty afterwards; interior characters and casing are kept
@@ -215,6 +243,108 @@ func runBatchRegister(args []string, stdout io.Writer) error {
 	}
 	_, err = fmt.Fprintln(stdout, string(payload))
 	return err
+}
+
+func runBatchImport(args []string, stdout io.Writer) error {
+	fs := flag.NewFlagSet("batch-import", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	registryPath := fs.String("registry", "", "registry `file` to read and write")
+	inputPath := fs.String("input", "", "read-only JSON manifest `file` to import")
+	if err := fs.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			fmt.Fprint(stdout, rootUsage())
+			return nil
+		}
+		return &usageError{msg: "batch-import: " + err.Error(), usage: batchImportUsage}
+	}
+	if fs.NArg() != 0 {
+		return &usageError{
+			msg:   fmt.Sprintf("batch-import: unexpected positional argument(s): %s", strings.Join(fs.Args(), " ")),
+			usage: batchImportUsage,
+		}
+	}
+	if *registryPath == "" || *inputPath == "" {
+		var missing []string
+		if *registryPath == "" {
+			missing = append(missing, "--registry")
+		}
+		if *inputPath == "" {
+			missing = append(missing, "--input")
+		}
+		return &usageError{
+			msg:   "batch-import: missing required flag(s): " + strings.Join(missing, ", "),
+			usage: batchImportUsage,
+		}
+	}
+
+	// The manifest is read-only and is parsed (and fully validated) before
+	// the registry is loaded or written, so bad input cannot touch it.
+	data, err := os.ReadFile(*inputPath)
+	if err != nil {
+		return fmt.Errorf("batch-import: cannot read input file %q: %w", *inputPath, err)
+	}
+	inputs, err := batchreg.ParseManifest(data)
+	if err != nil {
+		return fmt.Errorf("batch-import: invalid input file %q: %w", *inputPath, err)
+	}
+
+	reg, existed, err := batchreg.Load(*registryPath)
+	if err != nil {
+		return fmt.Errorf("batch-import: %w", err)
+	}
+	outcomes, err := batchreg.Import(reg, inputs)
+	if err != nil {
+		return fmt.Errorf("batch-import: %w", err)
+	}
+
+	type importResultJSON struct {
+		Batch    string `json:"batch"`
+		Product  string `json:"product"`
+		Quantity int64  `json:"quantity"`
+		Unit     string `json:"unit"`
+		Status   string `json:"status"`
+	}
+	results := make([]importResultJSON, len(outcomes))
+	anyCreated := false
+	for i, o := range outcomes {
+		status := "duplicate"
+		if o.Created {
+			status = "created"
+			anyCreated = true
+		}
+		results[i] = importResultJSON{
+			Batch:    o.Batch.Batch,
+			Product:  o.Batch.Product,
+			Quantity: o.Batch.Quantity,
+			Unit:     o.Batch.Unit,
+			Status:   status,
+		}
+	}
+
+	// An all-duplicate manifest must leave bytes and mtime untouched, so the
+	// registry is written only when at least one record was newly created.
+	if anyCreated {
+		if err := batchreg.Save(*registryPath, reg); err != nil {
+			if !existed {
+				// The registry never existed before this import; drop any
+				// partial new file so a failed save leaves nothing behind.
+				os.Remove(*registryPath)
+			}
+			return fmt.Errorf("batch-import: %w", err)
+		}
+	}
+
+	payload, err := json.Marshal(struct {
+		Results []importResultJSON `json:"results"`
+	}{Results: results})
+	if err != nil {
+		return fmt.Errorf("batch-import: %w", err)
+	}
+	_, err = fmt.Fprintln(stdout, string(payload))
+	if err != nil {
+		return fmt.Errorf("batch-import: %w", err)
+	}
+	return nil
 }
 
 func runDemo() {

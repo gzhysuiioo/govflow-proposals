@@ -70,6 +70,57 @@ govflow: batch "B-001" is already registered with conflicting field(s): quantity
 
 以下已有文件会被**明确拒绝**，绝不会当作空登记表覆盖：空文件或纯空白、内容无法按上述格式读取、`version` 不受支持、同一批次编号出现多条记录。
 
+## 整份到货清单导入：batch-import
+
+一次提交整份清单，把多个批次登记到同一份登记文件：
+
+```bash
+govflow batch-import --registry batches.json --input arrivals.json
+```
+
+- `--registry`：登记文件路径，规则与 `batch-register` 完全相同；文件不存在时可在导入成功后创建。
+- `--input`：清单文件路径，始终**只读**，不会被创建或修改。
+
+### 输入文件
+
+输入文件必须是一个**非空 JSON 数组**，每个元素是只含 `batch`、`product`、`quantity`、`unit` 四个必填字段的 JSON 对象：
+
+```json
+[
+  {"batch": "B-001", "product": "P-7", "quantity": 120, "unit": "kg"},
+  {"batch": "B-002", "product": "P-8", "quantity": 1, "unit": "box"}
+]
+```
+
+- 三个文本字段按 `batch-register` 的规则规范化：去掉首尾空白后不能为空，内部字符（含内部空白）和大小写保留。
+- `quantity` 必须是 **JSON 整数**（如 `120`），范围为 1 到 9223372036854775807；字符串（`"120"`）、小数（`1.0`、`1.5`）、指数形式（`1e3`）、布尔、`null`、零、负数、超范围值一律拒绝。
+- 空文件、纯空白、空数组 `[]`、非数组内容、数组元素不是对象、缺失字段、多余字段、字段重复或类型不符都会被明确拒绝，错误指出清单中**从 1 开始的记录位置**（能确定批次时同时给出批次编号）。
+
+### 全有或全无
+
+只有清单中**所有记录**都能新增或确认重复时才保存结果：
+
+- 批次编号已在登记文件中、或此前已在本次清单中出现时，规范化后的产品、数量、单位必须**全部一致**，该条记录确认为重复。
+- 任一字段不同则整份清单失败，没有任何新批次写入登记文件；错误指出记录位置（从 1 开始）、批次编号和不一致字段，以及冲突对象是登记文件中的记录还是清单中的更早记录及其位置。例如清单第 1、3 条同为 `B1` 但数量不同时：
+
+```text
+govflow: batch-import: manifest record 3 (batch "B1") conflicts with manifest record 1 on field(s): quantity; the whole manifest is rejected
+```
+
+- 后面的记录不能覆盖前面的记录。原登记文件没有 `B1` 时，两条完全相同的 `B1` 只新增一次；若第二条数量不同，第一条也不会留下。
+
+### 成功输出
+
+退出码为 0，标准输出只写一个 JSON 对象，`results` 数组按清单原顺序给出每条记录规范化后的四个字段和 `status`：
+
+```json
+{"results":[{"batch":"B-001","product":"P-7","quantity":120,"unit":"kg","status":"created"},{"batch":"B-001","product":"P-7","quantity":120,"unit":"kg","status":"duplicate"}]}
+```
+
+首次新增的记录标为 `created`，已存在或此前在本次清单中新增的相同记录标为 `duplicate`。已有记录的内容和顺序保持不变，新批次按首次出现的顺序追加。如果全部是重复记录，登记文件的**字节内容和修改时间都保持不变**。
+
+读取任一文件失败、记录非法、发生冲突或保存失败时退出码非零，原因写入标准错误，标准输出不出现成功结果；已有登记文件保持原样，原本不存在则不留下登记文件。
+
 ## 技术方向
 
 dao, governance, voting, proposal, multisig, treasury-management, reputation-system
