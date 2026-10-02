@@ -556,6 +556,32 @@ func (s *Store) Balances() (map[string]int64, error) {
 	return out, nil
 }
 
+// BalanceSnapshot 是同一次读取取得的资金库完整余额视图：
+// 资金库余额与全部收款账户余额，二者来自同一份已提交状态，
+// 不会出现转账前后数字拼接的组合。
+type BalanceSnapshot struct {
+	Treasury int64
+	Balances map[string]int64
+}
+
+// BalancesSnapshot 在同一次加锁读取中返回资金库余额与全部收款账户余额。
+// 资金库与账户余额取自同一份状态文件内容：与执行交错时，结果只可能是
+// 某次执行前或某次执行后的完整状态，绝不会是旧资金库余额配新账户余额
+// （或只含部分转账）的组合。返回的余额表是副本：本次查询确定结果后，
+// 后续执行提案不会改变已取得的结果；下一次调用会重新读取当前已提交状态，
+// 不会一直复用打开文件时的余额。
+func (s *Store) BalancesSnapshot() (*BalanceSnapshot, error) {
+	state, err := s.readState()
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[string]int64, len(state.Balances))
+	for account, balance := range state.Balances {
+		out[account] = balance
+	}
+	return &BalanceSnapshot{Treasury: state.Treasury, Balances: out}, nil
+}
+
 // Proposal 按编号返回提案登记信息；不存在时 ok 为 false。
 func (s *Store) Proposal(id string) (ProposalRecord, bool, error) {
 	state, err := s.readState()

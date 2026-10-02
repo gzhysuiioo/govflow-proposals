@@ -426,38 +426,33 @@ func runBalances(args []string) {
 		fail(err)
 	}
 	defer store.Close()
-	treasury, err := store.TreasuryBalance()
+	// 资金库与账户余额必须来自同一次读取：分别读取会与执行交错，
+	// 可能拼出“旧资金库余额配新账户余额”这种从未同时存在过的组合。
+	snapshot, err := store.BalancesSnapshot()
 	if err != nil {
 		fail(err)
 	}
 	if *account != "" {
-		balance, err := store.Balance(*account)
-		if err != nil {
-			fail(err)
-		}
+		balance := snapshot.Balances[*account]
 		if cf.asJSON {
-			emitJSON(map[string]any{"treasury": treasury, "account": *account, "balance": balance})
+			emitJSON(map[string]any{"treasury": snapshot.Treasury, "account": *account, "balance": balance})
 		} else {
-			fmt.Printf("treasury %d\n%s %d\n", treasury, *account, balance)
+			fmt.Printf("treasury %d\n%s %d\n", snapshot.Treasury, *account, balance)
 		}
 		return
-	}
-	balances, err := store.Balances()
-	if err != nil {
-		fail(err)
 	}
 	if cf.asJSON {
-		emitJSON(map[string]any{"treasury": treasury, "balances": balances})
+		emitJSON(map[string]any{"treasury": snapshot.Treasury, "balances": snapshot.Balances})
 		return
 	}
-	fmt.Printf("treasury %d\n", treasury)
-	accounts := make([]string, 0, len(balances))
-	for acct := range balances {
+	fmt.Printf("treasury %d\n", snapshot.Treasury)
+	accounts := make([]string, 0, len(snapshot.Balances))
+	for acct := range snapshot.Balances {
 		accounts = append(accounts, acct)
 	}
 	sort.Strings(accounts)
 	for _, acct := range accounts {
-		fmt.Printf("%s %d\n", acct, balances[acct])
+		fmt.Printf("%s %d\n", acct, snapshot.Balances[acct])
 	}
 }
 

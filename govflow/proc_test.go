@@ -2,6 +2,8 @@ package govflow
 
 import (
 	"bytes"
+	"encoding/json"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -154,6 +156,162 @@ func TestCrossProcessDifferentProposals(t *testing.T) {
 	so, _, _ = runCLI(t, binary, state, "receipts", "--json")
 	if strings.Count(so, `"proposal_id"`) != 10 {
 		t.Fatalf("expected 10 receipts, got:\n%s", so)
+	}
+}
+
+// TestCrossProcessBalancesConsistent：并发执行期间反复查询 balances，
+// 每次输出的 treasury 与 balances 都必须来自同一份已提交状态：
+// treasury 与各账户余额之和始终等于初始资金库，不得出现转账前后拼接的组合。
+func TestCrossProcessBalancesConsistent(t *testing.T) {
+	binary := buildCLI(t)
+	state := filepath.Join(t.TempDir(), "treasury.json")
+	if _, _, code := runCLI(t, binary, state, "init", "--balance", "1000"); code != 0 {
+		t.Fatal("init failed")
+	}
+	const n = 100
+	for i := 0; i < n; i++ {
+		if _, _, code := runCLI(t, binary, state, "register", "--id", "gip-"+itoa(i),
+			"--timelock", "0", "--action", "transfer:a:1"); code != 0 {
+			t.Fatalf("register %d failed", i)
+		}
+	}
+
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	// 执行方（幂等重试）。
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			_, _, _ = runCLI(t, binary, state, "execute", "--id", "gip-"+itoa(i), "--now", "0")
+		}(i)
+	}
+	// 查询方：解析 JSON，校验 treasury + sum(balances) == 1000。
+	const queriesPerReader = 100
+	const readers = 8
+	var badMu sync.Mutex
+	var badNews []string
+	for i := 0; i < readers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			for j := 0; j < queriesPerReader; j++ {
+				so, _, code := runCLI(t, binary, state, "balances", "--json")
+				if code != 0 {
+					badMu.Lock()
+					badNews = append(badNews, "balances exited non-zero: "+so)
+					badMu.Unlock()
+					return
+				}
+				var snap struct {
+					Treasury int64            `json:"treasury"`
+					Balances map[string]int64 `json:"balances"`
+				}
+				if err := json.Unmarshal([]byte(so), &snap); err != nil {
+					badMu.Lock()
+					badNews = append(badNews, "bad json: "+err.Error())
+					badMu.Unlock()
+					return
+				}
+				var sum int64
+				for _, b := range snap.Balances {
+					sum += b
+				}
+				if snap.Treasury+sum != 1000 {
+					badMu.Lock()
+					badNews = append(badNews, fmt.Sprintf("torn snapshot: treasury=%d balances=%v", snap.Treasury, snap.Balances))
+					badMu.Unlock()
+					return
+				}
+			}
+		}()
+	}
+	close(start)
+	wg.Wait()
+	for _, msg := range badNews {
+		t.Fatal(msg)
+	}
+
+	// 最终状态：100 笔 1 全部到账，资金库为 900。
+	so, _, _ := runCLI(t, binary, state, "balances", "--json")
+	if !strings.Contains(so, `"treasury": 900`) || !strings.Contains(so, `"a": 100`) {
+		t.Fatalf("final balances wrong:\n%s", so)
+	}
+}
+
+// TestCrossProcessBalancesAccountConsistent：单提案多笔转账的执行与查询重叠时，
+// 指定 --account 的查询结果只能是转账前（资金库 1000、账户 0）或转账后
+// （资金库 850、账户 100），不得出现旧资金库配新账户。
+func TestCrossProcessBalancesAccountConsistent(t *testing.T) {
+	binary := buildCLI(t)
+	state := filepath.Join(t.TempDir(), "treasury.json")
+	if _, _, code := runCLI(t, binary, state, "init", "--balance", "1000"); code != 0 {
+		t.Fatal("init failed")
+	}
+	if _, _, code := runCLI(t, binary, state, "register", "--id", "gip-1",
+		"--timelock", "0", "--action", "transfer:audits:100", "--action", "transfer:legal:50"); code != 0 {
+		t.Fatal("register failed")
+	}
+
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		<-start
+		_, _, _ = runCLI(t, binary, state, "execute", "--id", "gip-1", "--now", "0")
+	}()
+	const queriesPerReader = 100
+	const readers = 8
+	var badMu sync.Mutex
+	var badNews []string
+	for i := 0; i < readers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			for j := 0; j < queriesPerReader; j++ {
+				so, _, code := runCLI(t, binary, state, "balances", "--account", "audits", "--json")
+				if code != 0 {
+					badMu.Lock()
+					badNews = append(badNews, "balances exited non-zero: "+so)
+					badMu.Unlock()
+					return
+				}
+				var snap struct {
+					Treasury int64  `json:"treasury"`
+					Account  string `json:"account"`
+					Balance  int64  `json:"balance"`
+				}
+				if err := json.Unmarshal([]byte(so), &snap); err != nil {
+					badMu.Lock()
+					badNews = append(badNews, "bad json: "+err.Error())
+					badMu.Unlock()
+					return
+				}
+				if snap.Account != "audits" {
+					badMu.Lock()
+					badNews = append(badNews, fmt.Sprintf("account field = %q, want audits", snap.Account))
+					badMu.Unlock()
+					return
+				}
+				// 只能是转账前或转账后的完整组合。
+				if !((snap.Treasury == 1000 && snap.Balance == 0) ||
+					(snap.Treasury == 850 && snap.Balance == 100)) {
+					badMu.Lock()
+					badNews = append(badNews, fmt.Sprintf("torn account snapshot: treasury=%d balance=%d", snap.Treasury, snap.Balance))
+					badMu.Unlock()
+					return
+				}
+			}
+		}()
+	}
+	close(start)
+	wg.Wait()
+	for _, msg := range badNews {
+		t.Fatal(msg)
 	}
 }
 

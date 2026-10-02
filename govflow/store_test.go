@@ -555,6 +555,181 @@ func TestPathSpellingsShareLock(t *testing.T) {
 	}
 }
 
+// TestBalancesSnapshotCopyAndReread 验证快照语义：返回结果是副本，
+// 后续执行不改变已取得的结果；下一次查询重新读取当前已提交状态。
+func TestBalancesSnapshotCopyAndReread(t *testing.T) {
+	store, _ := openTempStore(t, 1000)
+	defer store.Close()
+	mustRegister(t, store, "gip-1", 0, "transfer:audits:100", "transfer:legal:50")
+
+	snap, err := store.BalancesSnapshot()
+	if err != nil {
+		t.Fatalf("BalancesSnapshot: %v", err)
+	}
+	if snap.Treasury != 1000 || len(snap.Balances) != 0 {
+		t.Fatalf("pre-execution snapshot: treasury=%d balances=%v", snap.Treasury, snap.Balances)
+	}
+
+	// 改动返回的 map 不得泄漏进状态，也不影响后续查询。
+	snap.Balances["ghost"] = 999
+	again, err := store.BalancesSnapshot()
+	if err != nil {
+		t.Fatalf("BalancesSnapshot: %v", err)
+	}
+	if _, ok := again.Balances["ghost"]; ok {
+		t.Fatal("snapshot map mutation leaked into store state")
+	}
+
+	// 执行后，已取得的快照保持不变（资金库仍为 1000，且不含执行后才有的账户）；
+	// 下一次查询反映新的已提交状态。
+	if _, err := store.Execute("gip-1", 0); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	if snap.Treasury != 1000 {
+		t.Fatalf("snapshot treasury changed after execution: %d", snap.Treasury)
+	}
+	if _, ok := snap.Balances["audits"]; ok {
+		t.Fatal("snapshot gained audits after execution")
+	}
+	if _, ok := snap.Balances["legal"]; ok {
+		t.Fatal("snapshot gained legal after execution")
+	}
+	fresh, err := store.BalancesSnapshot()
+	if err != nil {
+		t.Fatalf("BalancesSnapshot: %v", err)
+	}
+	if fresh.Treasury != 850 || fresh.Balances["audits"] != 100 || fresh.Balances["legal"] != 50 ||
+		len(fresh.Balances) != 2 {
+		t.Fatalf("fresh snapshot after execution: treasury=%d balances=%v", fresh.Treasury, fresh.Balances)
+	}
+}
+
+// TestBalancesSnapshotAfterRejectedExecution 验证执行被拒时查询仍展示原完整余额。
+func TestBalancesSnapshotAfterRejectedExecution(t *testing.T) {
+	store, _ := openTempStore(t, 1000)
+	defer store.Close()
+	mustRegister(t, store, "broke", 0, "transfer:a:2000")
+	if _, err := store.Execute("broke", 0); !errors.Is(err, ErrExecutionRejected) {
+		t.Fatalf("execute err=%v, want ErrExecutionRejected", err)
+	}
+	snap, err := store.BalancesSnapshot()
+	if err != nil {
+		t.Fatalf("BalancesSnapshot: %v", err)
+	}
+	if snap.Treasury != 1000 || len(snap.Balances) != 0 {
+		t.Fatalf("snapshot after rejected execution: treasury=%d balances=%v", snap.Treasury, snap.Balances)
+	}
+}
+
+// TestBalancesSnapshotZeroTreasuryEmptyBalances 验证资金库为 0、账户表为空时正常展示。
+func TestBalancesSnapshotZeroTreasuryEmptyBalances(t *testing.T) {
+	store, _ := openTempStore(t, 0)
+	defer store.Close()
+	snap, err := store.BalancesSnapshot()
+	if err != nil {
+		t.Fatalf("BalancesSnapshot: %v", err)
+	}
+	if snap.Treasury != 0 || len(snap.Balances) != 0 {
+		t.Fatalf("snapshot: treasury=%d balances=%v", snap.Treasury, snap.Balances)
+	}
+}
+
+// TestBalancesSnapshotAtomicWithExecution 验证执行与查询交错时，
+// 每次快照都来自同一份已提交状态：资金库 1000、无账户，或资金库 850、
+// audits=100、legal=50；不得出现旧资金库配新账户，或缺笔转账的组合。
+func TestBalancesSnapshotAtomicWithExecution(t *testing.T) {
+	const rounds = 20
+	for r := 0; r < rounds; r++ {
+		path := filepath.Join(t.TempDir(), "treasury.json")
+		store, err := InitTreasury(path, 1000)
+		if err != nil {
+			t.Fatalf("InitTreasury: %v", err)
+		}
+		mustRegister(t, store, "gip-1", 0, "transfer:audits:100", "transfer:legal:50")
+
+		// 执行前快照：主 goroutine 在启动执行方之前取，保证观察到转账前状态。
+		pre, err := store.BalancesSnapshot()
+		if err != nil {
+			t.Fatalf("round %d pre snapshot: %v", r, err)
+		}
+		if !isPreSnapshot(pre) {
+			t.Fatalf("round %d pre snapshot: treasury=%d balances=%v", r, pre.Treasury, pre.Balances)
+		}
+
+		var wg sync.WaitGroup
+		start := make(chan struct{})
+		// 执行方（幂等：只有首次真正扣款）。
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			_, _ = store.Execute("gip-1", 0)
+		}()
+		// 查询方：逐份校验必须是完整的前/后状态，直到观察到转账后状态为止。
+		// 执行方提交后，任何仍在轮询的查询方都必然观察到后状态，故不会漏测。
+		const maxIterations = 10000
+		const readers = 8
+		var mu sync.Mutex
+		var snapshots []*BalanceSnapshot
+		sawPost := false
+		for i := 0; i < readers; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				<-start
+				for j := 0; j < maxIterations; j++ {
+					snap, err := store.BalancesSnapshot()
+					if err != nil {
+						t.Errorf("round %d snapshot: %v", r, err)
+						return
+					}
+					mu.Lock()
+					snapshots = append(snapshots, snap)
+					if isPostSnapshot(snap) {
+						sawPost = true
+					}
+					mu.Unlock()
+					if isPostSnapshot(snap) {
+						return
+					}
+				}
+			}()
+		}
+		close(start)
+		wg.Wait()
+
+		for _, snap := range snapshots {
+			if !isPreSnapshot(snap) && !isPostSnapshot(snap) {
+				t.Fatalf("round %d torn snapshot: treasury=%d balances=%v", r, snap.Treasury, snap.Balances)
+			}
+		}
+		if !sawPost {
+			t.Fatalf("round %d never observed post-execution snapshot", r)
+		}
+
+		// 执行后快照：必须是完整的后状态。
+		post, err := store.BalancesSnapshot()
+		if err != nil {
+			t.Fatalf("round %d post snapshot: %v", r, err)
+		}
+		if !isPostSnapshot(post) {
+			t.Fatalf("round %d post snapshot: treasury=%d balances=%v", r, post.Treasury, post.Balances)
+		}
+		store.Close()
+	}
+}
+
+// isPreSnapshot 判断快照是否为转账前的完整状态：资金库 1000、无账户。
+func isPreSnapshot(snap *BalanceSnapshot) bool {
+	return snap.Treasury == 1000 && len(snap.Balances) == 0
+}
+
+// isPostSnapshot 判断快照是否为转账后的完整状态：资金库 850、audits=100、legal=50。
+func isPostSnapshot(snap *BalanceSnapshot) bool {
+	return snap.Treasury == 850 && len(snap.Balances) == 2 &&
+		snap.Balances["audits"] == 100 && snap.Balances["legal"] == 50
+}
+
 func itoa(i int) string {
 	if i == 0 {
 		return "0"
