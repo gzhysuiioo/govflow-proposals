@@ -18,6 +18,10 @@ const batchRegisterUsage = `usage: govflow batch-register --registry FILE --batc
 run 'govflow help' for the full description and the registry file format.
 `
 
+const batchImportUsage = `usage: govflow batch-import --registry FILE --input FILE
+run 'govflow help' for the full description and the input file format.
+`
+
 func main() {
 	if err := run(os.Args[1:]); err != nil {
 		fmt.Fprintln(os.Stderr, "govflow:", err)
@@ -53,6 +57,8 @@ func run(args []string) error {
 		return nil
 	case "batch-register":
 		return runBatchRegister(args[1:], os.Stdout)
+	case "batch-import":
+		return runBatchImport(args[1:], os.Stdout)
 	default:
 		fmt.Fprintf(os.Stderr, "unknown command %q\n", command)
 		fmt.Fprint(os.Stderr, rootUsage())
@@ -73,6 +79,10 @@ usage:
       --batch ID --product ID --quantity N --unit UNIT
                                            register one supply-chain batch in
                                            the registry FILE (see below)
+  govflow batch-import --registry FILE --input FILE
+                                           register every batch listed in the
+                                           input FILE into the registry FILE in
+                                           one atomic submission (see below)
 
 batch-register flags:
   --registry FILE   registry file to read and write (required)
@@ -93,6 +103,29 @@ already registered with the identical product, quantity and unit; a duplicate
 does not rewrite the file and is safe to retry. Registering an existing batch
 with any different field is rejected; the error names the batch and the
 mismatching field(s) and no record is changed.
+
+batch-import flags:
+  --registry FILE   registry file to read and write (required)
+  --input FILE      read-only file holding the batch list (required)
+
+The input file is a non-empty JSON array; each element is an object with
+exactly the four fields batch, product, quantity, unit. The three text fields
+have leading and trailing whitespace removed and must be non-empty afterwards;
+quantity must be a JSON integer in 1..9223372036854775807 (strings, fractions
+and exponents are rejected). The input file is never written.
+
+Every record in the list is checked in order against the registry and against
+records already seen in the same list: identical product, quantity and unit
+means "duplicate"; any difference fails the whole import. A failing record is
+reported with its 1-based position, batch number and mismatching field(s),
+and no new batch from the list is saved. Only when every record is accepted
+are new batches appended (in first-occurrence order) and the registry file
+written; an all-duplicate list leaves the registry file untouched.
+
+On success stdout contains a single JSON object, e.g.
+  {"results":[{"batch":"B-001","product":"P-7","quantity":120,"unit":"kg","status":"created"}]}
+The results array lists every record in list order with its normalized fields
+and status ("created" or "duplicate").
 
 registry file format (UTF-8 JSON, human-inspectable):
   {
@@ -210,6 +243,86 @@ func runBatchRegister(args []string, stdout io.Writer) error {
 		Status:   status,
 	}
 	payload, err := json.Marshal(result)
+	if err != nil {
+		return err
+	}
+	_, err = fmt.Fprintln(stdout, string(payload))
+	return err
+}
+
+func runBatchImport(args []string, stdout io.Writer) error {
+	fs := flag.NewFlagSet("batch-import", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	registryPath := fs.String("registry", "", "registry `file` to read and write")
+	inputPath := fs.String("input", "", "read-only `file` holding the batch list")
+	if err := fs.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			fmt.Fprint(stdout, rootUsage())
+			return nil
+		}
+		return &usageError{msg: "batch-import: " + err.Error(), usage: batchImportUsage}
+	}
+	if fs.NArg() != 0 {
+		return &usageError{
+			msg:   fmt.Sprintf("batch-import: unexpected positional argument(s): %s", strings.Join(fs.Args(), " ")),
+			usage: batchImportUsage,
+		}
+	}
+	if *registryPath == "" || *inputPath == "" {
+		var missing []string
+		if *registryPath == "" {
+			missing = append(missing, "--registry")
+		}
+		if *inputPath == "" {
+			missing = append(missing, "--input")
+		}
+		return &usageError{
+			msg:   "batch-import: missing required flag(s): " + strings.Join(missing, ", "),
+			usage: batchImportUsage,
+		}
+	}
+
+	// The input file is read-only and must never be created or modified.
+	inputData, err := os.ReadFile(*inputPath)
+	if err != nil {
+		return fmt.Errorf("batch-import: cannot read input file %q: %w", *inputPath, err)
+	}
+	records, err := batchreg.ParseImportInput(inputData)
+	if err != nil {
+		return fmt.Errorf("batch-import: %w", err)
+	}
+
+	reg, existed, err := batchreg.Load(*registryPath)
+	if err != nil {
+		return err
+	}
+	results, err := batchreg.Import(reg, records)
+	if err != nil {
+		return err
+	}
+
+	// Save only when at least one record is new; an all-duplicate import
+	// leaves the registry file's bytes and mtime untouched.
+	anyCreated := false
+	for _, r := range results {
+		if r.Status == "created" {
+			anyCreated = true
+			break
+		}
+	}
+	if anyCreated {
+		if err := batchreg.Save(*registryPath, reg); err != nil {
+			if !existed {
+				// Nothing was registered before; drop any partial new file.
+				os.Remove(*registryPath)
+			}
+			return err
+		}
+	}
+
+	payload, err := json.Marshal(struct {
+		Results []batchreg.ImportResult `json:"results"`
+	}{Results: results})
 	if err != nil {
 		return err
 	}

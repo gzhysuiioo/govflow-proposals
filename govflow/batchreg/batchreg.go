@@ -216,6 +216,173 @@ func Register(reg *Registry, in Input) (Outcome, error) {
 	return Outcome{Batch: b, Created: true}, nil
 }
 
+// ImportRecord is one normalized record read from a batch-import input list.
+type ImportRecord struct {
+	Batch    string
+	Product  string
+	Quantity int64
+	Unit     string
+}
+
+// ImportResult is one entry of the batch-import outcome: the normalized
+// record and its status, in the list's original order.
+type ImportResult struct {
+	Batch    string `json:"batch"`
+	Product  string `json:"product"`
+	Quantity int64  `json:"quantity"`
+	Unit     string `json:"unit"`
+	Status   string `json:"status"`
+}
+
+// ImportConflictError reports that a record in an import list reuses a batch
+// id already held by the registry or by an earlier record of the same list,
+// with product, quantity or unit differing. Position is the 1-based record
+// number in the input list.
+type ImportConflictError struct {
+	Position int
+	Batch    string
+	Fields   []string
+}
+
+func (e *ImportConflictError) Error() string {
+	return fmt.Sprintf("record %d: batch %q is already registered with conflicting field(s): %s; the existing record cannot be overwritten",
+		e.Position, e.Batch, strings.Join(e.Fields, ", "))
+}
+
+// ParseImportInput strictly parses the batch-import input document. The
+// document must be a non-empty JSON array of objects, each containing exactly
+// the four fields batch, product, quantity and unit. The three text fields
+// are trimmed and must stay non-empty afterwards; quantity must be a JSON
+// integer in [1, MaxQuantity] — strings, fractions, exponents and other
+// non-integer forms are rejected. Every failure is reported with the
+// offending record's 1-based position.
+func ParseImportInput(data []byte) ([]ImportRecord, error) {
+	if len(bytes.TrimSpace(data)) == 0 {
+		return nil, errors.New("input file is empty")
+	}
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.DisallowUnknownFields()
+	var wire []struct {
+		Batch    *string         `json:"batch"`
+		Product  *string         `json:"product"`
+		Quantity json.RawMessage `json:"quantity"`
+		Unit     *string         `json:"unit"`
+	}
+	if err := dec.Decode(&wire); err != nil {
+		return nil, fmt.Errorf("input must be a non-empty JSON array of records: %w", err)
+	}
+	if len(wire) == 0 {
+		return nil, errors.New("input array is empty")
+	}
+	var extra json.RawMessage
+	if err := dec.Decode(&extra); !errors.Is(err, io.EOF) {
+		if err == nil {
+			return nil, errors.New("unexpected data after the JSON array")
+		}
+		return nil, err
+	}
+	records := make([]ImportRecord, 0, len(wire))
+	for i, w := range wire {
+		pos := i + 1
+		if w.Batch == nil {
+			return nil, fmt.Errorf("record %d: missing required field \"batch\"", pos)
+		}
+		if w.Product == nil {
+			return nil, fmt.Errorf("record %d: missing required field \"product\"", pos)
+		}
+		if w.Unit == nil {
+			return nil, fmt.Errorf("record %d: missing required field \"unit\"", pos)
+		}
+		if len(w.Quantity) == 0 {
+			return nil, fmt.Errorf("record %d: missing required field \"quantity\"", pos)
+		}
+		quantity, err := ParseQuantity(string(w.Quantity))
+		if err != nil {
+			return nil, fmt.Errorf("record %d: invalid quantity: %w", pos, err)
+		}
+		batch, err := NormalizeField(*w.Batch)
+		if err != nil {
+			return nil, fmt.Errorf("record %d: invalid batch: %w", pos, err)
+		}
+		product, err := NormalizeField(*w.Product)
+		if err != nil {
+			return nil, fmt.Errorf("record %d: invalid product: %w", pos, err)
+		}
+		unit, err := NormalizeField(*w.Unit)
+		if err != nil {
+			return nil, fmt.Errorf("record %d: invalid unit: %w", pos, err)
+		}
+		records = append(records, ImportRecord{
+			Batch: batch, Product: product, Quantity: quantity, Unit: unit,
+		})
+	}
+	return records, nil
+}
+
+// Import validates records against reg and produces the per-record status
+// list in list order. A record whose batch id matches an existing registry
+// record or an earlier record of this list is a duplicate when product,
+// quantity and unit all match; otherwise the whole import fails with
+// *ImportConflictError and reg is left untouched. New records are appended
+// to reg in first-occurrence order only after every record has been accepted,
+// so a rejected list never leaves partial new batches behind.
+func Import(reg *Registry, records []ImportRecord) ([]ImportResult, error) {
+	if reg.Version != FormatVersion {
+		return nil, fmt.Errorf("unsupported registry version %d", reg.Version)
+	}
+	added := make([]Batch, 0)
+	results := make([]ImportResult, 0, len(records))
+	for i, rec := range records {
+		pos := i + 1
+		if rec.Batch == "" || rec.Product == "" || rec.Unit == "" {
+			return nil, fmt.Errorf("record %d: batch, product and unit must be non-empty", pos)
+		}
+		if rec.Quantity <= 0 || rec.Quantity > MaxQuantity {
+			return nil, fmt.Errorf("record %d: quantity must be a positive integer no greater than %d", pos, MaxQuantity)
+		}
+		existing := findBatch(reg.Batches, rec.Batch)
+		if existing == nil {
+			existing = findBatch(added, rec.Batch)
+		}
+		if existing != nil {
+			var diffs []string
+			if existing.Product != rec.Product {
+				diffs = append(diffs, "product")
+			}
+			if existing.Quantity != rec.Quantity {
+				diffs = append(diffs, "quantity")
+			}
+			if existing.Unit != rec.Unit {
+				diffs = append(diffs, "unit")
+			}
+			if len(diffs) > 0 {
+				return nil, &ImportConflictError{Position: pos, Batch: rec.Batch, Fields: diffs}
+			}
+			results = append(results, ImportResult{
+				Batch: rec.Batch, Product: rec.Product, Quantity: rec.Quantity, Unit: rec.Unit,
+				Status: "duplicate",
+			})
+			continue
+		}
+		added = append(added, Batch{Batch: rec.Batch, Product: rec.Product, Quantity: rec.Quantity, Unit: rec.Unit})
+		results = append(results, ImportResult{
+			Batch: rec.Batch, Product: rec.Product, Quantity: rec.Quantity, Unit: rec.Unit,
+			Status: "created",
+		})
+	}
+	reg.Batches = append(reg.Batches, added...)
+	return results, nil
+}
+
+func findBatch(batches []Batch, id string) *Batch {
+	for i := range batches {
+		if batches[i].Batch == id {
+			return &batches[i]
+		}
+	}
+	return nil
+}
+
 // Save atomically writes reg to path, replacing the file only after the new
 // content is fully on disk so an existing registry stays usable on failure.
 // Records are serialized in their current order; the file is created with

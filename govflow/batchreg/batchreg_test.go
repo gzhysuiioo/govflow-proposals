@@ -336,3 +336,233 @@ func TestIndependentRegistries(t *testing.T) {
 		t.Fatal("each registry must manage its own ids")
 	}
 }
+
+func TestParseImportInputValid(t *testing.T) {
+	const max = "9223372036854775807"
+	data := []byte(`[
+		{"batch":" B1 ","product":" P1 ","quantity":10,"unit":" kg "},
+		{"batch":"B2","product":"P2","quantity":7,"unit":"kg"},
+		{"batch":"B3","product":"P3","quantity":` + max + `,"unit":"kg"}
+	]`)
+	records, err := ParseImportInput(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(records) != 3 {
+		t.Fatalf("got %d records", len(records))
+	}
+	want := []ImportRecord{
+		{Batch: "B1", Product: "P1", Quantity: 10, Unit: "kg"},
+		{Batch: "B2", Product: "P2", Quantity: 7, Unit: "kg"},
+		{Batch: "B3", Product: "P3", Quantity: MaxQuantity, Unit: "kg"},
+	}
+	for i, w := range want {
+		if records[i] != w {
+			t.Errorf("record %d = %+v, want %+v", i+1, records[i], w)
+		}
+	}
+}
+
+func TestParseImportInputRejects(t *testing.T) {
+	cases := map[string]string{
+		"empty file":        "",
+		"whitespace":        "  \n\t ",
+		"empty array":       "[]",
+		"object":            `{"batch":"B1"}`,
+		"string":            `["B1"]`,
+		"number":            `[1,2]`,
+		"null element":      `[null]`,
+		"missing batch":     `[{"product":"P1","quantity":1,"unit":"kg"}]`,
+		"missing product":   `[{"batch":"B1","quantity":1,"unit":"kg"}]`,
+		"missing quantity":  `[{"batch":"B1","product":"P1","unit":"kg"}]`,
+		"missing unit":      `[{"batch":"B1","product":"P1","quantity":1}]`,
+		"batch wrong type":  `[{"batch":1,"product":"P1","quantity":1,"unit":"kg"}]`,
+		"quantity string":   `[{"batch":"B1","product":"P1","quantity":"1","unit":"kg"}]`,
+		"quantity decimal":  `[{"batch":"B1","product":"P1","quantity":1.5,"unit":"kg"}]`,
+		"quantity exponent": `[{"batch":"B1","product":"P1","quantity":1e3,"unit":"kg"}]`,
+		"quantity zero":     `[{"batch":"B1","product":"P1","quantity":0,"unit":"kg"}]`,
+		"quantity negative": `[{"batch":"B1","product":"P1","quantity":-5,"unit":"kg"}]`,
+		"quantity too big":  `[{"batch":"B1","product":"P1","quantity":9223372036854775808,"unit":"kg"}]`,
+		"empty batch":       `[{"batch":"  ","product":"P1","quantity":1,"unit":"kg"}]`,
+		"empty product":     `[{"batch":"B1","product":"","quantity":1,"unit":"kg"}]`,
+		"empty unit":        `[{"batch":"B1","product":"P1","quantity":1,"unit":"  "}]`,
+		"unknown field":     `[{"batch":"B1","product":"P1","quantity":1,"unit":"kg","extra":1}]`,
+		"trailing data":     `[{"batch":"B1","product":"P1","quantity":1,"unit":"kg"}] garbage`,
+		"second record bad": `[{"batch":"B1","product":"P1","quantity":1,"unit":"kg"},{"batch":"B2","product":"P2","quantity":1.0,"unit":"kg"}]`,
+	}
+	for name, content := range cases {
+		t.Run(name, func(t *testing.T) {
+			if _, err := ParseImportInput([]byte(content)); err == nil {
+				t.Fatal("expected rejection")
+			}
+		})
+	}
+}
+
+func TestImportCreatesAndDuplicatesInOrder(t *testing.T) {
+	reg := &Registry{Version: FormatVersion}
+	records := []ImportRecord{
+		{Batch: "B1", Product: "P1", Quantity: 10, Unit: "kg"},
+		{Batch: "B1", Product: "P1", Quantity: 10, Unit: "kg"}, // in-list duplicate
+		{Batch: "B2", Product: "P2", Quantity: 20, Unit: "kg"},
+	}
+	results, err := Import(reg, records)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantStatus := []string{"created", "duplicate", "created"}
+	for i, w := range wantStatus {
+		if results[i].Status != w {
+			t.Errorf("result %d status = %q, want %q", i+1, results[i].Status, w)
+		}
+	}
+	if len(reg.Batches) != 2 {
+		t.Fatalf("registry should hold 2 new batches, got %d", len(reg.Batches))
+	}
+	if reg.Batches[0].Batch != "B1" || reg.Batches[1].Batch != "B2" {
+		t.Fatalf("new batches not in first-occurrence order: %+v", reg.Batches)
+	}
+}
+
+func TestImportDuplicateWithExisting(t *testing.T) {
+	reg := &Registry{
+		Version: FormatVersion,
+		Batches: []Batch{{Batch: "B1", Product: "P1", Quantity: 10, Unit: "kg"}},
+	}
+	records := []ImportRecord{
+		{Batch: "B1", Product: "P1", Quantity: 10, Unit: "kg"}, // existing duplicate
+		{Batch: "B2", Product: "P2", Quantity: 20, Unit: "kg"}, // new
+	}
+	results, err := Import(reg, records)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if results[0].Status != "duplicate" || results[1].Status != "created" {
+		t.Fatalf("unexpected statuses: %+v", results)
+	}
+	if len(reg.Batches) != 2 || reg.Batches[0].Batch != "B1" || reg.Batches[1].Batch != "B2" {
+		t.Fatalf("existing record must stay first, new appended: %+v", reg.Batches)
+	}
+}
+
+func TestImportConflictIsAtomic(t *testing.T) {
+	// Conflict with an earlier in-list record: the first record must not
+	// remain in the registry.
+	t.Run("in-list", func(t *testing.T) {
+		reg := &Registry{Version: FormatVersion}
+		records := []ImportRecord{
+			{Batch: "B1", Product: "P1", Quantity: 10, Unit: "kg"},
+			{Batch: "B1", Product: "P1", Quantity: 11, Unit: "kg"},
+		}
+		_, err := Import(reg, records)
+		var ce *ImportConflictError
+		if !errors.As(err, &ce) {
+			t.Fatalf("expected ImportConflictError, got %v", err)
+		}
+		if ce.Position != 2 || ce.Batch != "B1" {
+			t.Fatalf("conflict = position %d batch %q", ce.Position, ce.Batch)
+		}
+		if strings.Join(ce.Fields, ",") != "quantity" {
+			t.Fatalf("fields = %v", ce.Fields)
+		}
+		if len(reg.Batches) != 0 {
+			t.Fatalf("rejected import must not leave partial batches: %+v", reg.Batches)
+		}
+	})
+
+	// Conflict with an existing registry record: the registry is untouched.
+	t.Run("existing", func(t *testing.T) {
+		reg := &Registry{
+			Version: FormatVersion,
+			Batches: []Batch{{Batch: "B1", Product: "P1", Quantity: 10, Unit: "kg"}},
+		}
+		records := []ImportRecord{
+			{Batch: "B2", Product: "P2", Quantity: 20, Unit: "kg"},
+			{Batch: "B1", Product: "P1", Quantity: 99, Unit: "kg"},
+		}
+		_, err := Import(reg, records)
+		var ce *ImportConflictError
+		if !errors.As(err, &ce) || ce.Position != 2 || ce.Batch != "B1" {
+			t.Fatalf("expected ImportConflictError at record 2 for B1, got %v", err)
+		}
+		if len(reg.Batches) != 1 || reg.Batches[0].Quantity != 10 {
+			t.Fatalf("conflict must not mutate registry: %+v", reg.Batches)
+		}
+	})
+
+	// All three fields differing are reported together.
+	t.Run("all fields", func(t *testing.T) {
+		reg := &Registry{Version: FormatVersion}
+		records := []ImportRecord{
+			{Batch: "B1", Product: "P1", Quantity: 10, Unit: "kg"},
+			{Batch: "B1", Product: "X", Quantity: 1, Unit: "Y"},
+		}
+		_, err := Import(reg, records)
+		var ce *ImportConflictError
+		if !errors.As(err, &ce) {
+			t.Fatalf("expected ImportConflictError, got %v", err)
+		}
+		if strings.Join(ce.Fields, ",") != "product,quantity,unit" {
+			t.Fatalf("fields = %v", ce.Fields)
+		}
+	})
+}
+
+func TestImportAllDuplicatesLeavesFileUntouched(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "registry.json")
+	writeRegistry(t, path, `{"version":1,"batches":[{"batch":"B1","product":"P1","quantity":10,"unit":"kg"}]}`)
+	before, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	reg, _, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	records := []ImportRecord{
+		{Batch: "B1", Product: "P1", Quantity: 10, Unit: "kg"},
+		{Batch: "B1", Product: "P1", Quantity: 10, Unit: "kg"},
+	}
+	results, err := Import(reg, records)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, r := range results {
+		if r.Status != "duplicate" {
+			t.Fatalf("result %d status = %q, want duplicate", i+1, r.Status)
+		}
+	}
+	// The CLI skips Save when nothing was created; simulate that contract.
+	anyCreated := false
+	for _, r := range results {
+		if r.Status == "created" {
+			anyCreated = true
+		}
+	}
+	if anyCreated {
+		t.Fatal("all-duplicate import has nothing to save")
+	}
+	after, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.ModTime() != before.ModTime() || after.Size() != before.Size() {
+		t.Fatal("all-duplicate import rewrote the registry file")
+	}
+}
+
+func TestImportRejectsInvalidRecords(t *testing.T) {
+	reg := &Registry{Version: FormatVersion}
+	for _, rec := range []ImportRecord{
+		{Batch: "", Product: "P1", Quantity: 1, Unit: "kg"},
+		{Batch: "B1", Product: "", Quantity: 1, Unit: "kg"},
+		{Batch: "B1", Product: "P1", Quantity: 0, Unit: "kg"},
+		{Batch: "B1", Product: "P1", Quantity: -1, Unit: "kg"},
+		{Batch: "B1", Product: "P1", Quantity: 1, Unit: ""},
+	} {
+		if _, err := Import(reg, []ImportRecord{rec}); err == nil {
+			t.Fatalf("expected rejection for %+v", rec)
+		}
+	}
+}
