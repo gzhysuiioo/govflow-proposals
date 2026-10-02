@@ -525,6 +525,32 @@ func cloneReceipt(r *Receipt) *Receipt {
 
 // ---- 查询 ----
 
+// BalanceSnapshot 是同一份完整已提交状态下的资金库余额与全部收款账户余额。
+// 一次 BalanceSnapshot 调用只读取一次状态文件，保证返回的字段彼此一致：
+// 不会把不同提交时刻的余额拼在一起。
+type BalanceSnapshot struct {
+	Treasury int64            `json:"treasury"`
+	Balances map[string]int64 `json:"balances"`
+}
+
+// BalanceSnapshot 在一次持锁读取中取得资金库与全部收款账户余额。
+// 返回的 Balances 是副本（永不为 nil），调用方可自由使用；
+// 后续执行不会改变已返回的快照，下一次调用重新读取当前已提交状态。
+func (s *Store) BalanceSnapshot() (*BalanceSnapshot, error) {
+	state, err := s.readState()
+	if err != nil {
+		return nil, err
+	}
+	out := &BalanceSnapshot{
+		Treasury: state.Treasury,
+		Balances: make(map[string]int64, len(state.Balances)),
+	}
+	for k, v := range state.Balances {
+		out.Balances[k] = v
+	}
+	return out, nil
+}
+
 // TreasuryBalance 返回资金库当前余额。
 func (s *Store) TreasuryBalance() (int64, error) {
 	state, err := s.readState()

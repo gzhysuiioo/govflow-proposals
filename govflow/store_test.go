@@ -507,6 +507,123 @@ func TestConcurrentDifferentProposalsSpendCommittedBalance(t *testing.T) {
 	}
 }
 
+func TestBalanceSnapshotMatchesCommittedState(t *testing.T) {
+	store, _ := openTempStore(t, 1000)
+	defer store.Close()
+
+	snap, err := store.BalanceSnapshot()
+	if err != nil {
+		t.Fatalf("BalanceSnapshot: %v", err)
+	}
+	if snap.Treasury != 1000 || len(snap.Balances) != 0 {
+		t.Fatalf("initial snapshot = %+v, want treasury=1000 empty balances", snap)
+	}
+	if snap.Balances == nil {
+		t.Fatal("Balances must be a non-nil empty map")
+	}
+
+	mustRegister(t, store, "gip-1", 0, "transfer:audits:100", "transfer:legal:50")
+	if _, err := store.Execute("gip-1", 10); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+
+	// 已取得的快照不受后续执行影响；新一次查询看到新的已提交状态。
+	if snap.Treasury != 1000 || len(snap.Balances) != 0 {
+		t.Fatalf("snapshot mutated by later execute: %+v", snap)
+	}
+	next, err := store.BalanceSnapshot()
+	if err != nil {
+		t.Fatalf("BalanceSnapshot after execute: %v", err)
+	}
+	if next.Treasury != 850 || next.Balances["audits"] != 100 || next.Balances["legal"] != 50 || len(next.Balances) != 2 {
+		t.Fatalf("post-execute snapshot = %+v, want treasury=850 audits=100 legal=50", next)
+	}
+	// 返回的是副本：改写不影响后续查询。
+	next.Balances["audits"] = -1
+	again, _ := store.BalanceSnapshot()
+	if again.Balances["audits"] != 100 {
+		t.Fatalf("snapshot shares state with store: audits=%d", again.Balances["audits"])
+	}
+	// 未出现过的账户余额为 0，且快照查询不新增账户记录。
+	if again.Balances["ghost"] != 0 {
+		t.Fatalf("ghost balance = %d, want 0", again.Balances["ghost"])
+	}
+	if _, ok := again.Balances["ghost"]; ok {
+		t.Fatal("snapshot query must not create account entries")
+	}
+}
+
+func TestBalanceSnapshotConsistentUnderConcurrentExecute(t *testing.T) {
+	store, _ := openTempStore(t, 1000)
+	defer store.Close()
+	// 一项提案按顺序转 audits 100、legal 50；快照只允许出现
+	// “转账前”或“转账后”两种完整组合，不得出现中间态。
+	mustRegister(t, store, "gip-1", 0, "transfer:audits:100", "transfer:legal:50")
+
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	stop := make(chan struct{})
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		<-start
+		_, _ = store.Execute("gip-1", 0)
+		close(stop)
+	}()
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				snap, err := store.BalanceSnapshot()
+				if err != nil {
+					t.Errorf("BalanceSnapshot: %v", err)
+					return
+				}
+				pre := snap.Treasury == 1000 && len(snap.Balances) == 0
+				post := snap.Treasury == 850 && len(snap.Balances) == 2 &&
+					snap.Balances["audits"] == 100 && snap.Balances["legal"] == 50
+				if !pre && !post {
+					t.Errorf("inconsistent snapshot: %+v", snap)
+					return
+				}
+			}
+		}()
+	}
+	close(start)
+	wg.Wait()
+}
+
+func TestBalanceSnapshotSeesCrossHandleCommits(t *testing.T) {
+	// 同一状态文件的另一个句柄提交的转账，下一次快照必须可见。
+	store, path := openTempStore(t, 1000)
+	defer store.Close()
+	mustRegister(t, store, "gip-1", 0, "transfer:audits:100")
+
+	other, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open second handle: %v", err)
+	}
+	defer other.Close()
+	if _, err := other.Execute("gip-1", 0); err != nil {
+		t.Fatalf("Execute via second handle: %v", err)
+	}
+
+	snap, err := store.BalanceSnapshot()
+	if err != nil {
+		t.Fatalf("BalanceSnapshot: %v", err)
+	}
+	if snap.Treasury != 900 || snap.Balances["audits"] != 100 {
+		t.Fatalf("snapshot = %+v, want treasury=900 audits=100", snap)
+	}
+}
+
 func TestPathSpellingsShareLock(t *testing.T) {
 	dir := t.TempDir()
 	cwd, err := os.Getwd()
