@@ -158,6 +158,246 @@ func TestCreateVoteIdempotentAndConflict(t *testing.T) {
 	}
 }
 
+// memberPaths 抽取视图中每个成员的路径/直接委托对象/最终代表，便于按编号断言。
+func memberPaths(v *VoteProposalView) map[string]MemberView {
+	got := make(map[string]MemberView, len(v.Members))
+	for _, m := range v.Members {
+		got[m.ID] = MemberView{
+			ID:       m.ID,
+			Weight:   m.Weight,
+			Path:     append([]string(nil), m.Path...),
+			Delegate: m.Delegate,
+			Direct:   m.Direct,
+		}
+	}
+	return got
+}
+
+func TestDelegationPathNotShortenedByRosterOrder(t *testing.T) {
+	// 复现缺陷场景：成员按 b、c、a、d 的顺序提交，委托 a→b、b→c、d→b。
+	// a 与 d 的路径必须保留中间的 b，不得显示为直接到 c。
+	store, _ := openTempStore(t, 1000)
+	defer store.Close()
+	in := &CreateVoteInput{
+		ID:      "gip-ordered-chain",
+		Members: []VoteMember{{ID: "b", Weight: 2}, {ID: "c", Weight: 4}, {ID: "a", Weight: 1}, {ID: "d", Weight: 8}},
+		Delegations: []Delegation{
+			{From: "a", To: "b"},
+			{From: "b", To: "c"},
+			{From: "d", To: "b"},
+		},
+		Quorum: 1, StartAt: 0, Deadline: 10, TimelockEnd: 10,
+	}
+	view := mustCreateVote(t, store, in)
+
+	want := map[string]MemberView{
+		"a": {ID: "a", Weight: 1, Path: []string{"a", "b", "c"}, Delegate: "c", Direct: "b"},
+		"b": {ID: "b", Weight: 2, Path: []string{"b", "c"}, Delegate: "c", Direct: "c"},
+		"c": {ID: "c", Weight: 4, Path: []string{"c"}, Delegate: "c", Direct: ""},
+		"d": {ID: "d", Weight: 8, Path: []string{"d", "b", "c"}, Delegate: "c", Direct: "b"},
+	}
+	got := memberPaths(view)
+	assertMemberViews(t, "create", got, want)
+
+	// 成员列表仍按首次提交顺序展示，不被路径修正重排。
+	if ids := memberIDs(view.Members); !equalStrings(ids, []string{"b", "c", "a", "d"}) {
+		t.Fatalf("member order changed: %v", ids)
+	}
+
+	// 票重归集不变：c 代表全部 1+2+4+8=15；路径修正不改变最终代表与归集权重。
+	ballot, err := store.CastVote("gip-ordered-chain", "c", true, 5)
+	if err != nil {
+		t.Fatalf("final representative vote: %v", err)
+	}
+	if ballot.Weight != 15 {
+		t.Fatalf("group weight=%d, want 15", ballot.Weight)
+	}
+}
+
+func TestDelegationPathsOrderIndependent(t *testing.T) {
+	// 同一组权重与委托关系，无论成员及委托参数怎样排列，
+	// 每名成员的完整路径、直接委托对象和最终代表都必须一致。
+	spec := func(id string, members []VoteMember, delegations []Delegation) *CreateVoteInput {
+		return &CreateVoteInput{
+			ID: id, Members: members, Delegations: delegations,
+			Quorum: 1, StartAt: 0, Deadline: 10, TimelockEnd: 10,
+		}
+	}
+	// 两层链 a→b→c 与 d→b 汇入 c；另有互不相连的独立链 f→g，以及自代的 e。
+	membersA := []VoteMember{
+		{ID: "b", Weight: 2}, {ID: "c", Weight: 4}, {ID: "a", Weight: 1},
+		{ID: "d", Weight: 8}, {ID: "e", Weight: 16}, {ID: "f", Weight: 32}, {ID: "g", Weight: 64},
+	}
+	delegationsA := []Delegation{
+		{From: "d", To: "b"}, {From: "a", To: "b"}, {From: "f", To: "g"}, {From: "b", To: "c"},
+	}
+	membersB := []VoteMember{
+		{ID: "g", Weight: 64}, {ID: "f", Weight: 32}, {ID: "e", Weight: 16},
+		{ID: "d", Weight: 8}, {ID: "c", Weight: 4}, {ID: "a", Weight: 1}, {ID: "b", Weight: 2},
+	}
+	delegationsB := []Delegation{
+		{From: "b", To: "c"}, {From: "f", To: "g"}, {From: "a", To: "b"}, {From: "d", To: "b"},
+	}
+	want := map[string]MemberView{
+		"a": {ID: "a", Weight: 1, Path: []string{"a", "b", "c"}, Delegate: "c", Direct: "b"},
+		"b": {ID: "b", Weight: 2, Path: []string{"b", "c"}, Delegate: "c", Direct: "c"},
+		"c": {ID: "c", Weight: 4, Path: []string{"c"}, Delegate: "c", Direct: ""},
+		"d": {ID: "d", Weight: 8, Path: []string{"d", "b", "c"}, Delegate: "c", Direct: "b"},
+		"e": {ID: "e", Weight: 16, Path: []string{"e"}, Delegate: "e", Direct: ""},
+		"f": {ID: "f", Weight: 32, Path: []string{"f", "g"}, Delegate: "g", Direct: "g"},
+		"g": {ID: "g", Weight: 64, Path: []string{"g"}, Delegate: "g", Direct: ""},
+	}
+
+	store1, _ := openTempStore(t, 1000)
+	defer store1.Close()
+	v1 := mustCreateVote(t, store1, spec("gip-perm-1", membersA, delegationsA))
+	assertMemberViews(t, "order A", memberPaths(v1), want)
+
+	store2, _ := openTempStore(t, 1000)
+	defer store2.Close()
+	v2 := mustCreateVote(t, store2, spec("gip-perm-2", membersB, delegationsB))
+	assertMemberViews(t, "order B", memberPaths(v2), want)
+
+	// 同一提案换序重试：返回已有提案、不重排已保存成员、不产生新记录。
+	retry := spec("gip-perm-1", membersB, delegationsB)
+	again, existed, err := store1.CreateVoteProposal(retry)
+	if err != nil || !existed {
+		t.Fatalf("reordered retry existed=%v err=%v", existed, err)
+	}
+	if ids := memberIDs(again.Members); !equalStrings(ids, memberIDs(v1.Members)) {
+		t.Fatalf("retry reordered stored members: %v want %v", ids, memberIDs(v1.Members))
+	}
+	all, _ := store1.VoteProposals()
+	if len(all) != 1 {
+		t.Fatalf("retry created an extra proposal record: %d", len(all))
+	}
+	assertMemberViews(t, "retry", memberPaths(again), want)
+
+	// 更深的转交链：a→b→c→d→e(停)，每个中间成员都必须出现在上游路径中。
+	deep := &CreateVoteInput{
+		ID: "gip-deep",
+		Members: []VoteMember{
+			{ID: "e", Weight: 1}, {ID: "d", Weight: 1}, {ID: "c", Weight: 1},
+			{ID: "b", Weight: 1}, {ID: "a", Weight: 1},
+		},
+		Delegations: []Delegation{
+			{From: "a", To: "b"}, {From: "b", To: "c"}, {From: "c", To: "d"}, {From: "d", To: "e"},
+		},
+		Quorum: 1, StartAt: 0, Deadline: 10, TimelockEnd: 10,
+	}
+	store3, _ := openTempStore(t, 1000)
+	defer store3.Close()
+	dv := mustCreateVote(t, store3, deep)
+	dgot := memberPaths(dv)
+	for id, p := range map[string][]string{
+		"a": {"a", "b", "c", "d", "e"},
+		"b": {"b", "c", "d", "e"},
+		"c": {"c", "d", "e"},
+		"d": {"d", "e"},
+		"e": {"e"},
+	} {
+		if !equalStrings(dgot[id].Path, p) {
+			t.Errorf("deep member %s path=%v want %v", id, dgot[id].Path, p)
+		}
+		if dgot[id].Delegate != "e" {
+			t.Errorf("deep member %s head=%s want e", id, dgot[id].Delegate)
+		}
+	}
+}
+
+func TestDelegationPathsSurviveReopen(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "treasury.json")
+	store, err := InitTreasury(path, 1000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	in := &CreateVoteInput{
+		ID:      "gip-reopen-chain",
+		Members: []VoteMember{{ID: "b", Weight: 2}, {ID: "c", Weight: 4}, {ID: "a", Weight: 1}, {ID: "d", Weight: 8}},
+		Delegations: []Delegation{
+			{From: "a", To: "b"}, {From: "b", To: "c"}, {From: "d", To: "b"},
+		},
+		Quorum: 15, StartAt: 0, Deadline: 10, TimelockEnd: 10,
+		Actions: []string{"transfer:audits:15"},
+	}
+	mustCreateVote(t, store, in)
+	if _, err := store.CastVote("gip-reopen-chain", "c", true, 5); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.TallyVote("gip-reopen-chain", 10); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Execute("gip-reopen-chain", 10); err != nil {
+		t.Fatal(err)
+	}
+	store.Close()
+
+	// 关闭后重新打开：无须重新创建，多级委托路径直接完整显示，状态与记录保留。
+	reopened, err := Open(path)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer reopened.Close()
+	v, ok, err := reopened.VoteProposal("gip-reopen-chain")
+	if err != nil || !ok {
+		t.Fatalf("query after reopen: %v ok=%v", err, ok)
+	}
+	want := map[string]MemberView{
+		"a": {ID: "a", Weight: 1, Path: []string{"a", "b", "c"}, Delegate: "c", Direct: "b"},
+		"b": {ID: "b", Weight: 2, Path: []string{"b", "c"}, Delegate: "c", Direct: "c"},
+		"c": {ID: "c", Weight: 4, Path: []string{"c"}, Delegate: "c", Direct: ""},
+		"d": {ID: "d", Weight: 8, Path: []string{"d", "b", "c"}, Delegate: "c", Direct: "b"},
+	}
+	assertMemberViews(t, "reopen", memberPaths(v), want)
+	if v.State != "executed" || v.Tally == nil || !v.Tally.Passed {
+		t.Fatalf("state/tally after reopen: state=%s tally=%+v", v.State, v.Tally)
+	}
+	if len(v.Ballots) != 1 || v.Ballots[0].Representative != "c" || v.Ballots[0].Weight != 15 {
+		t.Fatalf("ballot after reopen: %+v", v.Ballots)
+	}
+	if r, ok, _ := reopened.Receipt("gip-reopen-chain"); !ok || r.ExecutedAt != 10 {
+		t.Fatalf("receipt after reopen: %+v ok=%v", r, ok)
+	}
+}
+
+func memberIDs(ms []MemberView) []string {
+	ids := make([]string, len(ms))
+	for i, m := range ms {
+		ids[i] = m.ID
+	}
+	return ids
+}
+
+func assertMemberViews(t *testing.T, prefix string, got, want map[string]MemberView) {
+	t.Helper()
+	if len(got) != len(want) {
+		t.Fatalf("%s: member count=%d want %d", prefix, len(got), len(want))
+	}
+	for id, w := range want {
+		g, ok := got[id]
+		if !ok {
+			t.Errorf("%s: member %s missing from view", prefix, id)
+			continue
+		}
+		if !equalStrings(g.Path, w.Path) {
+			t.Errorf("%s: member %s path=%v want %v", prefix, id, g.Path, w.Path)
+		}
+		// 路径的相邻成员必须对应一次真实委托；无重复成员；首尾为本人和最终代表。
+		if len(g.Path) == 0 || g.Path[0] != id || g.Path[len(g.Path)-1] != g.Delegate {
+			t.Errorf("%s: member %s path %v inconsistent with self/final representative %q", prefix, id, g.Path, g.Delegate)
+		}
+		if g.Delegate != w.Delegate {
+			t.Errorf("%s: member %s delegate=%q want %q", prefix, id, g.Delegate, w.Delegate)
+		}
+		if g.Direct != w.Direct {
+			t.Errorf("%s: member %s direct_to=%q want %q", prefix, id, g.Direct, w.Direct)
+		}
+		if g.Weight != w.Weight {
+			t.Errorf("%s: member %s weight=%d want %d", prefix, id, g.Weight, w.Weight)
+		}
+	}
+}
+
 func TestDelegationChains(t *testing.T) {
 	store, _ := openTempStore(t, 1000)
 	defer store.Close()

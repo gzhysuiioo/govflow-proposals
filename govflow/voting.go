@@ -204,7 +204,12 @@ func validateProposalInput(in *CreateVoteInput) (*proposalSpec, error) {
 		delegate[d.From] = d.To
 	}
 
-	// 解析每条委托链：自委托已拦，这里检测循环并得到最终代表。
+	// 解析每名成员的委托路径：从本人出发，沿直接委托对象逐次前行，
+	// 直到未再委托的最终代表。每个成员出度至多 1，且自委托/循环已被拦截，
+	// 所以该遍历必然终止。
+	// 命中已解析成员时必须拼接其“完整路径”（去掉与之重复的衔接点），
+	// 不能直接跳到它的最终代表，否则多跳链上的中间委托对象会丢失。
+	// 结果只依赖委托关系本身，与成员及委托参数的提交顺序无关。
 	pathOf := make(map[string][]string, len(weights))
 	headOf := make(map[string]string, len(weights))
 	for _, id := range order {
@@ -217,15 +222,15 @@ func validateProposalInput(in *CreateVoteInput) (*proposalSpec, error) {
 		for {
 			next, has := delegate[cur]
 			if !has {
-				break
+				break // cur 即未再委托的最终代表
 			}
 			if pos, cyc := onChain[next]; cyc {
 				return nil, invalidProposal("proposal %s: delegation cycle involving %q", in.ID, chain[pos])
 			}
-			if head, resolved := headOf[next]; resolved {
-				cur = head
-				chain = append(chain, cur)
-				onChain[cur] = len(chain) - 1
+			if resolved, ok := pathOf[next]; ok {
+				// 拼接已解析的完整后缀；resolved[0] == next，逐跳衔接且无重复成员。
+				chain = append(chain, resolved...)
+				cur = resolved[len(resolved)-1]
 				break
 			}
 			chain = append(chain, next)
@@ -233,12 +238,12 @@ func validateProposalInput(in *CreateVoteInput) (*proposalSpec, error) {
 			cur = next
 		}
 		head := cur
-		// 链上每个成员的路径都是自身后缀到 head。
+		// 链上每个成员的路径都是自身到 head 的后缀。命中已解析后缀时，
+		// 后缀成员均已登记，这里只补齐尚未解析的成员。
 		for i := 0; i < len(chain); i++ {
 			member := chain[i]
 			if _, ok := headOf[member]; !ok {
-				path := append([]string(nil), chain[i:]...)
-				pathOf[member] = path
+				pathOf[member] = append([]string(nil), chain[i:]...)
 				headOf[member] = head
 			}
 		}
