@@ -505,30 +505,28 @@ func runProposals(args []string) {
 		fail(err)
 	}
 	defer store.Close()
-	registered, err := store.Proposals()
-	if err != nil {
-		fail(err)
-	}
-	voting, err := store.VoteProposals()
+	// 一次快照读取保证两种来源的提案来自同一份已提交状态，
+	// 不会把并发执行前后的状态拼在同一份列表里。
+	snapshot, err := store.ProposalsSnapshot()
 	if err != nil {
 		fail(err)
 	}
 	if cf.asJSON {
 		// 保持既有 JSON 形状：一个数组；登记记录字段不变，投票提案带额外字段。
-		merged := make([]any, 0, len(registered)+len(voting))
-		for _, r := range registered {
+		merged := make([]any, 0, len(snapshot.Registered)+len(snapshot.Voting))
+		for _, r := range snapshot.Registered {
 			merged = append(merged, r)
 		}
-		for _, v := range voting {
+		for _, v := range snapshot.Voting {
 			merged = append(merged, v)
 		}
 		emitJSON(merged)
 		return
 	}
-	for _, record := range registered {
+	for _, record := range snapshot.Registered {
 		printProposalText(record)
 	}
-	for _, view := range voting {
+	for _, view := range snapshot.Voting {
 		printVoteProposalText(view)
 	}
 }

@@ -624,6 +624,116 @@ func TestBalanceSnapshotSeesCrossHandleCommits(t *testing.T) {
 	}
 }
 
+func TestProposalsSnapshotConsistentUnderConcurrentExecute(t *testing.T) {
+	store, _ := openTempStore(t, 1000)
+	defer store.Close()
+	// 登记提案与投票提案最初都为 passed；另一个句柄先执行登记提案、
+	// 再执行投票提案。并发的列表快照只允许出现“都未执行”“仅登记提案
+	// 已执行”“都已执行”三种完整组合，不得出现登记提案仍为 passed
+	// 而投票提案已 executed 的混杂状态。
+	mustRegister(t, store, "reg-1", 0, "transfer:audits:100")
+	voteIn := baseVoteInput("vote-1")
+	voteIn.Actions = []string{"transfer:legal:50"}
+	mustCreateVote(t, store, voteIn)
+	if _, err := store.CastVote("vote-1", "alice", true, 100); err != nil {
+		t.Fatalf("CastVote: %v", err)
+	}
+	if _, err := store.CastVote("vote-1", "dave", true, 100); err != nil {
+		t.Fatalf("CastVote: %v", err)
+	}
+	if _, err := store.TallyVote("vote-1", 200); err != nil {
+		t.Fatalf("TallyVote: %v", err)
+	}
+
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	stop := make(chan struct{})
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		<-start
+		if _, err := store.Execute("reg-1", 0); err != nil {
+			t.Errorf("Execute reg-1: %v", err)
+			return
+		}
+		_, _ = store.Execute("vote-1", 300)
+		close(stop)
+	}()
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				snap, err := store.ProposalsSnapshot()
+				if err != nil {
+					t.Errorf("ProposalsSnapshot: %v", err)
+					return
+				}
+				if len(snap.Registered) != 1 || len(snap.Voting) != 1 {
+					t.Errorf("snapshot sizes = %d registered, %d voting; want 1 and 1",
+						len(snap.Registered), len(snap.Voting))
+					return
+				}
+				regState := snap.Registered[0].State
+				voteState := snap.Voting[0].State
+				if regState == "passed" && voteState == "executed" {
+					t.Errorf("inconsistent snapshot: registered=%s voting=%s", regState, voteState)
+					return
+				}
+			}
+		}()
+	}
+	close(start)
+	wg.Wait()
+}
+
+func TestProposalsSnapshotEmptyAndLegacyState(t *testing.T) {
+	// 没有提案时两个列表都为空（非 nil）。
+	store, _ := openTempStore(t, 1000)
+	defer store.Close()
+	snap, err := store.ProposalsSnapshot()
+	if err != nil {
+		t.Fatalf("ProposalsSnapshot: %v", err)
+	}
+	if snap.Registered == nil || snap.Voting == nil || len(snap.Registered) != 0 || len(snap.Voting) != 0 {
+		t.Fatalf("empty snapshot = %+v, want two empty non-nil lists", snap)
+	}
+
+	// 旧状态文件缺少 vote_proposals 部分时仍可列出登记提案。
+	path := filepath.Join(t.TempDir(), "legacy.json")
+	legacy := `{
+  "magic": "govflow-treasury-state",
+  "version": 1,
+  "initial_treasury": 500,
+  "treasury": 500,
+  "balances": {},
+  "proposals": {"gip-1": {"id": "gip-1", "state": "passed", "timelock_end": 0, "actions": ["transfer:audits:100"]}},
+  "receipts": []
+}
+`
+	if err := os.WriteFile(path, []byte(legacy), 0o600); err != nil {
+		t.Fatalf("write legacy state: %v", err)
+	}
+	old, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open legacy state: %v", err)
+	}
+	defer old.Close()
+	snap, err = old.ProposalsSnapshot()
+	if err != nil {
+		t.Fatalf("ProposalsSnapshot on legacy state: %v", err)
+	}
+	if len(snap.Registered) != 1 || snap.Registered[0].ID != "gip-1" || len(snap.Voting) != 0 {
+		t.Fatalf("legacy snapshot = %+v, want only gip-1 registered", snap)
+	}
+}
+
 func TestPathSpellingsShareLock(t *testing.T) {
 	dir := t.TempDir()
 	cwd, err := os.Getwd()
