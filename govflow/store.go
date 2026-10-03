@@ -9,7 +9,9 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -690,7 +692,7 @@ func (s *Store) loadLocked() (*storedState, error) {
 	if len(bytes.TrimSpace(raw)) == 0 {
 		return nil, fmt.Errorf("%w: %s: file is empty", ErrStateCorrupt, s.path)
 	}
-	if err := rejectDuplicateKeys(raw); err != nil {
+	if err := checkStateStructure(raw); err != nil {
 		return nil, fmt.Errorf("%w: %s: %v", ErrStateCorrupt, s.path, err)
 	}
 	var state storedState
@@ -902,16 +904,110 @@ func validateState(state *storedState) error {
 	return nil
 }
 
-// scanFrame 是重复键扫描的栈帧。
-type scanFrame struct {
-	isArray bool
-	seen    map[string]bool
-	atValue bool // 对象帧：下一个待消费 token 是值而非键
+// ---- 结构检查：固定字段名逐字匹配 + 重复键拒绝 ----
+
+// schemaKind 是状态文件 JSON 在某一层的形状类别。
+type schemaKind int
+
+const (
+	kindAny    schemaKind = iota // 叶子值：结构检查不深入，类型由解码器核对
+	kindObject                   // 固定字段对象：键必须与保存格式的字段名逐字一致
+	kindMap                      // 业务编号表：键是自由文本（账户名、提案编号）
+	kindArray                    // 数组
+)
+
+// schemaNode 描述状态文件某一层允许的形状。整棵树由 storedState 的 json tag
+// 反射生成，字段名集合因此永远与保存格式一致，不会随结构演进而漂移。
+type schemaNode struct {
+	kind   schemaKind
+	fields map[string]*schemaNode // kindObject：字段名 → 值的形状
+	elem   *schemaNode            // kindMap/kindArray：值/元素的形状
 }
 
-func rejectDuplicateKeys(raw []byte) error {
+// schemaOf 按 encoding/json 的字段名规则（json tag 优先，缺省用字段名）推导形状。
+func schemaOf(t reflect.Type) *schemaNode {
+	for t.Kind() == reflect.Pointer {
+		t = t.Elem()
+	}
+	switch t.Kind() {
+	case reflect.Struct:
+		node := &schemaNode{kind: kindObject, fields: map[string]*schemaNode{}}
+		for i := 0; i < t.NumField(); i++ {
+			f := t.Field(i)
+			if f.PkgPath != "" { // 未导出字段不参与 JSON
+				continue
+			}
+			name := f.Name
+			if tag, ok := f.Tag.Lookup("json"); ok {
+				tagName, _, _ := strings.Cut(tag, ",")
+				if tagName == "-" {
+					continue
+				}
+				if tagName != "" {
+					name = tagName
+				}
+			}
+			node.fields[name] = schemaOf(f.Type)
+		}
+		return node
+	case reflect.Map:
+		return &schemaNode{kind: kindMap, elem: schemaOf(t.Elem())}
+	case reflect.Slice, reflect.Array:
+		return &schemaNode{kind: kindArray, elem: schemaOf(t.Elem())}
+	default:
+		return &schemaNode{kind: kindAny}
+	}
+}
+
+var storedStateSchema = schemaOf(reflect.TypeOf(storedState{}))
+
+// scanFrame 是结构扫描的栈帧。
+type scanFrame struct {
+	node    *schemaNode
+	isArray bool
+	opaque  bool // 形状不符或叶子位置的容器：只配对括号，类型错误交给解码器报告
+	seen    map[string]bool
+	atValue bool // 对象帧：下一个待消费 token 是值而非键
+	index   int  // 数组帧：下一个元素下标
+	path    string
+}
+
+func peekFrame(stack []*scanFrame) *scanFrame {
+	if len(stack) == 0 {
+		return nil
+	}
+	return stack[len(stack)-1]
+}
+
+// checkStateStructure 在解码前逐 token 扫描状态文件：
+//   - 同一对象内键（按 JSON 解读后的字符串，转义拼写与普通拼写视为同一键）不得重复；
+//   - 固定字段对象的键必须与保存格式的字段名逐字一致：大小写变体（如 Treasury、
+//     Support）与未知字段一样拒绝，避免解码器的大小写折叠把两份值并入同一字段；
+//   - balances/proposals/vote_proposals 等业务编号表的键是自由文本，
+//     Audit 与 audit、GIP-1 与 gip-1 是不同账户/编号，不做字段名检查。
+//
+// 报错带有出问题的字段与所在记录的路径（如 vote_proposals["GIP-1"].ballots[0]），
+// 便于定位。字段顺序、缩进与合法转义不影响判定。
+func checkStateStructure(raw []byte) error {
 	dec := json.NewDecoder(bytes.NewReader(raw))
 	var stack []*scanFrame
+	// 对象帧读到键时，把该键对应值的形状与路径暂存于此，供紧随其后的值使用。
+	pendingNode := storedStateSchema
+	pendingPath := "state"
+
+	// 一个值消费完毕：推进父帧的键/值位置或数组下标。
+	finishValue := func() {
+		top := peekFrame(stack)
+		if top == nil || top.opaque {
+			return
+		}
+		if top.isArray {
+			top.index++
+		} else {
+			top.atValue = false
+		}
+	}
+
 	for {
 		tok, err := dec.Token()
 		if err == io.EOF {
@@ -923,44 +1019,88 @@ func rejectDuplicateKeys(raw []byte) error {
 		if err != nil {
 			return err
 		}
-		switch t := tok.(type) {
-		case json.Delim:
-			switch t {
-			case '{':
-				stack = append(stack, &scanFrame{seen: map[string]bool{}})
+
+		if top := peekFrame(stack); top != nil && top.opaque {
+			// 不透明容器内不做字段检查，只配对括号。
+			if d, ok := tok.(json.Delim); ok {
+				if d == '{' || d == '[' {
+					stack = append(stack, &scanFrame{opaque: true})
+				} else {
+					stack = stack[:len(stack)-1]
+					finishValue()
+				}
+			}
+			continue
+		}
+
+		if top := peekFrame(stack); top != nil && !top.isArray && !top.atValue {
+			// 对象帧的键位置：闭括号或下一个键。
+			if d, ok := tok.(json.Delim); ok {
+				if d != '}' {
+					return fmt.Errorf("unexpected %q inside object at %s", string(d), top.path)
+				}
+				stack = stack[:len(stack)-1]
+				finishValue()
 				continue
-			case '[':
-				stack = append(stack, &scanFrame{isArray: true})
-				continue
-			case '}', ']':
+			}
+			key, ok := tok.(string)
+			if !ok {
+				return errors.New("object key must be a string")
+			}
+			if top.seen[key] {
+				return fmt.Errorf("duplicate key %q at %s", key, top.path)
+			}
+			top.seen[key] = true
+			top.atValue = true
+			switch top.node.kind {
+			case kindObject:
+				child, known := top.node.fields[key]
+				if !known {
+					return fmt.Errorf("unknown field %q at %s", key, top.path)
+				}
+				pendingNode = child
+				pendingPath = top.path + "." + key
+			case kindMap:
+				// 业务编号是自由文本，大小写变体属于不同编号，不得拒绝或合并。
+				pendingNode = top.node.elem
+				pendingPath = top.path + "[" + strconv.Quote(key) + "]"
+			}
+			continue
+		}
+
+		// 值位置：对象键之后的值或数组元素。
+		node := pendingNode
+		path := pendingPath
+		if top := peekFrame(stack); top != nil && top.isArray {
+			node = top.node.elem
+			path = top.path + "[" + strconv.Itoa(top.index) + "]"
+		}
+		if d, ok := tok.(json.Delim); ok {
+			switch d {
+			case '{', '[':
+				frame := &scanFrame{isArray: d == '[', path: path}
+				shapeOK := (d == '{' && (node.kind == kindObject || node.kind == kindMap)) ||
+					(d == '[' && node.kind == kindArray)
+				if !shapeOK {
+					// 叶子位置出现容器或形状不符：跳过内容，类型错误由解码器报告。
+					frame.opaque = true
+				} else {
+					frame.node = node
+					if d == '{' {
+						frame.seen = map[string]bool{}
+					}
+				}
+				stack = append(stack, frame)
+			default: // '}' 或 ']'：数组结束（对象的闭括号已在键位置处理）
 				if len(stack) == 0 {
 					return errors.New("unexpected closing delimiter")
 				}
 				stack = stack[:len(stack)-1]
-				// 关闭的容器本身是外层对象的某个“值”，消费完毕后外层等待下一个键。
-				if len(stack) > 0 && !stack[len(stack)-1].isArray {
-					stack[len(stack)-1].atValue = false
-				}
-				continue
+				finishValue()
 			}
-		default:
-			// 标量 token。
+			continue
 		}
-		if len(stack) > 0 && !stack[len(stack)-1].isArray {
-			frame := stack[len(stack)-1]
-			if !frame.atValue {
-				key, ok := tok.(string)
-				if !ok {
-					return errors.New("object key must be a string")
-				}
-				if frame.seen[key] {
-					return fmt.Errorf("duplicate key %q", key)
-				}
-				frame.seen[key] = true
-				frame.atValue = true
-			} else {
-				frame.atValue = false
-			}
-		}
+		// 标量值。
+		finishValue()
 	}
 }

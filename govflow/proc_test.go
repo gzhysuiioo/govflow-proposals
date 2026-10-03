@@ -430,3 +430,39 @@ func TestReopenAfterClose(t *testing.T) {
 		t.Fatalf("balance after reopen = %d", bal)
 	}
 }
+
+// TestCLIRejectsCaseVariantField：固定字段名的大小写变体让整个状态文件被拒绝，
+// 命令行将原因（含问题字段）写到标准错误并以状态码 1 退出，文件不被改写。
+func TestCLIRejectsCaseVariantField(t *testing.T) {
+	binary := buildCLI(t)
+	dir := t.TempDir()
+	state := filepath.Join(dir, "treasury.json")
+	if _, se, code := runCLI(t, binary, state, "init", "--balance", "100"); code != 0 {
+		t.Fatalf("init exit=%d: %s", code, se)
+	}
+	raw, err := os.ReadFile(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	corrupt := strings.Replace(string(raw), `"treasury": 100`, `"Treasury": 100`, 1)
+	if corrupt == string(raw) {
+		t.Fatalf("setup: treasury field not found in %s", raw)
+	}
+	if err := os.WriteFile(state, []byte(corrupt), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	so, se, code := runCLI(t, binary, state, "balances")
+	if code != 1 {
+		t.Fatalf("balances exit=%d, want 1 (stdout=%q stderr=%q)", code, so, se)
+	}
+	if !strings.Contains(se, "corrupt") || !strings.Contains(se, `"Treasury"`) {
+		t.Fatalf("stderr should name the corruption and the field, got %q", se)
+	}
+	// 不提供部分余额信息，也不整理或写回原文件。
+	if so != "" {
+		t.Fatalf("stdout should be empty on corruption, got %q", so)
+	}
+	if got, err := os.ReadFile(state); err != nil || string(got) != corrupt {
+		t.Fatalf("corrupt file was modified")
+	}
+}

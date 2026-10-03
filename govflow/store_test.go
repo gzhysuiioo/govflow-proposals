@@ -1,6 +1,7 @@
 package govflow
 
 import (
+	"encoding/json"
 	"errors"
 	"math"
 	"os"
@@ -750,4 +751,232 @@ func TestAtomicFileIsAlwaysValid(t *testing.T) {
 	time.Sleep(50 * time.Millisecond)
 	close(stop)
 	wg.Wait()
+}
+
+// TestFixedFieldNamesMustMatchExactly 固定字段名必须与保存格式逐字一致：
+// 大小写变体（Treasury、Support 等）、同一对象内的大小写双胞胎（state 与 State，
+// 即使两个值相同）、转义写法的重复键，都导致整个文件被拒绝；
+// 业务编号（账户、提案编号）的大小写变体是不同编号，不得被合并或拒绝。
+func TestFixedFieldNamesMustMatchExactly(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "treasury.json")
+	store, err := InitTreasury(path, 1000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 两个只差大小写的提案编号与收款账户：合法数据，必须都能正常读回。
+	mustRegister(t, store, "GIP-1", 0, "transfer:Audit:100")
+	mustRegister(t, store, "gip-1", 0, "transfer:audit:50")
+	if _, err := store.Execute("GIP-1", 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Execute("gip-1", 0); err != nil {
+		t.Fatal(err)
+	}
+	mustCreateVote(t, store, baseVoteInput("gip-vote"))
+	if _, err := store.CastVote("gip-vote", "alice", true, 150); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.TallyVote("gip-vote", 200); err != nil {
+		t.Fatal(err)
+	}
+	store.Close()
+
+	good, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 正常文件（含大小写不同的业务编号）原样可读。
+	assertReadable := func(t *testing.T, raw []byte) {
+		t.Helper()
+		p := filepath.Join(dir, strings.ReplaceAll(t.Name(), "/", "-")+".json")
+		if err := os.WriteFile(p, raw, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		s, err := Open(p)
+		if err != nil {
+			t.Fatalf("readable variant rejected: %v", err)
+		}
+		defer s.Close()
+		if got, err := s.Balance("Audit"); err != nil || got != 100 {
+			t.Fatalf("Balance(Audit)=%d err=%v, want 100", got, err)
+		}
+		if got, err := s.Balance("audit"); err != nil || got != 50 {
+			t.Fatalf("Balance(audit)=%d err=%v, want 50", got, err)
+		}
+		if _, ok, err := s.Proposal("GIP-1"); err != nil || !ok {
+			t.Fatalf("Proposal(GIP-1) ok=%v err=%v", ok, err)
+		}
+		if _, ok, err := s.Proposal("gip-1"); err != nil || !ok {
+			t.Fatalf("Proposal(gip-1) ok=%v err=%v", ok, err)
+		}
+	}
+
+	t.Run("baseline", func(t *testing.T) { assertReadable(t, good) })
+
+	t.Run("reordered and reindented", func(t *testing.T) {
+		// 字段顺序与缩进不影响读取。
+		var asMap map[string]any
+		if err := json.Unmarshal(good, &asMap); err != nil {
+			t.Fatal(err)
+		}
+		raw, err := json.Marshal(asMap) // map 重marshal后键序变为字典序、无缩进
+		if err != nil {
+			t.Fatal(err)
+		}
+		assertReadable(t, raw)
+	})
+
+	t.Run("escaped field names", func(t *testing.T) {
+		// 转义拼写与普通拼写表示同一个字段：单独出现正常识别。
+		raw := strings.Replace(string(good), `"version": 1`, `"\u0076ersion": 1`, 1)
+		raw = strings.Replace(raw, `"timelock_end"`, `"\u0074imelock_end"`, 1)
+		assertReadable(t, []byte(raw))
+	})
+
+	// ---- 拒绝变体：每个都整文件拒绝，错误指出字段与所在记录，文件不被改写 ----
+
+	mutate := func(fn func(root map[string]any)) []byte {
+		var clone map[string]any
+		if err := json.Unmarshal(good, &clone); err != nil {
+			t.Fatal(err)
+		}
+		fn(clone)
+		raw, err := json.MarshalIndent(clone, "", "  ")
+		if err != nil {
+			t.Fatal(err)
+		}
+		return append(raw, '\n')
+	}
+	rename := func(obj map[string]any, old, new string) {
+		v, ok := obj[old]
+		if !ok {
+			t.Fatalf("setup: key %q missing", old)
+		}
+		obj[new] = v
+		delete(obj, old)
+	}
+	proposal := func(root map[string]any) map[string]any {
+		return root["proposals"].(map[string]any)["GIP-1"].(map[string]any)
+	}
+	vote := func(root map[string]any) map[string]any {
+		return root["vote_proposals"].(map[string]any)["gip-vote"].(map[string]any)
+	}
+	receipt := func(root map[string]any) map[string]any {
+		return root["receipts"].([]any)[0].(map[string]any)
+	}
+
+	rejected := map[string]struct {
+		raw  []byte
+		want []string // 错误原因应包含的片段（字段名与所在记录）
+	}{
+		"top-level Treasury": {
+			raw:  mutate(func(root map[string]any) { rename(root, "treasury", "Treasury") }),
+			want: []string{`"Treasury"`},
+		},
+		"proposal State": {
+			raw:  mutate(func(root map[string]any) { rename(proposal(root), "state", "State") }),
+			want: []string{`"State"`, `proposals["GIP-1"]`},
+		},
+		"proposal state and State twins": {
+			// 同一记录里同时放入 state 与 State，即使值相同也拒绝。
+			raw: mutate(func(root map[string]any) {
+				p := proposal(root)
+				p["State"] = p["state"]
+			}),
+			want: []string{`"State"`, `proposals["GIP-1"]`},
+		},
+		"ballot Support": {
+			raw: mutate(func(root map[string]any) {
+				rename(vote(root)["ballots"].([]any)[0].(map[string]any), "support", "Support")
+			}),
+			want: []string{`"Support"`, `vote_proposals["gip-vote"].ballots[0]`},
+		},
+		"tally Tallied_at": {
+			raw: mutate(func(root map[string]any) {
+				rename(vote(root)["tally"].(map[string]any), "tallied_at", "Tallied_at")
+			}),
+			want: []string{`"Tallied_at"`, ".tally"},
+		},
+		"receipt Proposal_ID": {
+			raw:  mutate(func(root map[string]any) { rename(receipt(root), "proposal_id", "Proposal_ID") }),
+			want: []string{`"Proposal_ID"`, "receipts[0]"},
+		},
+		"receipt balance Before": {
+			raw: mutate(func(root map[string]any) {
+				rename(receipt(root)["actions"].([]any)[0].(map[string]any)["treasury"].(map[string]any), "before", "Before")
+			}),
+			want: []string{`"Before"`, ".treasury"},
+		},
+		"member Weight": {
+			raw: mutate(func(root map[string]any) {
+				rename(vote(root)["members"].([]any)[0].(map[string]any), "weight", "Weight")
+			}),
+			want: []string{`"Weight"`, ".members[0]"},
+		},
+		"delegation From": {
+			raw: mutate(func(root map[string]any) {
+				rename(vote(root)["delegations"].([]any)[0].(map[string]any), "from", "From")
+			}),
+			want: []string{`"From"`, ".delegations[0]"},
+		},
+		"unknown field still rejected": {
+			raw:  mutate(func(root map[string]any) { proposal(root)["comment"] = "x" }),
+			want: []string{`"comment"`, `proposals["GIP-1"]`},
+		},
+		"escaped duplicate state": {
+			// 转义拼写与普通拼写是同一个键：同一对象出现两次属重复键。
+			raw: []byte(strings.Replace(string(good),
+				`"state": "executed"`, `"state": "executed", "st\u0061te": "executed"`, 1)),
+			want: []string{`duplicate key "state"`, `proposals["GIP-1"]`},
+		},
+	}
+	for name, tc := range rejected {
+		t.Run(name, func(t *testing.T) {
+			bad := filepath.Join(dir, "bad-"+strings.ReplaceAll(name, " ", "-")+".json")
+			if err := os.WriteFile(bad, tc.raw, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			s, err := Open(bad)
+			if !errors.Is(err, ErrStateCorrupt) {
+				if s != nil {
+					s.Close()
+				}
+				t.Fatalf("Open err=%v, want ErrStateCorrupt", err)
+			}
+			for _, want := range tc.want {
+				if !strings.Contains(err.Error(), want) {
+					t.Fatalf("error %q should mention %s", err.Error(), want)
+				}
+			}
+			// 损坏文件不被整理或写回。
+			if got, rerr := os.ReadFile(bad); rerr != nil || string(got) != string(tc.raw) {
+				t.Fatalf("corrupt file was modified")
+			}
+		})
+	}
+
+	t.Run("reads after corruption", func(t *testing.T) {
+		// 打开后文件被改成非法字段：后续读取同样返回状态损坏，不提供部分信息。
+		p := filepath.Join(dir, "live.json")
+		if err := os.WriteFile(p, good, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		s, err := Open(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer s.Close()
+		bad := mutate(func(root map[string]any) { rename(root, "treasury", "Treasury") })
+		if err := os.WriteFile(p, bad, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.BalanceSnapshot(); !errors.Is(err, ErrStateCorrupt) {
+			t.Fatalf("BalanceSnapshot on corrupted file err=%v, want ErrStateCorrupt", err)
+		}
+		if _, _, err := s.Proposal("GIP-1"); !errors.Is(err, ErrStateCorrupt) {
+			t.Fatalf("Proposal on corrupted file err=%v, want ErrStateCorrupt", err)
+		}
+	})
 }
