@@ -102,6 +102,104 @@ func TestRegisterIdempotentAndConflict(t *testing.T) {
 	}
 }
 
+// TestTransferParityAcrossSourcesAndReplay：登记来源与投票通过来源的提案，
+// 只要动作原文序列相同，成功执行产生的逐笔资金变动（资金库与收款账户前后余额）
+// 与最终余额就必须一致；重新打开时凭据重放走同一条转账规则，结果仍一致。
+func TestTransferParityAcrossSourcesAndReplay(t *testing.T) {
+	actions := []string{"transfer:audits:250", "transfer:audits:100", "transfer:legal:50"}
+
+	run := func(t *testing.T, viaVote bool) (*Receipt, *BalanceSnapshot) {
+		store, _ := openTempStore(t, 1000)
+		t.Cleanup(func() { store.Close() })
+		if viaVote {
+			in := baseVoteInput("gip-v")
+			in.Actions = actions
+			mustCreateVote(t, store, in)
+			if _, err := store.CastVote("gip-v", "alice", true, 150); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := store.CastVote("gip-v", "dave", true, 150); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := store.TallyVote("gip-v", 200); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := store.Execute("gip-v", 300); err != nil {
+				t.Fatalf("execute vote proposal: %v", err)
+			}
+		} else {
+			mustRegister(t, store, "gip-r", 300, actions...)
+			if _, err := store.Execute("gip-r", 300); err != nil {
+				t.Fatalf("execute registered proposal: %v", err)
+			}
+		}
+		id := "gip-r"
+		if viaVote {
+			id = "gip-v"
+		}
+		r, ok, err := store.Receipt(id)
+		if err != nil || !ok {
+			t.Fatalf("receipt lookup: ok=%v err=%v", ok, err)
+		}
+		snap, err := store.BalanceSnapshot()
+		if err != nil {
+			t.Fatal(err)
+		}
+		return r, snap
+	}
+
+	regReceipt, regSnap := run(t, false)
+	voteReceipt, voteSnap := run(t, true)
+	if len(regReceipt.Actions) != len(voteReceipt.Actions) {
+		t.Fatalf("action receipt length differs: %d vs %d", len(regReceipt.Actions), len(voteReceipt.Actions))
+	}
+	for i := range regReceipt.Actions {
+		a, b := regReceipt.Actions[i], voteReceipt.Actions[i]
+		if a.Action != b.Action || a.Index != b.Index ||
+			a.Treasury != b.Treasury || a.Recipient != b.Recipient {
+			t.Fatalf("action %d movement differs by source:\nregister=%+v\nvote=%+v", i, a, b)
+		}
+	}
+	if regSnap.Treasury != voteSnap.Treasury || regSnap.Treasury != 600 {
+		t.Fatalf("treasury differs: register=%d vote=%d, want 600", regSnap.Treasury, voteSnap.Treasury)
+	}
+	for acct, want := range map[string]int64{"audits": 350, "legal": 50} {
+		if regSnap.Balances[acct] != want || voteSnap.Balances[acct] != want {
+			t.Fatalf("account %s differs: register=%d vote=%d, want %d",
+				acct, regSnap.Balances[acct], voteSnap.Balances[acct], want)
+		}
+	}
+
+	// 端到端：金额恰好等于资金库剩余余额可以成功，重开后凭据与余额一致。
+	path := filepath.Join(t.TempDir(), "treasury.json")
+	store, err := InitTreasury(path, 250)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustRegister(t, store, "gip-exact", 0, "transfer:a:100", "transfer:b:150")
+	r, err := store.Execute("gip-exact", 0)
+	if err != nil {
+		t.Fatalf("exact-remaining execute: %v", err)
+	}
+	if r.Actions[1].Treasury.Before != 150 || r.Actions[1].Treasury.After != 0 {
+		t.Fatalf("final draw should take treasury 150->0: %+v", r.Actions[1].Treasury)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := Open(path) // 凭据重放走同一条转账规则：文件必须仍判为合法
+	if err != nil {
+		t.Fatalf("reopen after exact-remaining spend: %v", err)
+	}
+	defer reopened.Close()
+	if bal, _ := reopened.TreasuryBalance(); bal != 0 {
+		t.Fatalf("treasury after reopen = %d, want 0", bal)
+	}
+	if bal, _ := reopened.Balance("b"); bal != 150 {
+		t.Fatalf("b after reopen = %d, want 150", bal)
+	}
+}
+
 func TestExecuteHappyPathAndReceiptShape(t *testing.T) {
 	store, _ := openTempStore(t, 1000)
 	defer store.Close()
