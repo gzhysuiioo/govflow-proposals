@@ -546,12 +546,16 @@ func (s *Store) VoteProposals() ([]*VoteProposalView, error) {
 	if err != nil {
 		return nil, err
 	}
+	return voteProposalViews(state), nil
+}
+
+func voteProposalViews(state *storedState) []*VoteProposalView {
 	out := make([]*VoteProposalView, 0, len(state.VoteProposals))
 	for _, p := range state.VoteProposals {
 		out = append(out, voteProposalView(p))
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
-	return out, nil
+	return out
 }
 
 func voteProposalView(p *storedVoteProposal) *VoteProposalView {

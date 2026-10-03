@@ -946,3 +946,128 @@ func TestCreateVoteBoundaryTimesAndQuorum(t *testing.T) {
 		t.Fatalf("negative quorum err=%v", err)
 	}
 }
+
+func TestProposalsSnapshotContentsAndCopies(t *testing.T) {
+	store, _ := openTempStore(t, 1000)
+	defer store.Close()
+
+	// 空状态：两个列表都为空且非 nil。
+	snap, err := store.ProposalsSnapshot()
+	if err != nil {
+		t.Fatalf("ProposalsSnapshot: %v", err)
+	}
+	if snap.Registered == nil || snap.Voting == nil {
+		t.Fatalf("empty snapshot lists must be non-nil: %+v", snap)
+	}
+	if len(snap.Registered) != 0 || len(snap.Voting) != 0 {
+		t.Fatalf("empty snapshot = %+v", snap)
+	}
+
+	mustRegister(t, store, "gip-reg-b", 0, "transfer:audits:100")
+	mustRegister(t, store, "gip-reg-a", 0, "transfer:legal:50")
+	in := baseVoteInput("gip-vote-b")
+	mustCreateVote(t, store, in)
+	in2 := baseVoteInput("gip-vote-a")
+	mustCreateVote(t, store, in2)
+	if _, err := store.CastVote("gip-vote-a", "alice", true, 100); err != nil {
+		t.Fatalf("CastVote: %v", err)
+	}
+	if _, err := store.TallyVote("gip-vote-a", 200); err != nil {
+		t.Fatalf("TallyVote: %v", err)
+	}
+
+	snap, err = store.ProposalsSnapshot()
+	if err != nil {
+		t.Fatalf("ProposalsSnapshot: %v", err)
+	}
+	// 各来源内部按编号排序。
+	if len(snap.Registered) != 2 || snap.Registered[0].ID != "gip-reg-a" || snap.Registered[1].ID != "gip-reg-b" {
+		t.Fatalf("registered order = %+v", snap.Registered)
+	}
+	if len(snap.Voting) != 2 || snap.Voting[0].ID != "gip-vote-a" || snap.Voting[1].ID != "gip-vote-b" {
+		t.Fatalf("voting order = %+v", snap.Voting)
+	}
+	// 投票提案保留成员、委托路径、逐票与计票结论。
+	va := snap.Voting[0]
+	if va.State != "passed" || va.Tally == nil || !va.Tally.Passed || va.Tally.ForWeight != 600 {
+		t.Fatalf("tallied view = %+v", va)
+	}
+	if len(va.Members) != 4 || va.Members[1].ID != "bob" || va.Members[1].Delegate != "alice" ||
+		len(va.Members[1].Path) != 2 || va.Members[1].Path[0] != "bob" || va.Members[1].Path[1] != "alice" {
+		t.Fatalf("member delegation view = %+v", va.Members)
+	}
+	if len(va.Ballots) != 1 || va.Ballots[0].Representative != "alice" || va.Ballots[0].Weight != 600 {
+		t.Fatalf("ballots = %+v", va.Ballots)
+	}
+
+	// 返回的是副本：改写快照不影响后续查询。
+	snap.Registered[0].State = "executed"
+	snap.Voting[0].State = "executed"
+	again, err := store.ProposalsSnapshot()
+	if err != nil {
+		t.Fatalf("ProposalsSnapshot: %v", err)
+	}
+	if again.Registered[0].State != "passed" || again.Voting[0].State != "passed" {
+		t.Fatalf("snapshot shares state with store: %+v", again)
+	}
+}
+
+func TestProposalsSnapshotConsistentUnderConcurrentExecute(t *testing.T) {
+	store, _ := openTempStore(t, 1000)
+	defer store.Close()
+	// 登记提案与投票提案最初都为 passed 且时间锁已到期；
+	// 执行方先执行登记提案，再执行投票提案。快照只允许出现
+	// (passed,passed)、(executed,passed)、(executed,executed) 三种完整组合，
+	// 不得出现登记提案仍为 passed 而投票提案已 executed 的混杂状态。
+	mustRegister(t, store, "gip-reg", 0, "transfer:audits:100")
+	mustCreateVote(t, store, baseVoteInput("gip-vote"))
+	if _, err := store.CastVote("gip-vote", "alice", true, 100); err != nil {
+		t.Fatalf("CastVote: %v", err)
+	}
+	if _, err := store.TallyVote("gip-vote", 200); err != nil {
+		t.Fatalf("TallyVote: %v", err)
+	}
+
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	stop := make(chan struct{})
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		<-start
+		_, _ = store.Execute("gip-reg", 300)
+		_, _ = store.Execute("gip-vote", 300)
+		close(stop)
+	}()
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				snap, err := store.ProposalsSnapshot()
+				if err != nil {
+					t.Errorf("ProposalsSnapshot: %v", err)
+					return
+				}
+				if len(snap.Registered) != 1 || len(snap.Voting) != 1 {
+					t.Errorf("snapshot sizes = %d/%d, want 1/1", len(snap.Registered), len(snap.Voting))
+					return
+				}
+				reg := snap.Registered[0].State
+				vote := snap.Voting[0].State
+				if reg == "passed" && vote == "executed" {
+					t.Errorf("mixed committed states: registered=%s voting=%s", reg, vote)
+					return
+				}
+			}
+		}()
+	}
+	close(start)
+	wg.Wait()
+}

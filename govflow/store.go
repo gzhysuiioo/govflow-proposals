@@ -601,12 +601,38 @@ func (s *Store) Proposals() ([]ProposalRecord, error) {
 	if err != nil {
 		return nil, err
 	}
+	return proposalRecords(state), nil
+}
+
+func proposalRecords(state *storedState) []ProposalRecord {
 	out := make([]ProposalRecord, 0, len(state.Proposals))
 	for _, p := range state.Proposals {
 		out = append(out, toProposalRecord(p))
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
-	return out, nil
+	return out
+}
+
+// ProposalsSnapshot 是同一份完整已提交状态下的登记提案与投票提案列表。
+// 一次 ProposalsSnapshot 调用只读取一次状态文件，保证两个来源的提案状态、
+// 动作与投票明细彼此一致：不会把不同提交时刻的提案状态拼在一起。
+type ProposalsSnapshot struct {
+	Registered []ProposalRecord    `json:"registered"`
+	Voting     []*VoteProposalView `json:"voting"`
+}
+
+// ProposalsSnapshot 在一次持锁读取中取得全部登记提案与全部投票提案。
+// Registered 按编号排序，Voting 按编号排序；返回的切片与记录均为副本，
+// 后续执行不会改变已返回的快照，下一次调用重新读取当前已提交状态。
+func (s *Store) ProposalsSnapshot() (*ProposalsSnapshot, error) {
+	state, err := s.readState()
+	if err != nil {
+		return nil, err
+	}
+	return &ProposalsSnapshot{
+		Registered: proposalRecords(state),
+		Voting:     voteProposalViews(state),
+	}, nil
 }
 
 func toProposalRecord(p *storedProposal) ProposalRecord {

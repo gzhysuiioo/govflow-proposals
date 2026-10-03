@@ -505,14 +505,14 @@ func runProposals(args []string) {
 		fail(err)
 	}
 	defer store.Close()
-	registered, err := store.Proposals()
+	// 一次快照读取保证登记提案与投票提案来自同一份已提交状态，
+	// 不会把并发执行前后的提案状态拼在一起。
+	snapshot, err := store.ProposalsSnapshot()
 	if err != nil {
 		fail(err)
 	}
-	voting, err := store.VoteProposals()
-	if err != nil {
-		fail(err)
-	}
+	registered := snapshot.Registered
+	voting := snapshot.Voting
 	if cf.asJSON {
 		// 保持既有 JSON 形状：一个数组；登记记录字段不变，投票提案带额外字段。
 		merged := make([]any, 0, len(registered)+len(voting))
