@@ -44,17 +44,13 @@ func Vote(proposal *Proposal, weight int64, support bool) error {
 
 // Tally returns the state a proposal moves to under quorum and majority rules.
 // 只返回结论，不改写提案状态、票数或任何执行动作。
+// 法定人数与严格多数的判定复用投票提案唯一的通过规则 votePasses，
+// 保证两侧合计溢出 int64（乃至恰好为上限）时结论仍正确。
 func Tally(proposal *Proposal) string {
 	if proposal.State != "voting" {
 		return proposal.State
 	}
-	// 两侧各自可表示时合计仍可能超过 int64，直接相加会回绕成负数，
-	// 把已达到法定人数的提案误判为参与不足。比较剩余容量即可在不做
-	// 上溢加法的前提下判断真实参与量 for+against 是否达到法定人数。
-	if proposal.ForVotes < proposal.Quorum-proposal.AgainstVotes {
-		return "rejected"
-	}
-	if proposal.ForVotes > proposal.AgainstVotes {
+	if votePasses(proposal.ForVotes, proposal.AgainstVotes, proposal.Quorum) {
 		return "passed"
 	}
 	return "rejected"

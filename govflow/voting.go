@@ -371,6 +371,96 @@ func tallyReject(reason string) error {
 	return fmt.Errorf("%w: %s", ErrTallyRejected, reason)
 }
 
+// ---- 计票规则（唯一实现，首次计票、打开校验、查询结论共用） ----
+
+// ballotCounts 是按逐票明细汇总出的两侧权重。参与量只统计最终代表
+// 实际投出的票，未投成员的权重既不在 For 也不在 Against 中，
+// 因而不会被计入 Turnout，更不能直接拿成员总权重充当参与量。
+type ballotCounts struct {
+	forWeight     int64
+	againstWeight int64
+}
+
+// turnout 返回参与权重（赞成与反对之和），ok 表示合计未溢出 int64。
+// 两侧各自不超过合法成员总权重时合计必不溢出；此处仍显式检查，
+// 使“总权重恰好为 math.MaxInt64”的合法提案也不依赖该前提。
+func (c ballotCounts) turnout() (int64, bool) {
+	return addInt64(c.forWeight, c.againstWeight)
+}
+
+// votePasses 是唯一的通过条件：参与权重达到法定人数（恰好达到也算）
+// 且赞成严格多于反对。平票、无人投票或参与不足一律不通过。
+// 通过比较法定人数剩余容量判断参与量，避免 for+against 上溢时回绕为负，
+// 把已达标（乃至总权重恰好为 int64 上限）的提案误判为参与不足。
+func votePasses(forWeight, againstWeight, quorum int64) bool {
+	if forWeight <= againstWeight {
+		return false // 平票或赞成更少都不通过；两侧非负，无票时同样落在这里
+	}
+	return forWeight >= quorum-againstWeight // 等价于 for+against >= quorum，且不做上溢加法
+}
+
+// tallyVerdict 把通过条件映射为提案首次计票后的状态。
+func tallyVerdict(passed bool) string {
+	if passed {
+		return "passed"
+	}
+	return "rejected"
+}
+
+// countBallots 只按票据选择累加两侧权重，不做代表资格与票重核对
+// （资格核对由 verifyBallots 负责）。任何一侧溢出 int64 都返回损坏错误。
+func countBallots(ballots []storedBallot) (ballotCounts, error) {
+	var c ballotCounts
+	for _, b := range ballots {
+		if b.Support {
+			sum, ok := addInt64(c.forWeight, b.Weight)
+			if !ok {
+				return ballotCounts{}, errors.New("for-side ballot weights overflow int64")
+			}
+			c.forWeight = sum
+		} else {
+			sum, ok := addInt64(c.againstWeight, b.Weight)
+			if !ok {
+				return ballotCounts{}, errors.New("against-side ballot weights overflow int64")
+			}
+			c.againstWeight = sum
+		}
+	}
+	return c, nil
+}
+
+// verifyBallots 依据成员名单与委托关系逐票核对并汇总：
+// 代表必须是最终代表、不得重复、票重必须等于委托后归集到其名下的权重。
+// 这些条件全部由打开状态文件时的严格校验保证，首次计票路径再核对一次，
+// 使两条路径对“票重/代表是否可信”的判定使用同一份规则。
+// 汇总只含实际投出的票；任一条件不符返回带具体原因的错误，
+// 错误分类（ErrStateCorrupt）由调用方按自身路径统一包装。
+func verifyBallots(id string, ballots []storedBallot, spec *proposalSpec) (ballotCounts, error) {
+	seen := map[string]bool{}
+	for i, b := range ballots {
+		if b.Representative == "" {
+			return ballotCounts{}, fmt.Errorf("proposal %s ballot %d has empty representative", id, i)
+		}
+		if spec.headOf[b.Representative] != b.Representative {
+			return ballotCounts{}, fmt.Errorf("proposal %s ballot %d: %q is not a final representative",
+				id, i, b.Representative)
+		}
+		if seen[b.Representative] {
+			return ballotCounts{}, fmt.Errorf("proposal %s has duplicate stored ballot for %q", id, b.Representative)
+		}
+		seen[b.Representative] = true
+		if b.Weight != spec.groupW[b.Representative] {
+			return ballotCounts{}, fmt.Errorf("proposal %s ballot weight for %q (%d) does not match roster delegation (%d)",
+				id, b.Representative, b.Weight, spec.groupW[b.Representative])
+		}
+	}
+	counts, err := countBallots(ballots)
+	if err != nil {
+		return ballotCounts{}, fmt.Errorf("proposal %s %v", id, err)
+	}
+	return counts, nil
+}
+
 // CastVote 在一项投票提案上投票。调用方通过 now 提供当前时间。
 // 只有最终代表本人可投赞成/反对票，每位代表一张票，票重为归集到其名下的
 // 全部原始权重。相同选择的重试始终返回首次记录；改投报冲突。
@@ -470,40 +560,15 @@ func (s *Store) TallyVote(id string, now int64) (*TallyResultView, error) {
 	if verr != nil {
 		return nil, verr
 	}
-	var forW, againstW int64
-	seen := map[string]bool{}
-	for _, b := range p.Ballots {
-		if seen[b.Representative] {
-			return nil, fmt.Errorf("%w: proposal %s has duplicate stored ballot for %q", ErrStateCorrupt, id, b.Representative)
-		}
-		seen[b.Representative] = true
-		if b.Weight != spec.groupW[b.Representative] {
-			return nil, fmt.Errorf("%w: proposal %s ballot weight for %q (%d) does not match roster delegation (%d)",
-				ErrStateCorrupt, id, b.Representative, b.Weight, spec.groupW[b.Representative])
-		}
-		if b.Support {
-			sum, ok := addInt64(forW, b.Weight)
-			if !ok {
-				return nil, fmt.Errorf("%w: proposal %s vote weights overflow int64", ErrStateCorrupt, id)
-			}
-			forW = sum
-		} else {
-			sum, ok := addInt64(againstW, b.Weight)
-			if !ok {
-				return nil, fmt.Errorf("%w: proposal %s vote weights overflow int64", ErrStateCorrupt, id)
-			}
-			againstW = sum
-		}
+	// 计票规则只有一份：同一套“代表资格 + 票重 + 两侧汇总 + 法定人数/多数”
+	// 同时用于首次计票、打开文件时的重放校验与查询结论。
+	counts, verr := verifyBallots(id, p.Ballots, spec)
+	if verr != nil {
+		return nil, fmt.Errorf("%w: %v", ErrStateCorrupt, verr)
 	}
-
-	turnout, _ := addInt64(forW, againstW) // 不超过总权重
-	passed := turnout >= p.Quorum && forW > againstW
-	p.Tally = &storedTally{ForWeight: forW, AgainstWeight: againstW, TalliedAt: now}
-	if passed {
-		p.State = "passed"
-	} else {
-		p.State = "rejected"
-	}
+	passed := votePasses(counts.forWeight, counts.againstWeight, p.Quorum)
+	p.Tally = &storedTally{ForWeight: counts.forWeight, AgainstWeight: counts.againstWeight, TalliedAt: now}
+	p.State = tallyVerdict(passed)
 	if err := s.commitLocked(state); err != nil {
 		return nil, err
 	}
@@ -511,18 +576,21 @@ func (s *Store) TallyVote(id string, now int64) (*TallyResultView, error) {
 }
 
 // storedTallyResult 从已存储提案重建首次计票结论；尚未计票时返回 nil。
-// Passed 按票数与法定人数重算：提案后续执行（executed）不改变首次结论。
+// Passed 由唯一的通过规则（votePasses）按保存权重重算：提案后续执行
+// （executed）不改变首次结论，查询结论与首次计票结论因此始终一致。
+// 调用方持有的状态均经过 validateState，两侧合计必然不超过合法总权重。
 func storedTallyResult(p *storedVoteProposal) *TallyResultView {
 	if p.Tally == nil {
 		return nil
 	}
-	turnout := p.Tally.ForWeight + p.Tally.AgainstWeight
+	c := ballotCounts{forWeight: p.Tally.ForWeight, againstWeight: p.Tally.AgainstWeight}
+	turnout, _ := c.turnout()
 	return &TallyResultView{
-		ForWeight:     p.Tally.ForWeight,
-		AgainstWeight: p.Tally.AgainstWeight,
+		ForWeight:     c.forWeight,
+		AgainstWeight: c.againstWeight,
 		Turnout:       turnout,
 		Quorum:        p.Quorum,
-		Passed:        p.Tally.ForWeight > p.Tally.AgainstWeight && turnout >= p.Quorum,
+		Passed:        votePasses(c.forWeight, c.againstWeight, p.Quorum),
 		TalliedAt:     p.Tally.TalliedAt,
 	}
 }
@@ -650,40 +718,19 @@ func validateVoteProposals(state *storedState) error {
 			return err
 		}
 
-		// 票据明细：代表必须是最终代表，票重必须等于名单与委托归集出的权重。
-		seenReps := map[string]bool{}
-		var ballotFor, ballotAgainst int64
-		for i, b := range p.Ballots {
-			if b.Representative == "" {
-				return fmt.Errorf("voting proposal %q ballot %d has empty representative", p.ID, i)
-			}
-			if spec.headOf[b.Representative] != b.Representative {
-				return fmt.Errorf("voting proposal %q ballot %d: %q is not a final representative", p.ID, i, b.Representative)
-			}
-			if seenReps[b.Representative] {
-				return fmt.Errorf("voting proposal %q has duplicate ballot for representative %q", p.ID, b.Representative)
-			}
-			seenReps[b.Representative] = true
-			if b.Weight != spec.groupW[b.Representative] {
-				return fmt.Errorf("voting proposal %q ballot weight for %q is %d, roster/delegations yield %d",
-					p.ID, b.Representative, b.Weight, spec.groupW[b.Representative])
-			}
+		// 票据明细的代表资格、重复票据、票重与两侧汇总，全部复用首次计票的
+		// verifyBallots：打开重放与首次计票对“票重/代表是否可信”只有一份判定，
+		// 汇总只含最终代表实际投出的票，未投成员权重不进入参与量。
+		counts, err := verifyBallots(p.ID, p.Ballots, spec)
+		if err != nil {
+			return err
+		}
+		// 首次投票时间必须落在窗口 [start, deadline) 内；此约束与票重汇总无关，
+		// 仍只属于打开时的明细校验。
+		for _, b := range p.Ballots {
 			if b.VotedAt < p.StartAt || b.VotedAt >= p.Deadline {
 				return fmt.Errorf("voting proposal %q ballot by %q cast at %d outside window [%d,%d)",
 					p.ID, b.Representative, b.VotedAt, p.StartAt, p.Deadline)
-			}
-			if b.Support {
-				sum, ok := addInt64(ballotFor, b.Weight)
-				if !ok {
-					return fmt.Errorf("voting proposal %q ballot weights overflow int64", p.ID)
-				}
-				ballotFor = sum
-			} else {
-				sum, ok := addInt64(ballotAgainst, b.Weight)
-				if !ok {
-					return fmt.Errorf("voting proposal %q ballot weights overflow int64", p.ID)
-				}
-				ballotAgainst = sum
 			}
 		}
 
@@ -699,12 +746,13 @@ func validateVoteProposals(state *storedState) error {
 			if p.Tally.TalliedAt < p.Deadline {
 				return fmt.Errorf("voting proposal %q tallied at %d before deadline %d", p.ID, p.Tally.TalliedAt, p.Deadline)
 			}
-			if p.Tally.ForWeight != ballotFor || p.Tally.AgainstWeight != ballotAgainst {
+			if p.Tally.ForWeight != counts.forWeight || p.Tally.AgainstWeight != counts.againstWeight {
 				return fmt.Errorf("voting proposal %q tally weights for=%d/against=%d do not replay ballots for=%d/against=%d",
-					p.ID, p.Tally.ForWeight, p.Tally.AgainstWeight, ballotFor, ballotAgainst)
+					p.ID, p.Tally.ForWeight, p.Tally.AgainstWeight, counts.forWeight, counts.againstWeight)
 			}
-			turnout := ballotFor + ballotAgainst
-			passedNow := turnout >= p.Quorum && ballotFor > ballotAgainst
+			// 通过条件同样只有一份：保存状态必须与票据重放出的结论一致，
+			// executed 是 passed 提案执行后的后继状态，仍对应“首次通过”。
+			passedNow := votePasses(counts.forWeight, counts.againstWeight, p.Quorum)
 			if passedNow != (p.State == "passed" || p.State == "executed") {
 				return fmt.Errorf("voting proposal %q state %s does not match quorum/majority replay", p.ID, p.State)
 			}

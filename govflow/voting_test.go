@@ -1071,3 +1071,232 @@ func TestProposalsSnapshotConsistentUnderConcurrentExecute(t *testing.T) {
 	close(start)
 	wg.Wait()
 }
+
+// TestTallyAtInt64WeightBoundary：合法成员总权重恰好为有符号 64 位整数上限时，
+// 首次计票、查询结论与重开后的汇总/结论都不能因数值边界改变：
+// 参与量恰好等于法定人数（MaxInt64）且赞成严格多于反对即通过；
+// 无票时参与量为 0，绝不能把成员总权重当成参与量。
+func TestTallyAtInt64WeightBoundary(t *testing.T) {
+	max := int64(math.MaxInt64)
+
+	// 单成员持有全部权重且赞成：for=MaxInt64、against=0、turnout=MaxInt64
+	// 恰好达到法定人数 MaxInt64 => 通过。
+	t.Run("single member exactly quorum", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "treasury.json")
+		store, err := InitTreasury(path, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		in := &CreateVoteInput{
+			ID: "gip-max-one", Members: []VoteMember{{ID: "a", Weight: max}},
+			Quorum: max, StartAt: 0, Deadline: 10, TimelockEnd: 10,
+		}
+		mustCreateVote(t, store, in)
+		if _, err := store.CastVote("gip-max-one", "a", true, 5); err != nil {
+			t.Fatal(err)
+		}
+		res, err := store.TallyVote("gip-max-one", 10)
+		if err != nil {
+			t.Fatalf("tally: %v", err)
+		}
+		if !res.Passed || res.ForWeight != max || res.AgainstWeight != 0 || res.Turnout != max || res.Quorum != max {
+			t.Fatalf("boundary tally = %+v, want passed for=turnout=quorum=MaxInt64", res)
+		}
+		store.Close()
+
+		// 重开后查询结论与首次计票完全一致。
+		reopened, err := Open(path)
+		if err != nil {
+			t.Fatalf("reopen: %v", err)
+		}
+		defer reopened.Close()
+		v, ok, err := reopened.VoteProposal("gip-max-one")
+		if err != nil || !ok {
+			t.Fatalf("query: %v ok=%v", err, ok)
+		}
+		if v.State != "passed" || v.Tally == nil || !v.Tally.Passed ||
+			v.Tally.ForWeight != max || v.Tally.Turnout != max || v.Tally.AgainstWeight != 0 ||
+			v.Tally.TalliedAt != 10 || v.TotalWeight != max {
+			t.Fatalf("reopened boundary view = state=%s tally=%+v total=%d", v.State, v.Tally, v.TotalWeight)
+		}
+	})
+
+	// 总权重 MaxInt64 拆为 MaxInt64-1（赞成）与 1（反对）：参与量恰好到上限、
+	// 赞成严格多于反对 => 通过；此场景覆盖两侧相加恰好等于 MaxInt64 的边界。
+	t.Run("split weights turnout exactly max", func(t *testing.T) {
+		store, _ := openTempStore(t, 0)
+		defer store.Close()
+		in := &CreateVoteInput{
+			ID: "gip-max-split",
+			Members: []VoteMember{
+				{ID: "a", Weight: max - 1},
+				{ID: "b", Weight: 1},
+			},
+			Quorum: max, StartAt: 0, Deadline: 10, TimelockEnd: 10,
+		}
+		mustCreateVote(t, store, in)
+		if _, err := store.CastVote("gip-max-split", "a", true, 5); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := store.CastVote("gip-max-split", "b", false, 6); err != nil {
+			t.Fatal(err)
+		}
+		res, err := store.TallyVote("gip-max-split", 10)
+		if err != nil {
+			t.Fatalf("tally: %v", err)
+		}
+		if !res.Passed || res.ForWeight != max-1 || res.AgainstWeight != 1 || res.Turnout != max {
+			t.Fatalf("split boundary tally = %+v, want passed turnout=MaxInt64", res)
+		}
+	})
+
+	// 没有任何人投票：参与量必须是 0，而不是成员总权重 MaxInt64；即使法定人数为 1 也拒绝。
+	t.Run("no ballots turnout zero not total", func(t *testing.T) {
+		store, _ := openTempStore(t, 0)
+		defer store.Close()
+		in := &CreateVoteInput{
+			ID: "gip-max-novote", Members: []VoteMember{{ID: "a", Weight: max}},
+			Quorum: 1, StartAt: 0, Deadline: 10, TimelockEnd: 10,
+		}
+		mustCreateVote(t, store, in)
+		res, err := store.TallyVote("gip-max-novote", 10)
+		if err != nil {
+			t.Fatalf("tally: %v", err)
+		}
+		if res.Passed || res.ForWeight != 0 || res.AgainstWeight != 0 || res.Turnout != 0 {
+			t.Fatalf("no-ballot tally = %+v, want rejected with zero turnout", res)
+		}
+		v, _, _ := store.VoteProposal("gip-max-novote")
+		if v.State != "rejected" || v.Tally == nil || v.Tally.Passed {
+			t.Fatalf("no-ballot query state=%s tally=%+v, want rejected/not-passed", v.State, v.Tally)
+		}
+	})
+}
+
+// TestRepeatTallyAfterExecutionIgnoresEarlyNow：已有结论后，即使再次传入截止前
+// 时间，也返回首次结论与首次计票时间；提案后来已执行时，状态不得退回 passed。
+func TestRepeatTallyAfterExecutionIgnoresEarlyNow(t *testing.T) {
+	store, _ := openTempStore(t, 1000)
+	defer store.Close()
+	mustCreateVote(t, store, baseVoteInput("gip-again"))
+	if _, err := store.CastVote("gip-again", "alice", true, 100); err != nil {
+		t.Fatal(err)
+	}
+	first, err := store.TallyVote("gip-again", 200)
+	if err != nil || !first.Passed || first.TalliedAt != 200 {
+		t.Fatalf("first tally: %+v err=%v", first, err)
+	}
+	// 执行后状态变为 executed。
+	if _, err := store.Execute("gip-again", 300); err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+
+	// 传入截止前时间再次计票：不是“时间未到”，而是返回首次结论与首次时间。
+	early, err := store.TallyVote("gip-again", 150)
+	if err != nil {
+		t.Fatalf("repeat tally with early now must not error: %v", err)
+	}
+	if !early.Passed || early.TalliedAt != 200 || early.ForWeight != 600 || early.Turnout != 600 {
+		t.Fatalf("repeat tally = %+v, want first result tallied_at=200", early)
+	}
+	v, _, _ := store.VoteProposal("gip-again")
+	if v.State != "executed" {
+		t.Fatalf("state regressed to %s, want executed", v.State)
+	}
+	if v.Tally == nil || !v.Tally.Passed || v.Tally.TalliedAt != 200 {
+		t.Fatalf("query tally after execution = %+v", v.Tally)
+	}
+
+	// 截止前计票若发生在首次之前仍应明确报时间未到（对照另一项未计票提案）。
+	mustCreateVote(t, store, baseVoteInput("gip-fresh"))
+	if _, err := store.TallyVote("gip-fresh", 199); !errors.Is(err, ErrTallyRejected) {
+		t.Fatalf("first early tally err=%v, want ErrTallyRejected", err)
+	}
+	fv, _, _ := store.VoteProposal("gip-fresh")
+	if fv.State != "voting" || fv.Tally != nil {
+		t.Fatalf("rejected early tally changed state: %s %+v", fv.State, fv.Tally)
+	}
+}
+
+// TestTamperedTallyConclusionKeepsFile：保存的赞成/反对权重或提案状态与票据
+// 重放不一致时，必须作为状态损坏拒绝打开，错误文本能区分原因，且原文件保留。
+func TestTamperedTallyConclusionKeepsFile(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "treasury.json")
+	store, err := InitTreasury(path, 1000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustCreateVote(t, store, baseVoteInput("gip-ctamper"))
+	if _, err := store.CastVote("gip-ctamper", "alice", true, 150); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.TallyVote("gip-ctamper", 200); err != nil {
+		t.Fatal(err)
+	}
+	store.Close()
+
+	good, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mutate := func(fn func(p map[string]any)) []byte {
+		var clone map[string]any
+		if err := json.Unmarshal(good, &clone); err != nil {
+			t.Fatal(err)
+		}
+		p := clone["vote_proposals"].(map[string]any)["gip-ctamper"].(map[string]any)
+		fn(p)
+		raw, err := json.MarshalIndent(clone, "", "  ")
+		if err != nil {
+			t.Fatal(err)
+		}
+		return append(raw, '\n')
+	}
+
+	cases := map[string]struct {
+		raw     []byte
+		wantSub string
+	}{
+		// 票据是 600 赞成、法定人数 600，本应 passed；状态被改成 rejected。
+		"state contradicts ballots": {
+			mutate(func(p map[string]any) { p["state"] = "rejected" }),
+			"does not match quorum/majority replay",
+		},
+		// 保存的反对权重与票据重放不符（票据里没有反对票）。
+		"tally against weight disagrees": {
+			mutate(func(p map[string]any) {
+				p["tally"].(map[string]any)["against_weight"] = 1
+			}),
+			"do not replay ballots",
+		},
+		// 代表票重与委托后归集权重不符，走同一份票重核对规则。
+		"delegated ballot weight disagrees": {
+			mutate(func(p map[string]any) {
+				p["ballots"].([]any)[0].(map[string]any)["weight"] = 599
+			}),
+			"does not match roster delegation",
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			bad := filepath.Join(dir, "bad-"+strings.ReplaceAll(name, " ", "-")+".json")
+			if err := os.WriteFile(bad, tc.raw, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			s, err := Open(bad)
+			if !errors.Is(err, ErrStateCorrupt) {
+				if s != nil {
+					s.Close()
+				}
+				t.Fatalf("Open err=%v, want ErrStateCorrupt", err)
+			}
+			if !strings.Contains(err.Error(), tc.wantSub) {
+				t.Fatalf("error %q does not distinguish cause; want substring %q", err.Error(), tc.wantSub)
+			}
+			if got, rerr := os.ReadFile(bad); rerr != nil || string(got) != string(tc.raw) {
+				t.Fatalf("corrupt file was modified on rejected open")
+			}
+		})
+	}
+}
