@@ -466,3 +466,103 @@ func TestCLIRejectsCaseVariantField(t *testing.T) {
 		t.Fatalf("corrupt file was modified")
 	}
 }
+
+// TestCLIRejectsIncompleteBallot：未计票提案的票据缺 support 时，文本与 JSON
+// 查询、计票都把整份文件判为损坏：原因写入 stderr（能看出提案编号、票据与字段、
+// 空值/缺失/类型不符），以域错误退出码 1 结束，stdout 不出现部分结果，文件不改写。
+func TestCLIRejectsIncompleteBallot(t *testing.T) {
+	binary := buildCLI(t)
+	dir := t.TempDir()
+	state := filepath.Join(dir, "treasury.json")
+	if _, _, code := runCLI(t, binary, state, "init", "--balance", "1000"); code != 0 {
+		t.Fatal("init failed")
+	}
+	// 投票窗口从 0 开始；赞成票在 0 时刻投出，且始终不计票。
+	if _, _, code := runCLI(t, binary, state, "create-vote", "--id", "gip-cli",
+		"--member", "alice:600", "--member", "dave:400",
+		"--quorum", "600", "--start", "0", "--deadline", "10", "--timelock", "10",
+		"--action", "transfer:a:1"); code != 0 {
+		t.Fatal("create-vote failed")
+	}
+	if _, _, code := runCLI(t, binary, state, "vote", "--id", "gip-cli",
+		"--voter", "alice", "--choice", "for", "--now", "0"); code != 0 {
+		t.Fatal("vote failed")
+	}
+	raw, err := os.ReadFile(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	corrupt := strings.Replace(string(raw), `"support": true`, `"support": null`, 1)
+	if corrupt == string(raw) {
+		t.Fatal("setup: support field not found")
+	}
+	if err := os.WriteFile(state, []byte(corrupt), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// 文本与 JSON 查询采用同一判定：均为退出码 1、原因在 stderr、stdout 为空。
+	for _, args := range [][]string{
+		{"proposal", "--id", "gip-cli"},
+		{"proposal", "--id", "gip-cli", "--json"},
+		{"proposals"},
+		{"proposals", "--json"},
+		{"tally", "--id", "gip-cli", "--now", "10"},
+		{"tally", "--id", "gip-cli", "--now", "10", "--json"},
+		{"balances", "--json"},
+	} {
+		name := strings.Join(args, "_")
+		t.Run(name, func(t *testing.T) {
+			so, se, code := runCLI(t, binary, state, args...)
+			if code != 1 {
+				t.Fatalf("exit=%d want 1, stdout=%q stderr=%q", code, so, se)
+			}
+			if so != "" {
+				t.Fatalf("stdout must stay empty on corruption, got %q", so)
+			}
+			for _, want := range []string{"corrupt", "gip-cli", "ballot 0", `"support"`, "null"} {
+				if !strings.Contains(se, want) {
+					t.Fatalf("stderr %q missing %q", se, want)
+				}
+			}
+		})
+	}
+	if got, err := os.ReadFile(state); err != nil || string(got) != corrupt {
+		t.Fatalf("corrupt file was modified or rewritten")
+	}
+
+	// 对照：明确写出的 false 反对票与 0 投票时间是合法值，文本与 JSON 都能查询。
+	legal := filepath.Join(dir, "legal.json")
+	legalRaw := `{
+  "magic": "govflow-treasury-state",
+  "version": 1,
+  "initial_treasury": 1000,
+  "treasury": 1000,
+  "balances": {},
+  "proposals": {},
+  "receipts": [],
+  "vote_proposals": {
+    "gip-legal": {
+      "id": "gip-legal", "state": "voting",
+      "members": [{"id": "a", "weight": 5}],
+      "delegations": [],
+      "quorum": 1, "start_at": 0, "deadline": 10, "timelock_end": 10,
+      "actions": [],
+      "ballots": [{"representative": "a", "weight": 5, "support": false, "voted_at": 0}]
+    }
+  }
+}
+`
+	if err := os.WriteFile(legal, []byte(legalRaw), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if so, se, code := runCLI(t, binary, legal, "proposal", "--id", "gip-legal"); code != 0 {
+		t.Fatalf("legal false/0 ballot text query exit=%d: %s", code, se)
+	} else if !strings.Contains(so, "choice=against") || !strings.Contains(so, "voted_at=0") {
+		t.Fatalf("text query should show against/0, got %q", so)
+	}
+	if so, se, code := runCLI(t, binary, legal, "proposal", "--id", "gip-legal", "--json"); code != 0 {
+		t.Fatalf("legal false/0 ballot json query exit=%d: %s", code, se)
+	} else if !strings.Contains(so, `"support": false`) || !strings.Contains(so, `"voted_at": 0`) {
+		t.Fatalf("json query should preserve false/0, got %s", so)
+	}
+}

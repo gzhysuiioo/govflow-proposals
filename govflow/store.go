@@ -910,10 +910,13 @@ func validateState(state *storedState) error {
 type schemaKind int
 
 const (
-	kindAny    schemaKind = iota // 叶子值：结构检查不深入，类型由解码器核对
-	kindObject                   // 固定字段对象：键必须与保存格式的字段名逐字一致
-	kindMap                      // 业务编号表：键是自由文本（账户名、提案编号）
-	kindArray                    // 数组
+	kindAny     schemaKind = iota // 叶子值：结构检查不深入，类型由解码器核对
+	kindObject                    // 固定字段对象：键必须与保存格式的字段名逐字一致
+	kindMap                       // 业务编号表：键是自由文本（账户名、提案编号）
+	kindArray                     // 数组
+	kindString                    // 叶子：必须是 JSON 字符串
+	kindBoolean                   // 叶子：必须是 JSON 布尔值（不接受字符串/数字/null）
+	kindInteger                   // 叶子：必须是 int64 范围内的 JSON 整数（不接受小数/指数/字符串/null）
 )
 
 // schemaNode 描述状态文件某一层允许的形状。整棵树由 storedState 的 json tag
@@ -954,12 +957,30 @@ func schemaOf(t reflect.Type) *schemaNode {
 		return &schemaNode{kind: kindMap, elem: schemaOf(t.Elem())}
 	case reflect.Slice, reflect.Array:
 		return &schemaNode{kind: kindArray, elem: schemaOf(t.Elem())}
+	case reflect.String:
+		return &schemaNode{kind: kindString}
+	case reflect.Bool:
+		return &schemaNode{kind: kindBoolean}
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
+		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+		return &schemaNode{kind: kindInteger}
 	default:
 		return &schemaNode{kind: kindAny}
 	}
 }
 
 var storedStateSchema = schemaOf(reflect.TypeOf(storedState{}))
+
+func init() {
+	// 票据的四个标量字段（representative/weight/support/voted_at）由
+	// validateStoredBallot 逐票判定“缺失/空值/类型不符”，其错误原因需要带上
+	// 提案编号、票据下标与字段名；因此结构扫描在这些叶子位置保持宽松（kindAny），
+	// 不抢在解码器之前用不含票据定位的通用信息报错。
+	ballotFields := storedStateSchema.fields["vote_proposals"].elem.fields["ballots"].elem.fields
+	for _, name := range []string{"representative", "weight", "support", "voted_at"} {
+		ballotFields[name].kind = kindAny
+	}
+}
 
 // scanFrame 是结构扫描的栈帧。
 type scanFrame struct {
@@ -990,6 +1011,9 @@ func peekFrame(stack []*scanFrame) *scanFrame {
 // 便于定位。字段顺序、缩进与合法转义不影响判定。
 func checkStateStructure(raw []byte) error {
 	dec := json.NewDecoder(bytes.NewReader(raw))
+	// UseNumber：数字 token 保留词面写法，整数叶子可据此精确判定 int64 范围，
+	// 不被 float64 在 2^63 附近的舍入混淆（MaxInt64 与 MaxInt64+1 会折成同一浮点）。
+	dec.UseNumber()
 	var stack []*scanFrame
 	// 对象帧读到键时，把该键对应值的形状与路径暂存于此，供紧随其后的值使用。
 	pendingNode := storedStateSchema
@@ -1100,7 +1124,67 @@ func checkStateStructure(raw []byte) error {
 			}
 			continue
 		}
-		// 标量值。
+		// 标量值（含 null）：严格叶子必须与字段声明的 JSON 类型逐字一致，
+		// null 不允许用来顶替字符串/布尔/整数。
+		if err := checkLeafScalar(node, path, tok); err != nil {
+			return err
+		}
 		finishValue()
 	}
+}
+
+// leafKindName 是严格叶子类型在错误信息中的人类可读名称。
+func leafKindName(k schemaKind) string {
+	switch k {
+	case kindString:
+		return "string"
+	case kindBoolean:
+		return "boolean"
+	case kindInteger:
+		return "integer"
+	default:
+		return "value"
+	}
+}
+
+// tokenKindName 归类一个标量 token 实际写出的 JSON 类型。
+func tokenKindName(tok json.Token) string {
+	switch v := tok.(type) {
+	case nil:
+		return "null"
+	case string:
+		return "string"
+	case bool:
+		return "boolean"
+	case json.Number:
+		if _, err := strconv.ParseInt(string(v), 10, 64); err == nil {
+			return "integer"
+		}
+		return "number"
+	default:
+		return "value"
+	}
+}
+
+// checkLeafScalar 校验严格标量叶子：字符串/布尔/int64 整数位置出现 null 或
+// 其它 JSON 类型即判结构损坏。非整数（小数、指数）或超出 int64 的整数同样拒绝。
+func checkLeafScalar(node *schemaNode, path string, tok json.Token) error {
+	switch node.kind {
+	case kindString, kindBoolean, kindInteger:
+	default:
+		return nil
+	}
+	if node.kind == kindInteger {
+		if n, ok := tok.(json.Number); ok {
+			if _, err := strconv.ParseInt(string(n), 10, 64); err != nil {
+				return fmt.Errorf("field at %s must be an int64 integer, got %s", path, string(n))
+			}
+			return nil
+		}
+	}
+	want := leafKindName(node.kind)
+	if got := tokenKindName(tok); got != want {
+		return fmt.Errorf("field at %s must be %s, got %s", path, want, got)
+	}
+	return nil
 }

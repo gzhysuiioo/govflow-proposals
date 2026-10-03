@@ -1300,3 +1300,381 @@ func TestTamperedTallyConclusionKeepsFile(t *testing.T) {
 		})
 	}
 }
+
+// TestIncompleteBallotRejectedAsCorrupt：尚未计票的提案中，一张票缺字段、
+// 字段为 null 或 JSON 类型不符时，整份状态文件判为损坏：
+// 打开、查询与计票全部拒绝，不给出基于其余票据的部分结果，也不把缺损补成
+// 反对票或时间 0 后写回。错误原因必须能看出提案编号、票据下标与字段，
+// 并区分缺失、空值与类型不符。
+func TestIncompleteBallotRejectedAsCorrupt(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "treasury.json")
+	store, err := InitTreasury(path, 1000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	in := baseVoteInput("gip-incomplete")
+	in.StartAt, in.Deadline, in.TimelockEnd = 0, 200, 300
+	mustCreateVote(t, store, in)
+	// 两张票：alice 600 赞成（0 时刻）、dave 400 反对（150 时刻），尚未计票。
+	if _, err := store.CastVote("gip-incomplete", "alice", true, 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.CastVote("gip-incomplete", "dave", false, 150); err != nil {
+		t.Fatal(err)
+	}
+	// 另有一笔已执行支出，便于断言失败后资金余额与文件内容原样保留。
+	mustRegister(t, store, "gip-spent", 0, "transfer:audits:100")
+	if _, err := store.Execute("gip-spent", 0); err != nil {
+		t.Fatal(err)
+	}
+	store.Close()
+
+	good, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// mutate 以结构化改写构造损坏变体；index 标明出问题的票据下标（dave 是第 1 张）。
+	mutate := func(fn func(p map[string]any)) []byte {
+		var clone map[string]any
+		if err := json.Unmarshal(good, &clone); err != nil {
+			t.Fatal(err)
+		}
+		p := clone["vote_proposals"].(map[string]any)["gip-incomplete"].(map[string]any)
+		fn(p)
+		raw, err := json.MarshalIndent(clone, "", "  ")
+		if err != nil {
+			t.Fatal(err)
+		}
+		return append(raw, '\n')
+	}
+	// 第一张票（下标 0）与第二张票（下标 1）各覆盖若干字段，确保下标被正确报告。
+	cases := map[string]struct {
+		raw       []byte
+		index     string
+		field     string
+		causeWord string
+	}{
+		"support missing on ballot 0": {
+			mutate(func(p map[string]any) {
+				delete(p["ballots"].([]any)[0].(map[string]any), "support")
+			}), "ballot 0", "support", "missing",
+		},
+		"support null on ballot 0": {
+			mutate(func(p map[string]any) {
+				p["ballots"].([]any)[0].(map[string]any)["support"] = nil
+			}), "ballot 0", "support", "null",
+		},
+		"support string not boolean": {
+			mutate(func(p map[string]any) {
+				p["ballots"].([]any)[0].(map[string]any)["support"] = "true"
+			}), "ballot 0", "support", "wrong type",
+		},
+		"support number not boolean": {
+			mutate(func(p map[string]any) {
+				p["ballots"].([]any)[0].(map[string]any)["support"] = 1
+			}), "ballot 0", "support", "wrong type",
+		},
+		"voted_at missing with zero window": {
+			mutate(func(p map[string]any) {
+				delete(p["ballots"].([]any)[0].(map[string]any), "voted_at")
+			}), "ballot 0", "voted_at", "missing",
+		},
+		"voted_at null not timestamp zero": {
+			mutate(func(p map[string]any) {
+				p["ballots"].([]any)[0].(map[string]any)["voted_at"] = nil
+			}), "ballot 0", "voted_at", "null",
+		},
+		"voted_at string not integer": {
+			mutate(func(p map[string]any) {
+				p["ballots"].([]any)[0].(map[string]any)["voted_at"] = "0"
+			}), "ballot 0", "voted_at", "wrong type",
+		},
+		"voted_at float not integer": {
+			mutate(func(p map[string]any) {
+				p["ballots"].([]any)[0].(map[string]any)["voted_at"] = 150.5
+			}), "ballot 0", "voted_at", "wrong type",
+		},
+		"weight null": {
+			mutate(func(p map[string]any) {
+				p["ballots"].([]any)[1].(map[string]any)["weight"] = nil
+			}), "ballot 1", "weight", "null",
+		},
+		"weight missing": {
+			mutate(func(p map[string]any) {
+				delete(p["ballots"].([]any)[1].(map[string]any), "weight")
+			}), "ballot 1", "weight", "missing",
+		},
+		"weight float not integer": {
+			mutate(func(p map[string]any) {
+				p["ballots"].([]any)[1].(map[string]any)["weight"] = 400.5
+			}), "ballot 1", "weight", "wrong type",
+		},
+		"weight over int64": {
+			mutate(func(p map[string]any) {
+				p["ballots"].([]any)[1].(map[string]any)["weight"] = 9223372036854775808.0
+			}), "ballot 1", "weight", "wrong type",
+		},
+		"representative null": {
+			mutate(func(p map[string]any) {
+				p["ballots"].([]any)[1].(map[string]any)["representative"] = nil
+			}), "ballot 1", "representative", "null",
+		},
+		"representative missing": {
+			mutate(func(p map[string]any) {
+				delete(p["ballots"].([]any)[1].(map[string]any), "representative")
+			}), "ballot 1", "representative", "missing",
+		},
+		"representative number not string": {
+			mutate(func(p map[string]any) {
+				p["ballots"].([]any)[1].(map[string]any)["representative"] = 7
+			}), "ballot 1", "representative", "wrong type",
+		},
+		"support array not boolean": {
+			mutate(func(p map[string]any) {
+				p["ballots"].([]any)[0].(map[string]any)["support"] = []any{}
+			}), "ballot 0", "support", "wrong type",
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			bad := filepath.Join(dir, "bad-"+strings.ReplaceAll(name, " ", "-")+".json")
+			if err := os.WriteFile(bad, tc.raw, 0o600); err != nil {
+				t.Fatal(err)
+			}
+
+			// 打开即拒绝，错误带提案编号、票据下标、字段与原因分类。
+			s, err := Open(bad)
+			if !errors.Is(err, ErrStateCorrupt) {
+				if s != nil {
+					s.Close()
+				}
+				t.Fatalf("Open err=%v, want ErrStateCorrupt", err)
+			}
+			msg := err.Error()
+			for _, want := range []string{`"gip-incomplete"`, tc.index, `"` + tc.field + `"`, tc.causeWord} {
+				if !strings.Contains(msg, want) {
+					t.Fatalf("error %q missing %q", msg, want)
+				}
+			}
+
+			// 原文件内容必须原样保留（失败不回写、不补默认值）。
+			if got, rerr := os.ReadFile(bad); rerr != nil || string(got) != string(tc.raw) {
+				t.Fatalf("corrupt file was modified on rejected Open")
+			}
+
+			// 重复打开仍以同一损坏分类拒绝，绝不返回可用句柄给出部分结果。
+			s2, e := Open(bad)
+			if !errors.Is(e, ErrStateCorrupt) {
+				if s2 != nil {
+					s2.Close()
+				}
+				t.Fatalf("reopen err=%v, want ErrStateCorrupt", e)
+			}
+		})
+	}
+}
+
+// TestIncompleteBallotOpsRejectAndKeepFile：损坏文件上的查询与计票/投票操作
+// 一律返回 ErrStateCorrupt，且不产生部分结果、不改写文件、不动提案状态与余额。
+func TestIncompleteBallotOpsRejectAndKeepFile(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "treasury.json")
+	store, err := InitTreasury(path, 1000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	in := baseVoteInput("gip-ops")
+	in.StartAt, in.Deadline, in.TimelockEnd = 0, 200, 300
+	mustCreateVote(t, store, in)
+	if _, err := store.CastVote("gip-ops", "alice", true, 0); err != nil {
+		t.Fatal(err)
+	}
+	mustRegister(t, store, "gip-spent", 0, "transfer:audits:100")
+	if _, err := store.Execute("gip-spent", 0); err != nil {
+		t.Fatal(err)
+	}
+	store.Close()
+
+	good, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var clone map[string]any
+	if err := json.Unmarshal(good, &clone); err != nil {
+		t.Fatal(err)
+	}
+	// 删除赞成票的 support 字段：若被默认成 false，600 赞成会被误算成 600 反对。
+	delete(clone["vote_proposals"].(map[string]any)["gip-ops"].(map[string]any)["ballots"].([]any)[0].(map[string]any), "support")
+	bad, err := json.MarshalIndent(clone, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	bad = append(bad, '\n')
+	if err := os.WriteFile(path, bad, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// 打开后，任何读取或操作都拒绝。
+	s, err := Open(path)
+	if !errors.Is(err, ErrStateCorrupt) {
+		t.Fatalf("Open err=%v, want ErrStateCorrupt", err)
+	}
+	if s != nil {
+		t.Fatal("corrupt open must not return a usable store")
+	}
+
+	// 直接验证文件未被任何尝试改写。
+	if got, rerr := os.ReadFile(path); rerr != nil || string(got) != string(bad) {
+		t.Fatalf("corrupt file was normalized or rewritten")
+	}
+
+	// 用一个真实打开的句柄，随后在句柄之外把文件改坏，下一次读取/操作必须拒绝。
+	recoverPath := filepath.Join(dir, "recover.json")
+	if err := os.WriteFile(recoverPath, good, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	live, err := Open(recoverPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer live.Close()
+	if bal, err := live.TreasuryBalance(); err != nil || bal != 900 {
+		t.Fatalf("balance before corruption=%d err=%v", bal, err)
+	}
+	if err := os.WriteFile(recoverPath, bad, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := live.TreasuryBalance(); !errors.Is(err, ErrStateCorrupt) {
+		t.Fatalf("TreasuryBalance after corruption err=%v, want ErrStateCorrupt", err)
+	}
+	if _, _, err := live.VoteProposal("gip-ops"); !errors.Is(err, ErrStateCorrupt) {
+		t.Fatalf("VoteProposal after corruption err=%v", err)
+	}
+	if _, err := live.VoteProposals(); !errors.Is(err, ErrStateCorrupt) {
+		t.Fatalf("VoteProposals after corruption err=%v", err)
+	}
+	if _, err := live.ProposalsSnapshot(); !errors.Is(err, ErrStateCorrupt) {
+		t.Fatalf("ProposalsSnapshot after corruption err=%v", err)
+	}
+	if _, err := live.TallyVote("gip-ops", 200); !errors.Is(err, ErrStateCorrupt) {
+		t.Fatalf("TallyVote after corruption err=%v", err)
+	}
+	if _, err := live.CastVote("gip-ops", "dave", false, 150); !errors.Is(err, ErrStateCorrupt) {
+		t.Fatalf("CastVote after corruption err=%v", err)
+	}
+	if _, err := live.BalanceSnapshot(); !errors.Is(err, ErrStateCorrupt) {
+		t.Fatalf("BalanceSnapshot after corruption err=%v", err)
+	}
+	// 失败后文件字节、提案状态与余额保持损坏被发现时的原样（未回写默认值）。
+	if got, rerr := os.ReadFile(recoverPath); rerr != nil || string(got) != string(bad) {
+		t.Fatalf("failed ops rewrote or normalized the state file")
+	}
+}
+
+// TestExplicitFalseAndZeroBallotLegal：明确写出的 false 是有效反对票，
+// 投票窗口从 0 开始时明确写出的 0 是有效首次投票时间，二者都不得当成缺失。
+// 空票据列表的未投票提案同样继续可读、可计票。
+func TestExplicitFalseAndZeroBallotLegal(t *testing.T) {
+	dir := t.TempDir()
+	handwritten := filepath.Join(dir, "handwritten.json")
+	// 手工构造：start=0、票据 support=false、voted_at=0，quorum=1。
+	raw := `{
+  "magic": "govflow-treasury-state",
+  "version": 1,
+  "initial_treasury": 1000,
+  "treasury": 1000,
+  "balances": {},
+  "proposals": {},
+  "receipts": [],
+  "vote_proposals": {
+    "gip-fz": {
+      "id": "gip-fz",
+      "state": "voting",
+      "members": [{"id": "a", "weight": 5}, {"id": "b", "weight": 5}],
+      "delegations": [],
+      "quorum": 1,
+      "start_at": 0,
+      "deadline": 10,
+      "timelock_end": 10,
+      "actions": [],
+      "ballots": [{"representative": "b", "weight": 5, "support": false, "voted_at": 0}]
+    }
+  }
+}
+`
+	if err := os.WriteFile(handwritten, []byte(raw), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s, err := Open(handwritten)
+	if err != nil {
+		t.Fatalf("explicit false/0 ballot rejected: %v", err)
+	}
+	defer s.Close()
+	v, ok, err := s.VoteProposal("gip-fz")
+	if err != nil || !ok {
+		t.Fatalf("query: %v ok=%v", err, ok)
+	}
+	if len(v.Ballots) != 1 || v.Ballots[0].Support || v.Ballots[0].VotedAt != 0 ||
+		v.Ballots[0].Representative != "b" || v.Ballots[0].Weight != 5 {
+		t.Fatalf("false/0 ballot misread as missing/default: %+v", v.Ballots)
+	}
+	// 只有 5 权重反对：for=0 < against=5 => 拒绝；0 不得被当成“缺失时间”。
+	res, err := s.TallyVote("gip-fz", 10)
+	if err != nil {
+		t.Fatalf("tally legal against-only ballot: %v", err)
+	}
+	if res.Passed || res.ForWeight != 0 || res.AgainstWeight != 5 || res.Turnout != 5 {
+		t.Fatalf("unexpected tally for explicit-false ballot: %+v", res)
+	}
+
+	// 尚未投票的提案允许空票据列表（null 与 [] 两种旧/新写法都合法）。
+	empty, _ := openTempStore(t, 1000)
+	defer empty.Close()
+	mustCreateVote(t, empty, &CreateVoteInput{
+		ID: "gip-empty-ballots", Members: []VoteMember{{ID: "a", Weight: 1}},
+		Quorum: 1, StartAt: 0, Deadline: 10, TimelockEnd: 10,
+	})
+	empty.Close()
+	es, err := Open(empty.Path())
+	if err != nil {
+		t.Fatalf("reopen empty-ballot proposal: %v", err)
+	}
+	defer es.Close()
+	ev, ok, err := es.VoteProposal("gip-empty-ballots")
+	if err != nil || !ok || len(ev.Ballots) != 0 {
+		t.Fatalf("empty ballots query: %+v ok=%v err=%v", ev.Ballots, ok, err)
+	}
+	res2, err := es.TallyVote("gip-empty-ballots", 10)
+	if err != nil || res2.Passed || res2.Turnout != 0 {
+		t.Fatalf("empty-ballot tally should reject with zero turnout: %+v err=%v", res2, err)
+	}
+}
+
+// TestNullTopLevelLeafRejected：非票据位置的标量叶子为 null 同样整文件拒绝，
+// 不会被解码器静默读成零值（例如 null 余额）。
+func TestNullTopLevelLeafRejected(t *testing.T) {
+	store, _ := openTempStore(t, 1000)
+	defer store.Close()
+	goodPath := store.Path()
+	store.Close()
+	good, err := os.ReadFile(goodPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw := strings.Replace(string(good), `"treasury": 1000`, `"treasury": null`, 1)
+	bad := filepath.Join(t.TempDir(), "null-leaf.json")
+	if err := os.WriteFile(bad, []byte(raw), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s, err := Open(bad)
+	if !errors.Is(err, ErrStateCorrupt) {
+		if s != nil {
+			s.Close()
+		}
+		t.Fatalf("null treasury leaf err=%v, want ErrStateCorrupt", err)
+	}
+	if !strings.Contains(err.Error(), "treasury") {
+		t.Fatalf("error should name the field: %v", err)
+	}
+}
