@@ -114,6 +114,17 @@ Batch, product and unit values have leading and trailing whitespace removed
 and must be non-empty afterwards; interior characters and casing are kept
 ("B1" and "b1" are different batches). One invocation registers one batch.
 
+Batch, product and unit must be valid UTF-8 text in every source: command
+line flags, import manifest records and stored registry records. A value
+containing malformed UTF-8 bytes (or a JSON string holding a lone surrogate
+escape such as "\ud800") is rejected and never replaced with the U+FFFD
+replacement character, so distinct inputs cannot collapse onto one batch
+id; the error names the parameter, or the manifest/registry file with the
+1-based record position and field (plus the batch id only when it is itself
+valid and unambiguous). A genuinely entered U+FFFD character is ordinary
+text, non-ASCII ids (Chinese text, emoji, ...) are welcome, and a JSON
+escape means the same text as the character written directly.
+
 On success stdout contains a single JSON object, e.g.
   {"batch":"B-001","product":"P-7","quantity":120,"unit":"kg","status":"created"}
 status is "created" for a new record and "duplicate" when the same batch was

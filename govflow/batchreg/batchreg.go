@@ -27,6 +27,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 )
 
 // FormatVersion is the only registry file format understood by this build.
@@ -120,10 +121,30 @@ func (e *FormatError) Error() string {
 	return fmt.Sprintf("%s: %s", where, e.Reason)
 }
 
+// EncodingError reports that a text field is not valid UTF-8: either the
+// bytes of a CLI argument, or a JSON string value whose source bytes hold
+// malformed UTF-8 or a lone surrogate escape. The offending value is never
+// quoted back, since decoding it would substitute U+FFFD and make distinct
+// inputs collide. Field is one of "batch", "product" and "unit". Inside a
+// manifest, ParseManifest wraps this in a ManifestRecordError carrying the
+// 1-based record position.
+type EncodingError struct {
+	Field string
+}
+
+func (e *EncodingError) Error() string {
+	return fmt.Sprintf("field %q contains bytes that are not valid UTF-8; the value is rejected instead of being replaced with U+FFFD", e.Field)
+}
+
 // NormalizeField trims leading and trailing whitespace; the result must stay
-// non-empty. Interior characters, including interior whitespace, are kept,
-// and casing is preserved so "B1" and "b1" are different values.
+// non-empty and be valid UTF-8. Interior characters, including interior
+// whitespace, are kept, and casing is preserved so "B1" and "b1" are
+// different values. A genuine replacement character (U+FFFD) is ordinary
+// text; only malformed UTF-8 bytes are refused.
 func NormalizeField(value string) (string, error) {
+	if !utf8.ValidString(value) {
+		return "", errors.New("value is not valid UTF-8 text")
+	}
 	trimmed := strings.TrimSpace(value)
 	if trimmed == "" {
 		return "", errors.New("value must not be empty after trimming whitespace")
@@ -147,6 +168,138 @@ func ParseQuantity(text string) (int64, error) {
 		return 0, fmt.Errorf("quantity %q must be greater than zero", text)
 	}
 	return value, nil
+}
+
+var (
+	errStringNotJSON  = errors.New("value is not a JSON string")
+	errStringEncoding = errors.New("JSON string contains bytes that are not valid UTF-8")
+)
+
+// unmarshalStringStrict decodes one JSON string literal into a Go string
+// without encoding/json's silent U+FFFD substitution. The literal must be
+// syntactically valid JSON (only the single token, no trailing data) and the
+// decoded text must be valid Unicode: malformed UTF-8 source bytes and lone
+// surrogate escapes are refused, while a genuine U+FFFD — written directly
+// or as the escape "�" — is ordinary text. Syntax problems return
+// errStringNotJSON; encoding problems return errStringEncoding.
+func unmarshalStringStrict(raw json.RawMessage) (string, error) {
+	token := trimJSONSpace(raw)
+	if len(token) < 2 || token[0] != '"' || token[len(token)-1] != '"' {
+		return "", errStringNotJSON
+	}
+	var b strings.Builder
+	b.Grow(len(token))
+	i := 1
+	for i < len(token)-1 {
+		c := token[i]
+		switch {
+		case c == '"':
+			// An unescaped quote before the final byte ends the literal
+			// early, so anything following it is trailing data.
+			return "", errStringNotJSON
+		case c == '\\':
+			if i+1 >= len(token)-1 {
+				return "", errStringNotJSON
+			}
+			switch token[i+1] {
+			case '"', '\\', '/':
+				b.WriteByte(token[i+1])
+				i += 2
+			case 'b':
+				b.WriteByte('\b')
+				i += 2
+			case 'f':
+				b.WriteByte('\f')
+				i += 2
+			case 'n':
+				b.WriteByte('\n')
+				i += 2
+			case 'r':
+				b.WriteByte('\r')
+				i += 2
+			case 't':
+				b.WriteByte('\t')
+				i += 2
+			case 'u':
+				r, size, err := decodeUnicodeEscape(token[i:])
+				if err != nil {
+					return "", err
+				}
+				if _, err := b.WriteRune(r); err != nil {
+					return "", errStringEncoding
+				}
+				i += size
+			default:
+				return "", errStringNotJSON
+			}
+		case c < 0x20:
+			// Raw control characters must be escaped in JSON.
+			return "", errStringNotJSON
+		default:
+			r, size := utf8.DecodeRune(token[i : len(token)-1])
+			if r == utf8.RuneError && size == 1 {
+				return "", errStringEncoding
+			}
+			b.WriteRune(r)
+			i += size
+		}
+	}
+	if i != len(token)-1 {
+		return "", errStringNotJSON
+	}
+	return b.String(), nil
+}
+
+// decodeUnicodeEscape reads a "\uXXXX" escape (or a UTF-16 surrogate pair
+// "\uHHHH\uLLLL") at the start of p, returning the rune and the number of
+// bytes consumed. A high surrogate not followed by a low surrogate, a low
+// surrogate with no high one, or a non-hex code unit are encoding errors.
+func decodeUnicodeEscape(p []byte) (rune, int, error) {
+	hi, ok := hex4(p)
+	if !ok {
+		return 0, 0, errStringNotJSON
+	}
+	switch {
+	case hi >= 0xD800 && hi <= 0xDBFF:
+		if len(p) < 12 || p[6] != '\\' || p[7] != 'u' {
+			return 0, 0, errStringEncoding
+		}
+		lo, ok := hex4(p[6:])
+		if !ok {
+			return 0, 0, errStringNotJSON
+		}
+		if lo < 0xDC00 || lo > 0xDFFF {
+			return 0, 0, errStringEncoding
+		}
+		return 0x10000 + (rune(hi)-0xD800)<<10 + (rune(lo) - 0xDC00), 12, nil
+	case hi >= 0xDC00 && hi <= 0xDFFF:
+		return 0, 0, errStringEncoding
+	default:
+		return rune(hi), 6, nil
+	}
+}
+
+// hex4 reads the four hex digits following a leading "\u" (p[:2] == `\u`).
+func hex4(p []byte) (int, bool) {
+	if len(p) < 6 || p[0] != '\\' || p[1] != 'u' {
+		return 0, false
+	}
+	v := 0
+	for _, c := range p[2:6] {
+		var d byte
+		switch {
+		case c >= '0' && c <= '9':
+			d = c - '0'
+		case c >= 'a' && c <= 'f':
+			d = c - 'a' + 10
+		case c >= 'A' && c <= 'F':
+			d = c - 'A' + 10
+		default:
+			return 0, false
+		}
+		v = v<<4 | int(d)
+	}
+	return v, true
 }
 
 // Load reads the registry at path. A missing file yields an empty registry
@@ -267,13 +420,14 @@ func parseRegistryRecord(raw json.RawMessage, pos int) (Batch, error) {
 		return b, &FormatError{Position: pos, Reason: "record must be a JSON object holding exactly \"batch\", \"product\", \"quantity\" and \"unit\""}
 	}
 	// The batch id is attached to errors only when it is unambiguous:
-	// exactly one "batch" member carrying a JSON string. When the "batch"
-	// member itself is duplicated, no id is picked arbitrarily.
+	// exactly one "batch" member carrying a JSON string whose decoded text
+	// is valid UTF-8. When the "batch" member itself is duplicated, or its
+	// bytes are not valid UTF-8, no id (and never a U+FFFD replacement) is
+	// picked arbitrarily.
 	batchID := ""
 	if countField(fields, "batch") == 1 {
 		if rawID, _ := findField(fields, "batch"); rawID != nil {
-			var id string
-			if json.Unmarshal(rawID, &id) == nil {
+			if id, idErr := unmarshalStringStrict(rawID); idErr == nil {
 				batchID = id
 			}
 		}
@@ -299,8 +453,12 @@ func parseRegistryRecord(raw json.RawMessage, pos int) (Batch, error) {
 		if trimmed := bytes.TrimSpace(rawValue); len(trimmed) == 0 || trimmed[0] != '"' {
 			return "", &FormatError{Position: pos, Batch: batchID, Field: name, Reason: "must be a JSON string"}
 		}
-		var s string
-		if err := json.Unmarshal(rawValue, &s); err != nil {
+		s, err := unmarshalStringStrict(rawValue)
+		if errors.Is(err, errStringEncoding) {
+			return "", &FormatError{Position: pos, Batch: batchID, Field: name,
+				Reason: "must be valid UTF-8 text: malformed bytes or lone surrogate escapes are rejected instead of being replaced with U+FFFD"}
+		}
+		if err != nil {
 			return "", &FormatError{Position: pos, Batch: batchID, Field: name, Reason: "must be a JSON string"}
 		}
 		return s, nil
@@ -371,7 +529,9 @@ type objectField struct {
 }
 
 // parseObjectFields decodes a single JSON object value into its members in
-// source order, keeping duplicates visible for the caller to reject.
+// source order, keeping duplicates visible for the caller to reject. Keys
+// are re-scanned strictly: encoding/json would otherwise hand back U+FFFD
+// substitutions for malformed key bytes.
 func parseObjectFields(raw []byte) ([]objectField, error) {
 	trimmed := bytes.TrimSpace(raw)
 	if len(trimmed) == 0 || trimmed[0] != '{' {
@@ -383,13 +543,21 @@ func parseObjectFields(raw []byte) ([]objectField, error) {
 	}
 	var fields []objectField
 	for dec.More() {
+		keyStart := dec.InputOffset()
 		tok, err := dec.Token()
+		keyEnd := dec.InputOffset()
 		if err != nil {
 			return nil, err
 		}
 		key, ok := tok.(string)
 		if !ok {
 			return nil, errors.New("object keys must be JSON strings")
+		}
+		if _, err := unmarshalStringStrict(keyTokenBytes(trimmed, int(keyStart), int(keyEnd))); err != nil {
+			if errors.Is(err, errStringEncoding) {
+				return nil, errors.New("object key contains bytes that are not valid UTF-8")
+			}
+			return nil, err
 		}
 		var value json.RawMessage
 		if err := dec.Decode(&value); err != nil {
@@ -401,6 +569,28 @@ func parseObjectFields(raw []byte) ([]objectField, error) {
 		return nil, err
 	}
 	return fields, nil
+}
+
+// trimJSONSpace strips only the four JSON whitespace bytes (space, tab,
+// carriage return, newline). bytes.TrimSpace would also remove U+000B and
+// other Unicode whitespace, which is illegal around a JSON token and must
+// therefore be rejected rather than ignored.
+func trimJSONSpace(b []byte) []byte {
+	isSpace := func(c byte) bool { return c == ' ' || c == '\t' || c == '\r' || c == '\n' }
+	for len(b) > 0 && isSpace(b[0]) {
+		b = b[1:]
+	}
+	for len(b) > 0 && isSpace(b[len(b)-1]) {
+		b = b[:len(b)-1]
+	}
+	return b
+}
+
+// keyTokenBytes isolates one key token inside trimmed[start:end]. The
+// decoder reports the offset just after the preceding token (so the span
+// may still contain a separating comma and whitespace), hence the left trim.
+func keyTokenBytes(trimmed []byte, start, end int) []byte {
+	return bytes.TrimLeft(trimmed[start:end], " \t\r\n,")
 }
 
 // duplicateField returns the first field name appearing more than once.
@@ -542,32 +732,26 @@ var batchRecordFields = map[string]struct{}{
 }
 
 // parseManifestRecord validates one manifest element: it must be a JSON
-// object with exactly the four required keys, text fields as non-blank
-// strings and quantity as a strict JSON integer.
+// object with exactly the four required keys, text fields as non-blank,
+// valid UTF-8 strings and quantity as a strict JSON integer. The members
+// are scanned with parseObjectFields (strict key decoding, duplicates kept
+// visible) rather than a lenient map unmarshal, so malformed key or value
+// bytes cannot be silently replaced with U+FFFD.
 func parseManifestRecord(raw json.RawMessage) (Input, error) {
 	var in Input
-	if len(bytes.TrimSpace(raw)) == 0 || bytes.TrimSpace(raw)[0] != '{' {
+	members, err := parseObjectFields(raw)
+	if err != nil {
 		return in, errors.New("record must be a JSON object with batch, product, quantity and unit")
 	}
-	fields := make(map[string]json.RawMessage)
-	if err := json.Unmarshal(raw, &fields); err != nil {
-		return in, fmt.Errorf("record is not valid JSON: %w", err)
-	}
-	for name := range fields {
-		if _, ok := batchRecordFields[name]; !ok {
-			return in, fmt.Errorf("record has unknown field %q; only batch, product, quantity and unit are allowed", name)
+	fields := make(map[string]json.RawMessage, len(members))
+	for _, f := range members {
+		if _, ok := batchRecordFields[f.key]; !ok {
+			return in, fmt.Errorf("record has unknown field %q; only batch, product, quantity and unit are allowed", f.key)
 		}
-	}
-	keys, err := objectKeys(raw)
-	if err != nil {
-		return in, err
-	}
-	counts := make(map[string]int, len(keys))
-	for _, k := range keys {
-		counts[k]++
-		if counts[k] > 1 {
-			return in, fmt.Errorf("record lists field %q more than once", k)
+		if _, dup := fields[f.key]; dup {
+			return in, fmt.Errorf("record lists field %q more than once", f.key)
 		}
+		fields[f.key] = f.value
 	}
 
 	textField := func(name string) (string, error) {
@@ -575,13 +759,19 @@ func parseManifestRecord(raw json.RawMessage) (Input, error) {
 		if !ok {
 			return "", fmt.Errorf("missing required field %q", name)
 		}
-		var text string
-		if err := json.Unmarshal(value, &text); err != nil {
+		if trimmed := bytes.TrimSpace(value); len(trimmed) == 0 || trimmed[0] != '"' {
 			return "", fmt.Errorf("field %q must be a JSON string", name)
 		}
-		normalized, err := NormalizeField(text)
-		if err != nil {
-			return "", fmt.Errorf("field %q must not be blank: %w", name, err)
+		text, decodeErr := unmarshalStringStrict(value)
+		if errors.Is(decodeErr, errStringEncoding) {
+			return "", &EncodingError{Field: name}
+		}
+		if decodeErr != nil {
+			return "", fmt.Errorf("field %q must be a JSON string", name)
+		}
+		normalized, normErr := NormalizeField(text)
+		if normErr != nil {
+			return "", fmt.Errorf("field %q must not be blank: %w", name, normErr)
 		}
 		return normalized, nil
 	}
@@ -607,20 +797,6 @@ func parseManifestRecord(raw json.RawMessage) (Input, error) {
 		return in, err
 	}
 	return in, nil
-}
-
-// objectKeys returns the member keys of a JSON object in source order,
-// flagging repeated names for the caller.
-func objectKeys(raw json.RawMessage) ([]string, error) {
-	fields, err := parseObjectFields(raw)
-	if err != nil {
-		return nil, err
-	}
-	keys := make([]string, len(fields))
-	for i, f := range fields {
-		keys[i] = f.key
-	}
-	return keys, nil
 }
 
 // parseManifestQuantity accepts exactly a strict JSON integer token in the
@@ -668,6 +844,22 @@ func Import(reg *Registry, inputs []Input) (results []ImportResult, err error) {
 	}
 	if len(inputs) == 0 {
 		return nil, errors.New("manifest must contain at least one record")
+	}
+	// Reject malformed text before touching anything; every input must be
+	// valid UTF-8 so stored ids can never silently collapse onto U+FFFD.
+	for i, in := range inputs {
+		batchValid := utf8.ValidString(in.Batch)
+		for _, tv := range []struct{ field, value string }{
+			{"batch", in.Batch}, {"product", in.Product}, {"unit", in.Unit},
+		} {
+			if !utf8.ValidString(tv.value) {
+				err := &ManifestRecordError{Position: i + 1, Reason: (&EncodingError{Field: tv.field}).Error()}
+				if tv.field != "batch" && batchValid && in.Batch != "" {
+					err.Batch = in.Batch
+				}
+				return nil, err
+			}
+		}
 	}
 
 	// Work on a copy: a rejected manifest must never partially land in reg.
@@ -731,6 +923,13 @@ func Register(reg *Registry, in Input) (Outcome, error) {
 	if in.Batch == "" || in.Product == "" || in.Unit == "" {
 		return Outcome{}, errors.New("batch, product and unit must be non-empty")
 	}
+	for _, tv := range []struct{ field, value string }{
+		{"batch", in.Batch}, {"product", in.Product}, {"unit", in.Unit},
+	} {
+		if !utf8.ValidString(tv.value) {
+			return Outcome{}, &EncodingError{Field: tv.field}
+		}
+	}
 	if in.Quantity <= 0 || in.Quantity > MaxQuantity {
 		return Outcome{}, fmt.Errorf("quantity must be a positive integer no greater than %d", MaxQuantity)
 	}
@@ -765,6 +964,18 @@ func Register(reg *Registry, in Input) (Outcome, error) {
 func Save(path string, reg *Registry) error {
 	if reg.Version != FormatVersion {
 		return fmt.Errorf("cannot write registry format version %d", reg.Version)
+	}
+	// Never persist U+FFFD substitutions: every text field must round-trip
+	// as valid UTF-8. Load already guarantees this; the guard also covers
+	// registries assembled by hand inside other code.
+	for i, b := range reg.Batches {
+		for _, tv := range []struct{ field, value string }{
+			{"batch", b.Batch}, {"product", b.Product}, {"unit", b.Unit},
+		} {
+			if !utf8.ValidString(tv.value) {
+				return fmt.Errorf("cannot save registry %q: batches record %d field %q is not valid UTF-8", path, i+1, tv.field)
+			}
+		}
 	}
 	mode := os.FileMode(0o644)
 	if info, err := os.Stat(path); err == nil {

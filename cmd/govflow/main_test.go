@@ -318,3 +318,261 @@ func TestRegistryRecordErrorNamesPositionAndBatch(t *testing.T) {
 		}
 	}
 }
+
+// batch-register must refuse malformed UTF-8 in any text flag, naming the
+// offending flag, before creating or touching the registry.
+func TestBatchRegisterRejectsBadUTF8Flags(t *testing.T) {
+	bad := "\xff"
+	cases := []struct {
+		name    string
+		batch   string
+		product string
+		unit    string
+		flag    string
+	}{
+		{"batch", " B" + bad + " ", "P", "kg", "--batch"},
+		{"product", "B1", "P" + bad, "kg", "--product"},
+		{"unit", "B1", "P", " kg" + bad, "--unit"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			registry := filepath.Join(dir, "reg.json")
+			var stdout bytes.Buffer
+			err := runBatchRegister([]string{
+				"--registry", registry,
+				"--batch", tc.batch,
+				"--product", tc.product,
+				"--quantity", "1",
+				"--unit", tc.unit,
+			}, &stdout)
+			if err == nil {
+				t.Fatal("malformed UTF-8 must be rejected")
+			}
+			if !strings.Contains(err.Error(), tc.flag) {
+				t.Fatalf("error must name %q: %v", tc.flag, err)
+			}
+			if !strings.Contains(err.Error(), "UTF-8") {
+				t.Fatalf("error must explain the encoding problem: %v", err)
+			}
+			if stdout.Len() != 0 {
+				t.Fatalf("stdout must stay empty: %q", stdout.String())
+			}
+			if _, statErr := os.Stat(registry); !os.IsNotExist(statErr) {
+				t.Fatal("a rejected registration must not create the registry file")
+			}
+		})
+	}
+}
+
+// Any malformed text field in any manifest record rejects the whole import,
+// even after legal records; the error names file, 1-based position and field
+// and only cites the batch id when that id itself is valid.
+func TestBatchImportRejectsBadUTF8Manifest(t *testing.T) {
+	cases := map[string]struct {
+		content []byte
+		pos     string
+		field   string
+		batch   string // empty when the batch must not be cited
+	}{
+		"bad unit after legal record": {
+			[]byte("[{\"batch\":\"OK1\",\"product\":\"P\",\"quantity\":1,\"unit\":\"kg\"}," +
+				"{\"batch\":\"BAD2\",\"product\":\"P\",\"quantity\":2,\"unit\":\"kg\xff\"}]"),
+			"record 2", "unit", "BAD2",
+		},
+		"bad batch cites no id": {
+			[]byte("[{\"batch\":\"B\xff\",\"product\":\"P\",\"quantity\":1,\"unit\":\"kg\"}]"),
+			"record 1", "batch", "",
+		},
+		"bad product cites valid batch": {
+			[]byte("[{\"batch\":\"B42\",\"product\":\"P\xff\",\"quantity\":1,\"unit\":\"kg\"}]"),
+			"record 1", "product", "B42",
+		},
+		"lone surrogate escape": {
+			[]byte(`[{"batch":"B\ud800","product":"P","quantity":1,"unit":"kg"}]`),
+			"record 1", "batch", "",
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			registry := filepath.Join(dir, "reg.json")
+			manifest := filepath.Join(dir, "in.json")
+			if err := os.WriteFile(manifest, tc.content, 0o644); err != nil {
+				t.Fatal(err)
+			}
+
+			var stdout bytes.Buffer
+			err := runBatchImport([]string{"--registry", registry, "--input", manifest}, &stdout)
+			if err == nil {
+				t.Fatal("malformed manifest must be rejected")
+			}
+			msg := err.Error()
+			for _, want := range []string{manifest, tc.pos, tc.field} {
+				if !strings.Contains(msg, want) {
+					t.Fatalf("error must mention %q: %v", want, msg)
+				}
+			}
+			if tc.batch != "" {
+				if !strings.Contains(msg, tc.batch) {
+					t.Fatalf("error must cite batch %q: %v", tc.batch, msg)
+				}
+			} else if strings.Contains(msg, "�") {
+				t.Fatalf("error must not cite a substituted batch id: %v", msg)
+			}
+			if stdout.Len() != 0 {
+				t.Fatalf("stdout must stay empty: %q", stdout.String())
+			}
+			if _, statErr := os.Stat(registry); !os.IsNotExist(statErr) {
+				t.Fatal("rejected import must not create the registry")
+			}
+			after, rerr := os.ReadFile(manifest)
+			if rerr != nil || !bytes.Equal(after, tc.content) {
+				t.Fatal("the read-only manifest was modified")
+			}
+		})
+	}
+}
+
+// A registry record containing malformed UTF-8 blocks both entry points; the
+// file's bytes and mtime stay exactly as they were.
+func TestBadUTF8RegistryBlocksBothCommands(t *testing.T) {
+	registries := map[string]struct {
+		content []byte
+		pos     string
+		field   string
+		batch   string
+	}{
+		"bad batch": {
+			[]byte("{\"version\":1,\"batches\":[{\"batch\":\"B\xff\",\"product\":\"P\",\"quantity\":1,\"unit\":\"kg\"}]}"),
+			"record 1", "batch", "",
+		},
+		"bad unit second record": {
+			[]byte("{\"version\":1,\"batches\":[" +
+				"{\"batch\":\"B1\",\"product\":\"P\",\"quantity\":1,\"unit\":\"kg\"}," +
+				"{\"batch\":\"B2\",\"product\":\"P\",\"quantity\":2,\"unit\":\"kg\xff\"}]}"),
+			"record 2", "unit", "B2",
+		},
+		"lone surrogate": {
+			[]byte(`{"version":1,"batches":[{"batch":"B\udc01","product":"P","quantity":1,"unit":"kg"}]}`),
+			"record 1", "batch", "",
+		},
+	}
+	manifestContent := []byte(`[{"batch":"NEW","product":"P","quantity":1,"unit":"kg"}]`)
+	for name, tc := range registries {
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			registry := filepath.Join(dir, "reg.json")
+			manifest := filepath.Join(dir, "in.json")
+			if err := os.WriteFile(registry, tc.content, 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(manifest, manifestContent, 0o644); err != nil {
+				t.Fatal(err)
+			}
+			pinned := time.Date(2003, time.April, 5, 6, 7, 8, 0, time.UTC)
+			if err := os.Chtimes(registry, pinned, pinned); err != nil {
+				t.Fatal(err)
+			}
+
+			assertBlocked := func(err error, stdout *bytes.Buffer) {
+				t.Helper()
+				if err == nil {
+					t.Fatal("malformed registry must be rejected")
+				}
+				msg := err.Error()
+				for _, want := range []string{registry, tc.pos, tc.field} {
+					if !strings.Contains(msg, want) {
+						t.Fatalf("error must mention %q: %v", want, msg)
+					}
+				}
+				if tc.batch != "" && !strings.Contains(msg, tc.batch) {
+					t.Fatalf("error must cite batch %q: %v", tc.batch, msg)
+				}
+				if tc.batch == "" && strings.Contains(msg, "�") {
+					t.Fatalf("error must not cite a substituted id: %v", msg)
+				}
+				if stdout.Len() != 0 {
+					t.Fatalf("stdout must stay empty: %q", stdout.String())
+				}
+			}
+
+			var stdout bytes.Buffer
+			err := runBatchRegister([]string{
+				"--registry", registry, "--batch", "NEW", "--product", "P",
+				"--quantity", "1", "--unit", "kg",
+			}, &stdout)
+			assertBlocked(err, &stdout)
+
+			stdout.Reset()
+			err = runBatchImport([]string{"--registry", registry, "--input", manifest}, &stdout)
+			assertBlocked(err, &stdout)
+
+			after, rerr := os.ReadFile(registry)
+			if rerr != nil || !bytes.Equal(after, tc.content) {
+				t.Fatalf("registry bytes changed: %q", after)
+			}
+			info, serr := os.Stat(registry)
+			if serr != nil || !info.ModTime().Equal(pinned) {
+				t.Fatalf("registry mtime changed: %v", serr)
+			}
+			mAfter, merr := os.ReadFile(manifest)
+			if merr != nil || !bytes.Equal(mAfter, manifestContent) {
+				t.Fatal("manifest was modified")
+			}
+		})
+	}
+}
+
+// Valid Unicode — CJK, emoji and a genuine U+FFFD — works end to end, and a
+// JSON escape means the same text as the directly written character.
+func TestUnicodeRoundTripsThroughBothCommands(t *testing.T) {
+	dir := t.TempDir()
+	registry := filepath.Join(dir, "reg.json")
+
+	var stdout bytes.Buffer
+	if err := runBatchRegister([]string{
+		"--registry", registry, "--batch", " 批次-1 ", "--product", "产品😀",
+		"--quantity", "7", "--unit", "千克",
+	}, &stdout); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(stdout.String(), `"status":"created"`) ||
+		!strings.Contains(stdout.String(), `"batch":"批次-1"`) {
+		t.Fatalf("unexpected output: %q", stdout.String())
+	}
+
+	// The same batch via a JSON \uXXXX escape pair for the emoji must be a
+	// duplicate, while a direct genuine U+FFFD registers a distinct batch.
+	manifest := filepath.Join(dir, "in.json")
+	writeFile(t, manifest, `[
+		{"batch":"批次-1","product":"产品😀","quantity":7,"unit":"千克"},
+		{"batch":"B-FFFD","product":"P�","quantity":1,"unit":"kg"}
+	]`)
+	stdout.Reset()
+	if err := runBatchImport([]string{"--registry", registry, "--input", manifest}, &stdout); err != nil {
+		t.Fatal(err)
+	}
+	var out importOutput
+	if err := json.Unmarshal(bytes.TrimSpace(stdout.Bytes()), &out); err != nil {
+		t.Fatal(err)
+	}
+	if len(out.Results) != 2 ||
+		out.Results[0].Status != "duplicate" || out.Results[0].Product != "产品😀" ||
+		out.Results[1].Status != "created" || out.Results[1].Product != "P�" {
+		t.Fatalf("unexpected results: %s", stdout.String())
+	}
+
+	// Re-registering the genuine U+FFFD batch directly is a duplicate, and a
+	// malformed byte in a different flag is still refused.
+	stdout.Reset()
+	if err := runBatchRegister([]string{
+		"--registry", registry, "--batch", "B-FFFD", "--product", "P�",
+		"--quantity", "1", "--unit", "kg",
+	}, &stdout); err != nil {
+		t.Fatalf("genuine U+FFFD must stay usable: %v", err)
+	}
+	if !strings.Contains(stdout.String(), `"status":"duplicate"`) {
+		t.Fatalf("expected duplicate: %q", stdout.String())
+	}
+}
