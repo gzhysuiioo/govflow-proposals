@@ -533,6 +533,99 @@ func TestParseManifestRecordErrorPosition(t *testing.T) {
 	}
 }
 
+func TestParseManifestRecordErrorBatchAttribution(t *testing.T) {
+	// A record rejected for an unknown, duplicated or case-variant field
+	// must still name its batch id whenever the record carries exactly one
+	// "batch" member with valid, non-blank text — no matter where in the
+	// record that member sits. The id is normalized (trimmed) and never
+	// recovered from a duplicated, mistyped, blank or malformed "batch".
+	cases := map[string]struct {
+		content   string
+		pos       int
+		batch     string
+		fieldName string // must appear in the reason
+	}{
+		"unknown field after batch": {
+			`[{"batch":" B-002 ","product":"P","quantity":1,"unit":"kg","supplier":"S"}]`,
+			1, "B-002", "supplier",
+		},
+		"unknown field before batch": {
+			`[{"supplier":"S","product":"P","quantity":1,"unit":"kg","batch":" B-002 "}]`,
+			1, "B-002", "supplier",
+		},
+		"unknown field on second record": {
+			`[{"batch":"B1","product":"P","quantity":1,"unit":"kg"},
+			  {"batch":" B-002 ","product":"P","quantity":1,"unit":"kg","supplier":1}]`,
+			2, "B-002", "supplier",
+		},
+		"duplicate product with identical values": {
+			`[{"batch":"B-002","product":"P","product":"P","quantity":1,"unit":"kg"}]`,
+			1, "B-002", "product",
+		},
+		"case-variant field": {
+			`[{"batch":"B-002","Batch":"X","product":"P","quantity":1,"unit":"kg"}]`,
+			1, "B-002", "Batch",
+		},
+		"non-ASCII batch id": {
+			`[{"batch":"批次 😀","product":"P","quantity":1,"unit":"kg","supplier":1}]`,
+			1, "批次 😀", "supplier",
+		},
+		"batch missing": {
+			`[{"product":"P","quantity":1,"unit":"kg","supplier":1}]`,
+			1, "", "supplier",
+		},
+		"batch not a string": {
+			`[{"batch":7,"product":"P","quantity":1,"unit":"kg","supplier":1}]`,
+			1, "", "supplier",
+		},
+		"batch blank after trimming": {
+			`[{"batch":"   ","product":"P","quantity":1,"unit":"kg","supplier":1}]`,
+			1, "", "supplier",
+		},
+		"batch duplicated with identical values": {
+			`[{"batch":"B-002","batch":"B-002","product":"P","quantity":1,"unit":"kg"}]`,
+			1, "", "batch",
+		},
+		"batch duplicated through a JSON escape": {
+			`[{"batch":"B-002","bat\u0063h":"B-002","product":"P","quantity":1,"unit":"kg"}]`,
+			1, "", "batch",
+		},
+		"batch with lone surrogate escape": {
+			`[{"batch":"B\ud800","product":"P","quantity":1,"unit":"kg","supplier":1}]`,
+			1, "", "supplier",
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			_, err := ParseManifest([]byte(tc.content))
+			var re *ManifestRecordError
+			if !errors.As(err, &re) {
+				t.Fatalf("expected ManifestRecordError, got %v", err)
+			}
+			if re.Position != tc.pos || re.Batch != tc.batch {
+				t.Fatalf("position=%d batch=%q, want %d/%q", re.Position, re.Batch, tc.pos, tc.batch)
+			}
+			if !strings.Contains(re.Reason, tc.fieldName) {
+				t.Fatalf("reason %q must name field %q", re.Reason, tc.fieldName)
+			}
+		})
+	}
+
+	// A malformed UTF-8 byte inside the batch value must not be quoted back
+	// as a U+FFFD substitution either.
+	badByte := []byte(`[{"batch":"B`)
+	badByte = append(badByte, 0xff)
+	badByte = append(badByte, []byte(`","product":"P","quantity":1,"unit":"kg","supplier":1}]`)...)
+	_, err := ParseManifest(badByte)
+	var re *ManifestRecordError
+	if !errors.As(err, &re) {
+		t.Fatalf("expected ManifestRecordError, got %v", err)
+	}
+	if re.Batch != "" {
+		t.Fatalf("batch=%q, want empty for malformed UTF-8 batch", re.Batch)
+	}
+}
+
 func TestImportCreatesAndConfirmsRepeats(t *testing.T) {
 	reg := &Registry{Version: FormatVersion, Batches: []Batch{
 		{Batch: "OLD", Product: "P-1", Quantity: 3, Unit: "kg"},

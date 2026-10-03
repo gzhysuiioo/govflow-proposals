@@ -743,6 +743,24 @@ func parseManifestRecord(raw json.RawMessage) (Input, error) {
 	if err != nil {
 		return in, errors.New("record must be a JSON object with batch, product, quantity and unit")
 	}
+	// The batch id is attached to the returned Input (and thereby to the
+	// ManifestRecordError) only when it is unambiguous: exactly one "batch"
+	// member carrying a JSON string whose decoded text is valid UTF-8 and
+	// stays non-empty after trimming. When "batch" is missing, duplicated,
+	// not a string, blank or not valid UTF-8, no id (and never a U+FFFD
+	// replacement) is picked arbitrarily. This is resolved before the
+	// unknown/duplicate field checks below — and independently of where the
+	// "batch" member sits in the record — so those rejections still name
+	// the batch.
+	if countField(members, "batch") == 1 {
+		if rawID, ok := findField(members, "batch"); ok {
+			if id, idErr := unmarshalStringStrict(rawID); idErr == nil {
+				if normalized, normErr := NormalizeField(id); normErr == nil {
+					in.Batch = normalized
+				}
+			}
+		}
+	}
 	fields := make(map[string]json.RawMessage, len(members))
 	for _, f := range members {
 		if _, ok := batchRecordFields[f.key]; !ok {
