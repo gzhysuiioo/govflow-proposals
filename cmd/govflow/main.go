@@ -131,7 +131,15 @@ registry file format (UTF-8 JSON, human-inspectable):
   }
 A missing file is created on first registration. An existing file that is
 empty, cannot be read in this format, or contains several records with the
-same batch number is rejected outright and never overwritten. Failures print
+same batch number is rejected outright and never overwritten. "This format"
+is strict: the root object must carry exactly version (the integer 1) and
+batches (an array, empty allowed), each record exactly the four lowercase
+fields batch, product, quantity and unit; missing, null, mistyped, unknown
+or case-variant fields (Version, Batch, ...) are rejected, and so is any
+field appearing twice in one object — even with identical values, even when
+one spelling hides behind a JSON escape. The error names the file, the
+field and the reason, plus the 1-based record position (and the batch id
+when it is unambiguous) for record-level problems. Failures print
 the reason to stderr and exit non-zero without touching the registry.
 `
 }

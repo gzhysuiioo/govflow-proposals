@@ -78,12 +78,46 @@ func (e *ConflictError) Error() string {
 }
 
 // DuplicateIDError reports two stored records sharing one batch id.
+// First and Second are the 1-based positions of the two records in the
+// batches array when known.
 type DuplicateIDError struct {
-	Batch string
+	Batch  string
+	First  int
+	Second int
 }
 
 func (e *DuplicateIDError) Error() string {
+	if e.First > 0 && e.Second > 0 {
+		return fmt.Sprintf("registry contains multiple records for batch %q (records %d and %d)", e.Batch, e.First, e.Second)
+	}
 	return fmt.Sprintf("registry contains multiple records for batch %q", e.Batch)
+}
+
+// FormatError reports a structural violation of the public registry file
+// format: a missing, duplicated, misspelled, null or mistyped field, either
+// in the root object (Position == 0) or in one batch record (Position is its
+// 1-based index in "batches"). Batch carries the record's batch id only when
+// it is uniquely determined; it stays empty when the "batch" member itself
+// is missing, duplicated or not a string.
+type FormatError struct {
+	Position int
+	Batch    string
+	Field    string
+	Reason   string
+}
+
+func (e *FormatError) Error() string {
+	where := "root object"
+	if e.Position > 0 {
+		where = fmt.Sprintf("batches record %d", e.Position)
+		if e.Batch != "" {
+			where += fmt.Sprintf(" (batch %q)", e.Batch)
+		}
+	}
+	if e.Field != "" {
+		return fmt.Sprintf("%s: field %q: %s", where, e.Field, e.Reason)
+	}
+	return fmt.Sprintf("%s: %s", where, e.Reason)
 }
 
 // NormalizeField trims leading and trailing whitespace; the result must stay
@@ -117,7 +151,8 @@ func ParseQuantity(text string) (int64, error) {
 
 // Load reads the registry at path. A missing file yields an empty registry
 // with existed == false. An existing file that is empty, not parseable as
-// the public format, of an unsupported version, or holding duplicate batch
+// the public format — including missing, null, duplicated, misspelled or
+// mistyped fields — of an unsupported version, or holding duplicate batch
 // ids is an error: callers must never overwrite such a file as if it were a
 // fresh registry.
 func Load(path string) (reg *Registry, existed bool, err error) {
@@ -141,11 +176,20 @@ func Load(path string) (reg *Registry, existed bool, err error) {
 	return reg, true, nil
 }
 
+// decode parses data as the public registry format. The root must be a JSON
+// object holding exactly "version" (the integer 1) and "batches" (an array,
+// possibly empty); every record must be an object holding exactly "batch",
+// "product", "quantity" and "unit". Field names are matched case-sensitively
+// after JSON string decoding, so "Version" or "Batch" are unknown fields and
+// an escaped respelling such as "bat\u0063h" counts as the same field. A
+// field appearing twice in one object is rejected even when both values are
+// identical; missing fields, nulls, wrong types and unknown fields are
+// rejected just the same. Nothing is patched up by taking the later value,
+// merging or defaulting.
 func decode(data []byte) (*Registry, error) {
 	dec := json.NewDecoder(bytes.NewReader(data))
-	dec.DisallowUnknownFields()
-	reg := &Registry{}
-	if err := dec.Decode(reg); err != nil {
+	var root json.RawMessage
+	if err := dec.Decode(&root); err != nil {
 		return nil, err
 	}
 	var extra json.RawMessage
@@ -155,25 +199,257 @@ func decode(data []byte) (*Registry, error) {
 		}
 		return nil, err
 	}
-	if reg.Version != FormatVersion {
-		return nil, fmt.Errorf("unsupported registry version: got %d, want %d", reg.Version, FormatVersion)
+
+	fields, err := parseObjectFields(root)
+	if err != nil {
+		return nil, &FormatError{Reason: "root must be a JSON object holding exactly \"version\" and \"batches\""}
+	}
+	if dup, ok := duplicateField(fields); ok {
+		return nil, &FormatError{Field: dup, Reason: "field appears more than once; duplicate fields are not allowed"}
+	}
+	for _, f := range fields {
+		if f.key != "version" && f.key != "batches" {
+			return nil, &FormatError{Field: f.key, Reason: "unknown field; only \"version\" and \"batches\" are allowed"}
+		}
+	}
+	versionRaw, ok := findField(fields, "version")
+	if !ok {
+		return nil, &FormatError{Field: "version", Reason: "required field is missing"}
+	}
+	batchesRaw, ok := findField(fields, "batches")
+	if !ok {
+		return nil, &FormatError{Field: "batches", Reason: "required field is missing"}
+	}
+	version, err := parseRegistryVersion(versionRaw)
+	if err != nil {
+		return nil, err
+	}
+	if trimmed := bytes.TrimSpace(batchesRaw); len(trimmed) == 0 || trimmed[0] != '[' {
+		return nil, &FormatError{Field: "batches", Reason: "must be an array of batch records"}
+	}
+	var elems []json.RawMessage
+	if err := json.Unmarshal(batchesRaw, &elems); err != nil {
+		return nil, &FormatError{Field: "batches", Reason: "must be an array of batch records"}
+	}
+	reg := &Registry{Version: version, Batches: make([]Batch, 0, len(elems))}
+	for i, raw := range elems {
+		b, err := parseRegistryRecord(raw, i+1)
+		if err != nil {
+			return nil, err
+		}
+		reg.Batches = append(reg.Batches, b)
 	}
 	return reg, nil
 }
 
+// parseRegistryVersion accepts exactly the integer literal of FormatVersion.
+// Other integers report an unsupported version; anything else (strings,
+// fractions, exponents, booleans, null, arrays, objects) is a type error.
+func parseRegistryVersion(raw json.RawMessage) (int, error) {
+	token := string(bytes.TrimSpace(raw))
+	if isJSONInteger(token) {
+		if token == strconv.Itoa(FormatVersion) {
+			return FormatVersion, nil
+		}
+		return 0, fmt.Errorf("unsupported registry version: got %s, want %d", token, FormatVersion)
+	}
+	return 0, &FormatError{Field: "version", Reason: fmt.Sprintf("must be the integer %d, not %s", FormatVersion, token)}
+}
+
+// parseRegistryRecord validates one batches element: a JSON object with
+// exactly the four required lowercase fields, text fields as JSON strings
+// and quantity as a strict JSON integer in 1..MaxQuantity. pos is the
+// record's 1-based position in the batches array.
+func parseRegistryRecord(raw json.RawMessage, pos int) (Batch, error) {
+	var b Batch
+	fields, err := parseObjectFields(raw)
+	if err != nil {
+		return b, &FormatError{Position: pos, Reason: "record must be a JSON object holding exactly \"batch\", \"product\", \"quantity\" and \"unit\""}
+	}
+	// The batch id is attached to errors only when it is unambiguous:
+	// exactly one "batch" member carrying a JSON string. When the "batch"
+	// member itself is duplicated, no id is picked arbitrarily.
+	batchID := ""
+	if countField(fields, "batch") == 1 {
+		if rawID, _ := findField(fields, "batch"); rawID != nil {
+			var id string
+			if json.Unmarshal(rawID, &id) == nil {
+				batchID = id
+			}
+		}
+	}
+	fail := func(field, reason string) (Batch, error) {
+		return Batch{}, &FormatError{Position: pos, Batch: batchID, Field: field, Reason: reason}
+	}
+
+	if dup, ok := duplicateField(fields); ok {
+		return fail(dup, "field appears more than once; duplicate fields are not allowed")
+	}
+	for _, f := range fields {
+		if _, ok := batchRecordFields[f.key]; !ok {
+			return fail(f.key, "unknown field; only \"batch\", \"product\", \"quantity\" and \"unit\" are allowed")
+		}
+	}
+
+	text := func(name string) (string, error) {
+		rawValue, ok := findField(fields, name)
+		if !ok {
+			return "", &FormatError{Position: pos, Batch: batchID, Field: name, Reason: "required field is missing"}
+		}
+		if trimmed := bytes.TrimSpace(rawValue); len(trimmed) == 0 || trimmed[0] != '"' {
+			return "", &FormatError{Position: pos, Batch: batchID, Field: name, Reason: "must be a JSON string"}
+		}
+		var s string
+		if err := json.Unmarshal(rawValue, &s); err != nil {
+			return "", &FormatError{Position: pos, Batch: batchID, Field: name, Reason: "must be a JSON string"}
+		}
+		return s, nil
+	}
+	if b.Batch, err = text("batch"); err != nil {
+		return Batch{}, err
+	}
+	if b.Product, err = text("product"); err != nil {
+		return Batch{}, err
+	}
+	if b.Unit, err = text("unit"); err != nil {
+		return Batch{}, err
+	}
+	quantityRaw, ok := findField(fields, "quantity")
+	if !ok {
+		return fail("quantity", "required field is missing")
+	}
+	b.Quantity, err = parseRegistryQuantity(bytes.TrimSpace(quantityRaw))
+	if err != nil {
+		return fail("quantity", err.Error())
+	}
+	return b, nil
+}
+
+// parseRegistryQuantity accepts exactly a strict JSON integer token in the
+// range 1..MaxQuantity. Strings, signs, fractions, exponents, null and
+// out-of-range values are rejected.
+func parseRegistryQuantity(token []byte) (int64, error) {
+	if !isJSONInteger(string(token)) || len(token) == 0 || token[0] == '-' {
+		return 0, fmt.Errorf("must be a JSON integer between 1 and %d", MaxQuantity)
+	}
+	value, err := strconv.ParseInt(string(token), 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("must be an integer no greater than %d", MaxQuantity)
+	}
+	if value == 0 {
+		return 0, errors.New("must be greater than zero")
+	}
+	return value, nil
+}
+
+// isJSONInteger reports whether token is a JSON number literal without
+// fraction or exponent. The token comes from validated JSON, so leading
+// zeros cannot hide extra digits.
+func isJSONInteger(token string) bool {
+	if token == "" {
+		return false
+	}
+	if token[0] == '-' {
+		token = token[1:]
+	}
+	if token == "" {
+		return false
+	}
+	for i := 0; i < len(token); i++ {
+		if token[i] < '0' || token[i] > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// objectField is one member of a JSON object in source order; the key is
+// the decoded JSON string, so escaped spellings compare by meaning.
+type objectField struct {
+	key   string
+	value json.RawMessage
+}
+
+// parseObjectFields decodes a single JSON object value into its members in
+// source order, keeping duplicates visible for the caller to reject.
+func parseObjectFields(raw []byte) ([]objectField, error) {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || trimmed[0] != '{' {
+		return nil, errors.New("value is not a JSON object")
+	}
+	dec := json.NewDecoder(bytes.NewReader(trimmed))
+	if _, err := dec.Token(); err != nil { // opening brace
+		return nil, err
+	}
+	var fields []objectField
+	for dec.More() {
+		tok, err := dec.Token()
+		if err != nil {
+			return nil, err
+		}
+		key, ok := tok.(string)
+		if !ok {
+			return nil, errors.New("object keys must be JSON strings")
+		}
+		var value json.RawMessage
+		if err := dec.Decode(&value); err != nil {
+			return nil, err
+		}
+		fields = append(fields, objectField{key: key, value: value})
+	}
+	if _, err := dec.Token(); err != nil { // closing brace
+		return nil, err
+	}
+	return fields, nil
+}
+
+// duplicateField returns the first field name appearing more than once.
+func duplicateField(fields []objectField) (string, bool) {
+	seen := make(map[string]struct{}, len(fields))
+	for _, f := range fields {
+		if _, dup := seen[f.key]; dup {
+			return f.key, true
+		}
+		seen[f.key] = struct{}{}
+	}
+	return "", false
+}
+
+// findField returns the raw value of the first member named name.
+func findField(fields []objectField, name string) (json.RawMessage, bool) {
+	for _, f := range fields {
+		if f.key == name {
+			return f.value, true
+		}
+	}
+	return nil, false
+}
+
+// countField counts the members named name.
+func countField(fields []objectField, name string) int {
+	n := 0
+	for _, f := range fields {
+		if f.key == name {
+			n++
+		}
+	}
+	return n
+}
+
 func validate(reg *Registry) error {
-	seen := make(map[string]struct{}, len(reg.Batches))
+	seen := make(map[string]int, len(reg.Batches))
 	for i, b := range reg.Batches {
+		pos := i + 1
 		if b.Batch == "" || b.Product == "" || b.Unit == "" {
-			return fmt.Errorf("batches[%d] (batch %q): batch, product and unit must all be non-empty", i, b.Batch)
+			return fmt.Errorf("batches record %d (batch %q): batch, product and unit must all be non-empty", pos, b.Batch)
 		}
 		if b.Quantity <= 0 {
-			return fmt.Errorf("batches[%d] (batch %q): quantity must be a positive integer", i, b.Batch)
+			return fmt.Errorf("batches record %d (batch %q): quantity must be a positive integer", pos, b.Batch)
 		}
-		if _, dup := seen[b.Batch]; dup {
-			return &DuplicateIDError{Batch: b.Batch}
+		if first, dup := seen[b.Batch]; dup {
+			return &DuplicateIDError{Batch: b.Batch, First: first, Second: pos}
 		}
-		seen[b.Batch] = struct{}{}
+		seen[b.Batch] = pos
 	}
 	return nil
 }
@@ -259,8 +535,9 @@ func ParseManifest(data []byte) ([]Input, error) {
 	return inputs, nil
 }
 
-// requiredManifestFields are the only members a manifest record may carry.
-var requiredManifestFields = map[string]struct{}{
+// batchRecordFields are the only members a batch record may carry, in the
+// registry file and in an import manifest alike.
+var batchRecordFields = map[string]struct{}{
 	"batch": {}, "product": {}, "quantity": {}, "unit": {},
 }
 
@@ -277,7 +554,7 @@ func parseManifestRecord(raw json.RawMessage) (Input, error) {
 		return in, fmt.Errorf("record is not valid JSON: %w", err)
 	}
 	for name := range fields {
-		if _, ok := requiredManifestFields[name]; !ok {
+		if _, ok := batchRecordFields[name]; !ok {
 			return in, fmt.Errorf("record has unknown field %q; only batch, product, quantity and unit are allowed", name)
 		}
 	}
@@ -335,29 +612,13 @@ func parseManifestRecord(raw json.RawMessage) (Input, error) {
 // objectKeys returns the member keys of a JSON object in source order,
 // flagging repeated names for the caller.
 func objectKeys(raw json.RawMessage) ([]string, error) {
-	dec := json.NewDecoder(bytes.NewReader(raw))
-	if _, err := dec.Token(); err != nil { // opening brace
-		return nil, fmt.Errorf("record is not a JSON object: %w", err)
-	}
-	var keys []string
-	for dec.More() {
-		tok, err := dec.Token()
-		if err != nil {
-			return nil, err
-		}
-		key, ok := tok.(string)
-		if !ok {
-			return nil, errors.New("record object keys must be JSON strings")
-		}
-		keys = append(keys, key)
-		// Skip over the value token(s) so the next token is the next key.
-		var skip json.RawMessage
-		if err := dec.Decode(&skip); err != nil {
-			return nil, err
-		}
-	}
-	if _, err := dec.Token(); err != nil { // closing brace
+	fields, err := parseObjectFields(raw)
+	if err != nil {
 		return nil, err
+	}
+	keys := make([]string, len(fields))
+	for i, f := range fields {
+		keys[i] = f.key
 	}
 	return keys, nil
 }

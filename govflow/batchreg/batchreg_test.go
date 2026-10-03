@@ -285,6 +285,122 @@ func TestLoadAcceptsEmptyBatchList(t *testing.T) {
 	}
 }
 
+func TestLoadRejectsStructuralViolations(t *testing.T) {
+	dir := t.TempDir()
+	cases := map[string]string{
+		// Duplicate fields are rejected even when both values are identical,
+		// and even when the repeat hides behind a JSON escape.
+		"root duplicate version":   `{"version":1,"version":1,"batches":[]}`,
+		"root duplicate batches":   `{"version":1,"batches":[{"batch":"B","product":"P","quantity":1,"unit":"kg"}],"batches":[]}`,
+		"root duplicate escaped":   `{"version":1,"\u0076ersion":1,"batches":[]}`,
+		"record duplicate field":   `{"version":1,"batches":[{"batch":"B","product":"P","quantity":1,"unit":"kg","unit":"kg"}]}`,
+		"record duplicate escaped": `{"version":1,"batches":[{"batch":"B","produc\u0074":"P","product":"P","quantity":1,"unit":"kg"}]}`,
+		// Missing or null members of the root object.
+		"missing version": `{"batches":[]}`,
+		"missing batches": `{"version":1}`,
+		"null version":    `{"version":null,"batches":[]}`,
+		"null batches":    `{"version":1,"batches":null}`,
+		// Wrong types.
+		"string version": `{"version":"1","batches":[]}`,
+		"float version":  `{"version":1.0,"batches":[]}`,
+		"batches object": `{"version":1,"batches":{}}`,
+		"batches string": `{"version":1,"batches":"[]"}`,
+		// Field names are matched case-sensitively.
+		"capitalized root":   `{"Version":1,"batches":[]}`,
+		"capitalized record": `{"version":1,"batches":[{"Batch":"B","product":"P","quantity":1,"unit":"kg"}]}`,
+		// Record-level structural problems.
+		"record not object":      `{"version":1,"batches":[null]}`,
+		"record missing field":   `{"version":1,"batches":[{"batch":"B","product":"P","quantity":1}]}`,
+		"record null field":      `{"version":1,"batches":[{"batch":"B","product":null,"quantity":1,"unit":"kg"}]}`,
+		"record quantity string": `{"version":1,"batches":[{"batch":"B","product":"P","quantity":"1","unit":"kg"}]}`,
+		"record quantity float":  `{"version":1,"batches":[{"batch":"B","product":"P","quantity":1.0,"unit":"kg"}]}`,
+		"record quantity null":   `{"version":1,"batches":[{"batch":"B","product":"P","quantity":null,"unit":"kg"}]}`,
+		"record quantity minus":  `{"version":1,"batches":[{"batch":"B","product":"P","quantity":-3,"unit":"kg"}]}`,
+		"record unknown field":   `{"version":1,"batches":[{"batch":"B","product":"P","quantity":1,"unit":"kg","note":"x"}]}`,
+	}
+	for name, content := range cases {
+		t.Run(name, func(t *testing.T) {
+			path := filepath.Join(dir, name+".json")
+			writeRegistry(t, path, content)
+			if _, _, err := Load(path); err == nil {
+				t.Fatalf("expected rejection of %s", content)
+			}
+		})
+	}
+}
+
+func TestLoadFormatErrorDetails(t *testing.T) {
+	dir := t.TempDir()
+
+	// A record-level error names the 1-based position, the batch id when it
+	// is unambiguous, the field and the reason.
+	t.Run("record position and batch", func(t *testing.T) {
+		path := filepath.Join(dir, "pos.json")
+		writeRegistry(t, path, `{"version":1,"batches":[
+			{"batch":"B1","product":"P","quantity":1,"unit":"kg"},
+			{"batch":"B2","product":"P","quantity":1,"unit":"kg","extra":1}]}`)
+		_, _, err := Load(path)
+		var fe *FormatError
+		if !errors.As(err, &fe) {
+			t.Fatalf("expected FormatError, got %v", err)
+		}
+		if fe.Position != 2 || fe.Batch != "B2" || fe.Field != "extra" {
+			t.Fatalf("unexpected FormatError: %+v", fe)
+		}
+	})
+
+	// When the batch member itself is duplicated, no id is picked.
+	t.Run("ambiguous batch id", func(t *testing.T) {
+		path := filepath.Join(dir, "amb.json")
+		writeRegistry(t, path, `{"version":1,"batches":[{"batch":"B1","batch":"B2","product":"P","quantity":1,"unit":"kg"}]}`)
+		_, _, err := Load(path)
+		var fe *FormatError
+		if !errors.As(err, &fe) {
+			t.Fatalf("expected FormatError, got %v", err)
+		}
+		if fe.Position != 1 || fe.Batch != "" || fe.Field != "batch" {
+			t.Fatalf("unexpected FormatError: %+v", fe)
+		}
+	})
+
+	// Root-level problems carry the field but no record position.
+	t.Run("root field", func(t *testing.T) {
+		path := filepath.Join(dir, "root.json")
+		writeRegistry(t, path, `{"version":1,"batches":[],"batches":[]}`)
+		_, _, err := Load(path)
+		var fe *FormatError
+		if !errors.As(err, &fe) {
+			t.Fatalf("expected FormatError, got %v", err)
+		}
+		if fe.Position != 0 || fe.Field != "batches" {
+			t.Fatalf("unexpected FormatError: %+v", fe)
+		}
+	})
+}
+
+func TestLoadAcceptsLegalFormatting(t *testing.T) {
+	// Field order, indentation and JSON escapes are part of the format, not
+	// of the data: this file is legal and its values load unchanged.
+	path := filepath.Join(t.TempDir(), "r.json")
+	writeRegistry(t, path, "{\n  \"batches\": [\n    {\"unit\": \"kg\", \"quantity\": 120, \"product\": \"P-7\", \"batch\": \"B-001\"},\n    {\"batch\": \"B\\u002d002\", \"product\": \"P 8\", \"quantity\": 1, \"unit\": \"box\"}\n  ],\n  \"version\": 1\n}")
+	reg, existed, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !existed || len(reg.Batches) != 2 {
+		t.Fatalf("existed=%v batches=%+v", existed, reg.Batches)
+	}
+	want := []Batch{
+		{Batch: "B-001", Product: "P-7", Quantity: 120, Unit: "kg"},
+		{Batch: "B-002", Product: "P 8", Quantity: 1, Unit: "box"},
+	}
+	for i, w := range want {
+		if reg.Batches[i] != w {
+			t.Errorf("record %d = %+v, want %+v", i+1, reg.Batches[i], w)
+		}
+	}
+}
+
 func TestSaveFailureLeavesExistingRegistryUsable(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "registry.json")
