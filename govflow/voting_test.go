@@ -1678,3 +1678,339 @@ func TestNullTopLevelLeafRejected(t *testing.T) {
 		t.Fatalf("error should name the field: %v", err)
 	}
 }
+
+// TestIncompleteTallyRejectedAsCorrupt：已计票提案的计票结果缺少 for_weight 或
+// against_weight（或为 null、JSON 类型不符）时，整份状态文件判为损坏——即使缺失
+// 一侧的真实票重恰好为零、逐票明细能重放出相同结论，也不得默认补零后接受。
+// 已通过、已拒绝、已执行的提案遵守同一条完整性规则。错误必须能看出提案编号、
+// 缺失字段与原因分类，且原文件保留。
+func TestIncompleteTallyRejectedAsCorrupt(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "treasury.json")
+	store, err := InitTreasury(path, 1000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 三项提案共用同一份名单（quorum=600，alice 归集 600，dave 400）：
+	// gip-passed：alice 600 赞成、反对 0，恰好达到法定人数而通过；
+	// gip-rejected：dave 400 反对、赞成 0，参与不足而拒绝；
+	// gip-executed：与 gip-passed 相同并已在时间锁后执行。
+	passed := baseVoteInput("gip-passed")
+	mustCreateVote(t, store, passed)
+	rejected := baseVoteInput("gip-rejected")
+	mustCreateVote(t, store, rejected)
+	executed := baseVoteInput("gip-executed")
+	mustCreateVote(t, store, executed)
+	for _, id := range []string{"gip-passed", "gip-rejected", "gip-executed"} {
+		voter, support := "alice", true
+		if id == "gip-rejected" {
+			voter, support = "dave", false
+		}
+		if _, err := store.CastVote(id, voter, support, 150); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := store.TallyVote(id, 200); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := store.Execute("gip-executed", 300); err != nil {
+		t.Fatal(err)
+	}
+	store.Close()
+
+	good, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// mutate 以结构化改写构造损坏变体；id 标明出问题的提案。
+	mutate := func(id string, fn func(tally map[string]any)) []byte {
+		var clone map[string]any
+		if err := json.Unmarshal(good, &clone); err != nil {
+			t.Fatal(err)
+		}
+		p := clone["vote_proposals"].(map[string]any)[id].(map[string]any)
+		fn(p["tally"].(map[string]any))
+		raw, err := json.MarshalIndent(clone, "", "  ")
+		if err != nil {
+			t.Fatal(err)
+		}
+		return append(raw, '\n')
+	}
+	cases := map[string]struct {
+		raw       []byte
+		id        string
+		field     string
+		causeWord string
+	}{
+		// 标题场景：赞成 600/反对 0/法定人数 600 已通过，反对权重被删掉。
+		"against weight missing on passed zero side": {
+			mutate("gip-passed", func(tl map[string]any) { delete(tl, "against_weight") }),
+			"gip-passed", "against_weight", "missing",
+		},
+		"for weight missing on passed": {
+			mutate("gip-passed", func(tl map[string]any) { delete(tl, "for_weight") }),
+			"gip-passed", "for_weight", "missing",
+		},
+		// 已拒绝提案的赞成侧恰好为零，同样不得补零接受。
+		"for weight missing on rejected zero side": {
+			mutate("gip-rejected", func(tl map[string]any) { delete(tl, "for_weight") }),
+			"gip-rejected", "for_weight", "missing",
+		},
+		// 已执行提案的首次计票记录同样必须完整。
+		"against weight missing on executed": {
+			mutate("gip-executed", func(tl map[string]any) { delete(tl, "against_weight") }),
+			"gip-executed", "against_weight", "missing",
+		},
+		"for weight null": {
+			mutate("gip-passed", func(tl map[string]any) { tl["for_weight"] = nil }),
+			"gip-passed", "for_weight", "null",
+		},
+		"against weight null": {
+			mutate("gip-rejected", func(tl map[string]any) { tl["against_weight"] = nil }),
+			"gip-rejected", "against_weight", "null",
+		},
+		"for weight string not integer": {
+			mutate("gip-passed", func(tl map[string]any) { tl["for_weight"] = "600" }),
+			"gip-passed", "for_weight", "wrong type",
+		},
+		"against weight float not integer": {
+			mutate("gip-passed", func(tl map[string]any) { tl["against_weight"] = 0.5 }),
+			"gip-passed", "against_weight", "wrong type",
+		},
+		"for weight boolean not integer": {
+			mutate("gip-passed", func(tl map[string]any) { tl["for_weight"] = true }),
+			"gip-passed", "for_weight", "wrong type",
+		},
+		"against weight over int64": {
+			mutate("gip-passed", func(tl map[string]any) { tl["against_weight"] = 9223372036854775808.0 }),
+			"gip-passed", "against_weight", "wrong type",
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			bad := filepath.Join(dir, "bad-"+strings.ReplaceAll(name, " ", "-")+".json")
+			if err := os.WriteFile(bad, tc.raw, 0o600); err != nil {
+				t.Fatal(err)
+			}
+
+			// 打开即拒绝，错误带提案编号、计票字段与原因分类。
+			s, err := Open(bad)
+			if !errors.Is(err, ErrStateCorrupt) {
+				if s != nil {
+					s.Close()
+				}
+				t.Fatalf("Open err=%v, want ErrStateCorrupt", err)
+			}
+			msg := err.Error()
+			for _, want := range []string{`"` + tc.id + `"`, "tally", `"` + tc.field + `"`, tc.causeWord} {
+				if !strings.Contains(msg, want) {
+					t.Fatalf("error %q missing %q", msg, want)
+				}
+			}
+
+			// 原文件内容必须原样保留（失败不回写、不把缺失权重补成 0）。
+			if got, rerr := os.ReadFile(bad); rerr != nil || string(got) != string(tc.raw) {
+				t.Fatalf("corrupt file was modified on rejected Open")
+			}
+
+			// 重复打开仍以同一损坏分类拒绝，绝不返回可用句柄给出部分结果。
+			s2, e := Open(bad)
+			if !errors.Is(e, ErrStateCorrupt) {
+				if s2 != nil {
+					s2.Close()
+				}
+				t.Fatalf("reopen err=%v, want ErrStateCorrupt", e)
+			}
+		})
+	}
+}
+
+// TestIncompleteTallyOpsRejectAndKeepFile：计票结果缺损的文件上，查询与
+// 计票/投票操作一律返回 ErrStateCorrupt，不给出部分结果、不因请求同库内另一项
+// 正常提案而忽略损坏、不改写文件，写入操作也不能借机把缺失权重补成零后保存。
+func TestIncompleteTallyOpsRejectAndKeepFile(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "treasury.json")
+	store, err := InitTreasury(path, 1000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// gip-tally-ops：已计票通过（for=600/against=0）；gip-still-voting：仍在投票。
+	mustCreateVote(t, store, baseVoteInput("gip-tally-ops"))
+	if _, err := store.CastVote("gip-tally-ops", "alice", true, 150); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.TallyVote("gip-tally-ops", 200); err != nil {
+		t.Fatal(err)
+	}
+	mustCreateVote(t, store, baseVoteInput("gip-still-voting"))
+	mustRegister(t, store, "gip-spent", 0, "transfer:audits:100")
+	if _, err := store.Execute("gip-spent", 0); err != nil {
+		t.Fatal(err)
+	}
+	store.Close()
+
+	good, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var clone map[string]any
+	if err := json.Unmarshal(good, &clone); err != nil {
+		t.Fatal(err)
+	}
+	// 删除已计票结果的 against_weight：真实反对票重恰好为 0，
+	// 若被默认补零，这份缺损记录会被误当成有效的首次计票结果。
+	delete(clone["vote_proposals"].(map[string]any)["gip-tally-ops"].(map[string]any)["tally"].(map[string]any), "against_weight")
+	bad, err := json.MarshalIndent(clone, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	bad = append(bad, '\n')
+	if err := os.WriteFile(path, bad, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// 打开即拒绝，不返回可用句柄。
+	s, err := Open(path)
+	if !errors.Is(err, ErrStateCorrupt) {
+		t.Fatalf("Open err=%v, want ErrStateCorrupt", err)
+	}
+	if s != nil {
+		t.Fatal("corrupt open must not return a usable store")
+	}
+	if got, rerr := os.ReadFile(path); rerr != nil || string(got) != string(bad) {
+		t.Fatalf("corrupt file was normalized or rewritten")
+	}
+
+	// 用一个真实打开的句柄，随后在句柄之外把文件改坏，下一次读取/操作必须拒绝。
+	recoverPath := filepath.Join(dir, "recover.json")
+	if err := os.WriteFile(recoverPath, good, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	live, err := Open(recoverPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer live.Close()
+	if bal, err := live.TreasuryBalance(); err != nil || bal != 900 {
+		t.Fatalf("balance before corruption=%d err=%v", bal, err)
+	}
+	if err := os.WriteFile(recoverPath, bad, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := live.TreasuryBalance(); !errors.Is(err, ErrStateCorrupt) {
+		t.Fatalf("TreasuryBalance after corruption err=%v, want ErrStateCorrupt", err)
+	}
+	if _, _, err := live.VoteProposal("gip-tally-ops"); !errors.Is(err, ErrStateCorrupt) {
+		t.Fatalf("VoteProposal(corrupt) after corruption err=%v", err)
+	}
+	// 请求同库内另一项正常提案同样必须拒绝，不得忽略损坏。
+	if _, _, err := live.VoteProposal("gip-still-voting"); !errors.Is(err, ErrStateCorrupt) {
+		t.Fatalf("VoteProposal(healthy) after corruption err=%v", err)
+	}
+	if _, err := live.VoteProposals(); !errors.Is(err, ErrStateCorrupt) {
+		t.Fatalf("VoteProposals after corruption err=%v", err)
+	}
+	if _, err := live.ProposalsSnapshot(); !errors.Is(err, ErrStateCorrupt) {
+		t.Fatalf("ProposalsSnapshot after corruption err=%v", err)
+	}
+	// 再次计票不得返回由其余字段组成的部分结果。
+	if _, err := live.TallyVote("gip-tally-ops", 200); !errors.Is(err, ErrStateCorrupt) {
+		t.Fatalf("TallyVote(corrupt) after corruption err=%v", err)
+	}
+	// 对另一项正常提案首次计票同样拒绝，且不得借机改写状态文件。
+	if _, err := live.TallyVote("gip-still-voting", 200); !errors.Is(err, ErrStateCorrupt) {
+		t.Fatalf("TallyVote(healthy) after corruption err=%v", err)
+	}
+	if _, err := live.CastVote("gip-still-voting", "dave", false, 150); !errors.Is(err, ErrStateCorrupt) {
+		t.Fatalf("CastVote after corruption err=%v", err)
+	}
+	if _, err := live.BalanceSnapshot(); !errors.Is(err, ErrStateCorrupt) {
+		t.Fatalf("BalanceSnapshot after corruption err=%v", err)
+	}
+	// 失败后文件字节保持损坏被发现时的原样（未回写、未把缺失权重补成 0）。
+	if got, rerr := os.ReadFile(recoverPath); rerr != nil || string(got) != string(bad) {
+		t.Fatalf("failed ops rewrote or normalized the state file")
+	}
+}
+
+// TestExplicitZeroTallyWeightsLegal：计票结果中明确写出的整数 0 是合法权重
+// （该侧或两侧都没有票），不得当成缺失；保存的结论仍按逐票明细重放核对，
+// 再次计票返回首次结论。
+func TestExplicitZeroTallyWeightsLegal(t *testing.T) {
+	dir := t.TempDir()
+	handwritten := filepath.Join(dir, "handwritten.json")
+	raw := `{
+  "magic": "govflow-treasury-state",
+  "version": 1,
+  "initial_treasury": 1000,
+  "treasury": 1000,
+  "balances": {},
+  "proposals": {},
+  "receipts": [],
+  "vote_proposals": {
+    "gip-zero": {
+      "id": "gip-zero",
+      "state": "rejected",
+      "members": [{"id": "a", "weight": 5}],
+      "delegations": [],
+      "quorum": 1,
+      "start_at": 0,
+      "deadline": 10,
+      "timelock_end": 10,
+      "actions": [],
+      "ballots": [],
+      "tally": {"for_weight": 0, "against_weight": 0, "tallied_at": 10}
+    },
+    "gip-zerowin": {
+      "id": "gip-zerowin",
+      "state": "passed",
+      "members": [{"id": "a", "weight": 5}],
+      "delegations": [],
+      "quorum": 1,
+      "start_at": 0,
+      "deadline": 10,
+      "timelock_end": 10,
+      "actions": [],
+      "ballots": [{"representative": "a", "weight": 5, "support": true, "voted_at": 3}],
+      "tally": {"for_weight": 5, "against_weight": 0, "tallied_at": 10}
+    }
+  }
+}
+`
+	if err := os.WriteFile(handwritten, []byte(raw), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s, err := Open(handwritten)
+	if err != nil {
+		t.Fatalf("explicit zero tally weights rejected: %v", err)
+	}
+	defer s.Close()
+
+	// 双方都明确写出 0：无票提案的合法拒绝结论。
+	v, ok, err := s.VoteProposal("gip-zero")
+	if err != nil || !ok {
+		t.Fatalf("query gip-zero: %v ok=%v", err, ok)
+	}
+	if v.Tally == nil || v.Tally.ForWeight != 0 || v.Tally.AgainstWeight != 0 ||
+		v.Tally.Turnout != 0 || v.Tally.Passed || v.Tally.TalliedAt != 10 {
+		t.Fatalf("zero tally misread: %+v", v.Tally)
+	}
+	// 再次计票返回首次结论（tallied_at 保持 10），不重新计票。
+	res, err := s.TallyVote("gip-zero", 20)
+	if err != nil {
+		t.Fatalf("re-tally gip-zero: %v", err)
+	}
+	if res.Passed || res.TalliedAt != 10 || res.ForWeight != 0 || res.AgainstWeight != 0 {
+		t.Fatalf("re-tally must return first result: %+v", res)
+	}
+
+	// 反对侧明确写出 0：合法通过结论，重放核对一致。
+	v2, ok, err := s.VoteProposal("gip-zerowin")
+	if err != nil || !ok {
+		t.Fatalf("query gip-zerowin: %v ok=%v", err, ok)
+	}
+	if v2.Tally == nil || v2.Tally.ForWeight != 5 || v2.Tally.AgainstWeight != 0 || !v2.Tally.Passed {
+		t.Fatalf("zero against weight misread: %+v", v2.Tally)
+	}
+}

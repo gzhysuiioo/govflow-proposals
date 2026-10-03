@@ -566,3 +566,83 @@ func TestCLIRejectsIncompleteBallot(t *testing.T) {
 		t.Fatalf("json query should preserve false/0, got %s", so)
 	}
 }
+
+// TestCLIRejectsIncompleteTally：已计票提案的计票结果缺 against_weight（该侧真实
+// 票重恰好为 0）时，文本与 JSON 的查询、再次计票都把整份文件判为损坏：原因写入
+// stderr（能看出提案编号、计票字段与缺失原因），以域错误退出码 1 结束，stdout
+// 不出现成功结果，文件不被改写；请求同库内另一项正常提案也同样拒绝。
+func TestCLIRejectsIncompleteTally(t *testing.T) {
+	binary := buildCLI(t)
+	dir := t.TempDir()
+	state := filepath.Join(dir, "treasury.json")
+	if _, _, code := runCLI(t, binary, state, "init", "--balance", "1000"); code != 0 {
+		t.Fatal("init failed")
+	}
+	if _, _, code := runCLI(t, binary, state, "create-vote", "--id", "gip-cli-tally",
+		"--member", "alice:600", "--member", "dave:400",
+		"--quorum", "600", "--start", "0", "--deadline", "10", "--timelock", "10",
+		"--action", "transfer:a:1"); code != 0 {
+		t.Fatal("create-vote failed")
+	}
+	// 同库另一项正常提案（仍在投票），用于验证损坏不被选择性忽略。
+	if _, _, code := runCLI(t, binary, state, "create-vote", "--id", "gip-other",
+		"--member", "alice:600", "--member", "dave:400",
+		"--quorum", "600", "--start", "0", "--deadline", "10", "--timelock", "10"); code != 0 {
+		t.Fatal("create-vote gip-other failed")
+	}
+	if _, _, code := runCLI(t, binary, state, "vote", "--id", "gip-cli-tally",
+		"--voter", "alice", "--choice", "for", "--now", "5"); code != 0 {
+		t.Fatal("vote failed")
+	}
+	// 计票通过：for=600、against=0、quorum=600，反对侧真实票重恰好为零。
+	if so, se, code := runCLI(t, binary, state, "tally", "--id", "gip-cli-tally", "--now", "10"); code != 0 {
+		t.Fatalf("tally exit=%d: %s", code, se)
+	} else if !strings.Contains(so, "for=600 against=0") || !strings.Contains(so, "passed") {
+		t.Fatalf("tally output = %q, want passed for=600 against=0", so)
+	}
+
+	raw, err := os.ReadFile(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 删掉已保存计票结果中的 against_weight（写出的值是 0）。
+	corrupt := strings.Replace(string(raw), `"against_weight": 0,`, ``, 1)
+	if corrupt == string(raw) {
+		t.Fatal("setup: against_weight field not found")
+	}
+	if err := os.WriteFile(state, []byte(corrupt), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// 文本与 JSON 采用同一判定：均为退出码 1、原因在 stderr、stdout 为空。
+	for _, args := range [][]string{
+		{"proposal", "--id", "gip-cli-tally"},
+		{"proposal", "--id", "gip-cli-tally", "--json"},
+		{"proposal", "--id", "gip-other"},
+		{"proposals"},
+		{"proposals", "--json"},
+		{"tally", "--id", "gip-cli-tally", "--now", "10"},
+		{"tally", "--id", "gip-cli-tally", "--now", "10", "--json"},
+		{"balances", "--json"},
+	} {
+		name := strings.Join(args, "_")
+		t.Run(name, func(t *testing.T) {
+			so, se, code := runCLI(t, binary, state, args...)
+			if code != 1 {
+				t.Fatalf("exit=%d want 1, stdout=%q stderr=%q", code, so, se)
+			}
+			if so != "" {
+				t.Fatalf("stdout must stay empty on corruption, got %q", so)
+			}
+			for _, want := range []string{"corrupt", "gip-cli-tally", "tally", `"against_weight"`, "missing"} {
+				if !strings.Contains(se, want) {
+					t.Fatalf("stderr %q missing %q", se, want)
+				}
+			}
+		})
+	}
+	// 任何失败尝试都不得改写或补全原文件。
+	if got, err := os.ReadFile(state); err != nil || string(got) != corrupt {
+		t.Fatalf("corrupt file was modified or rewritten")
+	}
+}

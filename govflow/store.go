@@ -974,6 +974,14 @@ func init() {
 	for _, name := range []string{"representative", "weight", "support", "voted_at"} {
 		ballotFields[name].kind = kindAny
 	}
+	// 计票结果的两个权重字段（for_weight/against_weight）同理：缺失/空值/
+	// 类型不符的判定需要带上提案编号，统一由 validateStoredTally 报错，
+	// 结构扫描在这两个叶子位置保持宽松。tallied_at 保持严格整数叶子，
+	// 其“不早于截止”的既有校验不变。
+	tallyFields := storedStateSchema.fields["vote_proposals"].elem.fields["tally"].fields
+	for _, name := range []string{"for_weight", "against_weight"} {
+		tallyFields[name].kind = kindAny
+	}
 	// 凭据的 executed_at 同理：缺失/空值/类型不符/早于时间锁的判定需要带上
 	// 提案编号与凭据位置，统一由 validateReceiptExecutedAt 报错，结构扫描在此
 	// 叶子位置保持宽松。
