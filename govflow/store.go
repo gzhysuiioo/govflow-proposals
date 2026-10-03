@@ -55,11 +55,96 @@ type ActionReceipt struct {
 
 // Receipt 是一项提案首次成功执行后生成的执行凭据。
 // 一项提案只允许成功一次；重试返回同一份凭据。
+//
+// executed_at 必须由首次执行时明确写出，且不得早于对应提案的 timelock_end。
+// 与 storedBallot 同理，该标量先用 RawMessage 接住：encoding/json 直接解进
+// int64 会把“字段缺失 / 显式 null / 写错类型”都折叠成零值，使缺失的执行时间
+// 被读成 0、早于时间锁的凭据被当作正常记录。字段的“缺失/空值/类型不符”
+// 由 validateStoredReceipt 判定，绝不能把缺损补成 0 或本次命令传入的时间；
+// 但时间锁允许 0 时明确写出的 0 是合法执行时间，必须与缺失区别对待。
 type Receipt struct {
 	ProposalID string          `json:"proposal_id"`
 	ExecutedAt int64           `json:"executed_at"` // 首次成功执行时调用方提供的时间
 	Order      int             `json:"order"`       // 成功提交的先后顺序，0 起
 	Actions    []ActionReceipt `json:"actions"`
+
+	executedAtRaw json.RawMessage
+}
+
+// receiptJSONShape 只用于解码，按保存格式的字段名逐字接住执行时间的原始 JSON。
+type receiptJSONShape struct {
+	ProposalID json.RawMessage `json:"proposal_id"`
+	ExecutedAt json.RawMessage `json:"executed_at"`
+	Order      json.RawMessage `json:"order"`
+	Actions    json.RawMessage `json:"actions"`
+}
+
+// UnmarshalJSON 保留 executed_at 是否出现及其原始写法（缺失为 nil、
+// null 为 "null"），供 validateStoredReceipt 区分缺失、空值与类型不符。
+// executed_at 类型不符时这里不返回错误（执行时间保持零值），以免解码器在
+// 不含提案编号/凭据下标的通用错误处提前失败；定位与判定统一交给
+// validateStoredReceipt。结构扫描已先行保证：键名与保存格式逐字一致、无重复键，
+// proposal_id/order/actions 的 JSON 类型与声明一致，因此这些片段逐字段解码
+// 不会失败；Decoder.DisallowUnknownFields 会拒绝未知字段。
+func (r *Receipt) UnmarshalJSON(data []byte) error {
+	var shape receiptJSONShape
+	if err := json.Unmarshal(data, &shape); err != nil {
+		return err
+	}
+	if raw := shape.ProposalID; len(raw) > 0 && string(raw) != "null" {
+		if err := json.Unmarshal(raw, &r.ProposalID); err != nil {
+			return err
+		}
+	}
+	if raw := shape.Order; len(raw) > 0 && string(raw) != "null" {
+		if err := json.Unmarshal(raw, &r.Order); err != nil {
+			return err
+		}
+	}
+	if raw := shape.Actions; len(raw) > 0 && string(raw) != "null" {
+		if err := json.Unmarshal(raw, &r.Actions); err != nil {
+			return err
+		}
+	}
+	r.executedAtRaw = shape.ExecutedAt
+	// 仅当字段确实是 int64 整数时才填充执行时间；类型不符留待校验拒绝，
+	// 绝不能让错误类型悄悄落成 0 并被当作零时刻执行。
+	if raw := shape.ExecutedAt; isInt64Number(raw) {
+		_ = json.Unmarshal(raw, &r.ExecutedAt)
+	}
+	return nil
+}
+
+// MarshalJSON 只输出四个凭据字段，RawMessage 状态（仅用于入站判定）不落盘。
+func (r Receipt) MarshalJSON() ([]byte, error) {
+	return json.Marshal(receiptOut{
+		ProposalID: r.ProposalID,
+		ExecutedAt: r.ExecutedAt,
+		Order:      r.Order,
+		Actions:    r.Actions,
+	})
+}
+
+// receiptOut 是凭据的保存形状；字段名与保存格式逐字一致。
+type receiptOut struct {
+	ProposalID string          `json:"proposal_id"`
+	ExecutedAt int64           `json:"executed_at"`
+	Order      int             `json:"order"`
+	Actions    []ActionReceipt `json:"actions"`
+}
+
+// mustReceipt 构造一份内存中的合法执行凭据（执行成功路径使用），同步填上
+// executed_at 的原始片段，使“提交前校验”与“打开重放校验”走同一份
+// validateStoredReceipt 判定时不会把本进程新建的凭据误判为字段缺失。
+func mustReceipt(proposalID string, executedAt int64, order int, actions []ActionReceipt) *Receipt {
+	atRaw, _ := json.Marshal(executedAt)
+	return &Receipt{
+		ProposalID:    proposalID,
+		ExecutedAt:    executedAt,
+		Order:         order,
+		Actions:       actions,
+		executedAtRaw: atRaw,
+	}
 }
 
 // ProposalRecord 是已登记提案的对外视图。State 只可能是 passed 或 executed。
@@ -380,15 +465,41 @@ func resolveExecutable(state *storedState, id string) *executionTarget {
 	return nil
 }
 
-// proposalOwners 将两个来源的提案编号映射到状态，供凭据重放交叉校验。
-func proposalOwnerState(state *storedState, id string) (string, []string, bool) {
+// proposalOwnerState 将两个来源的提案编号映射到状态、动作与时间锁，
+// 供凭据重放交叉校验（含执行时间不得早于时间锁）。
+func proposalOwnerState(state *storedState, id string) (ownerState string, actions []string, timelockEnd int64, found bool) {
 	if p, ok := state.Proposals[id]; ok {
-		return p.State, p.Actions, true
+		return p.State, p.Actions, p.TimelockEnd, true
 	}
 	if vp, ok := state.VoteProposals[id]; ok {
-		return vp.State, vp.Actions, true
+		return vp.State, vp.Actions, vp.TimelockEnd, true
 	}
-	return "", nil, false
+	return "", nil, 0, false
+}
+
+// validateStoredReceipt 判定一份已保存凭据的首次执行时间：
+// executed_at 必须明确写出、非 null 且为 int64 整数，并且不得早于对应提案的
+// timelock_end（恰好相等仍有效）。登记提案与投票通过的提案共用这一份判定，
+// 与首次执行资格检查（now < timelockEnd 即拒绝）一致。
+//
+// 任一不符都意味着状态文件损坏：绝不能把缺失/类型不符的执行时间补成 0，
+// 也不能用本次命令传入的时间顶替；时间锁允许 0 时明确写出的 0 是合法旧凭据。
+// index 是凭据在 receipts 中的下标（0 起），错误据此定位提案与凭据位置。
+func validateStoredReceipt(index int, r *Receipt, timelockEnd int64) error {
+	switch {
+	case r.executedAtRaw == nil:
+		return fmt.Errorf("receipt %d (proposal %q) field %q is missing", index, r.ProposalID, "executed_at")
+	case string(r.executedAtRaw) == "null":
+		return fmt.Errorf("receipt %d (proposal %q) field %q is null", index, r.ProposalID, "executed_at")
+	case !isInt64Number(r.executedAtRaw):
+		return fmt.Errorf("receipt %d (proposal %q) field %q has wrong type: want integer, got %s",
+			index, r.ProposalID, "executed_at", jsonValueType(r.executedAtRaw))
+	}
+	if r.ExecutedAt < timelockEnd {
+		return fmt.Errorf("receipt %d (proposal %q) executed_at=%d is before timelock_end=%d",
+			index, r.ProposalID, r.ExecutedAt, timelockEnd)
+	}
+	return nil
 }
 
 // Execute 按编号执行一项提案。调用方通过 now 提供当前时间。
@@ -471,14 +582,9 @@ func (s *Store) Execute(id string, now int64) (*Receipt, error) {
 	}
 
 	// 第二阶段：全部预演成功后构造凭据并一次性原子提交。
-	receipt := &Receipt{
-		ProposalID: id,
-		ExecutedAt: now,
-		Order:      len(state.Receipts),
-		Actions:    make([]ActionReceipt, 0, len(steps)),
-	}
+	actions := make([]ActionReceipt, 0, len(steps))
 	for i, st := range steps {
-		receipt.Actions = append(receipt.Actions, ActionReceipt{
+		actions = append(actions, ActionReceipt{
 			Index:  i,
 			Action: target.actions[i],
 			Treasury: BalanceUpdate{
@@ -493,6 +599,7 @@ func (s *Store) Execute(id string, now int64) (*Receipt, error) {
 			},
 		})
 	}
+	receipt := mustReceipt(id, now, len(state.Receipts), actions)
 	state.Treasury = simTreasury
 	state.Balances = simBalances
 	target.markExecuted()
@@ -838,12 +945,19 @@ func validateState(state *storedState) error {
 			return fmt.Errorf("duplicate receipt for %q at positions %d and %d", rcpt.ProposalID, prev, order)
 		}
 		seenReceipts[rcpt.ProposalID] = order
-		ownerState, ownerActions, found := proposalOwnerState(state, rcpt.ProposalID)
+		ownerState, ownerActions, ownerTimelock, found := proposalOwnerState(state, rcpt.ProposalID)
 		if !found {
 			return fmt.Errorf("receipt %q references an unregistered proposal", rcpt.ProposalID)
 		}
 		if ownerState != "executed" {
 			return fmt.Errorf("proposal %q has receipt but state is %q", rcpt.ProposalID, ownerState)
+		}
+		// 已保存凭据必须与首次执行满足同一份时间锁资格：executed_at 明确存在
+		// 且不早于提案 timelock_end。登记提案与投票提案在此共用判定，即使
+		// 资金变动与动作明细全部能对应，早于时间锁或缺字段的凭据也必须判整份
+		// 文件损坏——不能返回该凭据，也不能当作尚未执行再扣一次款。
+		if err := validateStoredReceipt(order, rcpt, ownerTimelock); err != nil {
+			return err
 		}
 		if len(rcpt.Actions) != len(ownerActions) {
 			return fmt.Errorf("receipt %q action count %d does not match proposal %d", rcpt.ProposalID, len(rcpt.Actions), len(ownerActions))
@@ -980,6 +1094,9 @@ func init() {
 	for _, name := range []string{"representative", "weight", "support", "voted_at"} {
 		ballotFields[name].kind = kindAny
 	}
+	// 凭据的 executed_at 同理：缺失/空值/类型不符与“早于时间锁”的判定都需要
+	// 提案编号与凭据下标来定位，统一交给 validateStoredReceipt。
+	storedStateSchema.fields["receipts"].elem.fields["executed_at"].kind = kindAny
 }
 
 // scanFrame 是结构扫描的栈帧。
