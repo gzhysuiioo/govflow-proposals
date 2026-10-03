@@ -736,12 +736,34 @@ var batchRecordFields = map[string]struct{}{
 // valid UTF-8 strings and quantity as a strict JSON integer. The members
 // are scanned with parseObjectFields (strict key decoding, duplicates kept
 // visible) rather than a lenient map unmarshal, so malformed key or value
-// bytes cannot be silently replaced with U+FFFD.
+// bytes cannot be silently replaced with U+FFFD. Whatever makes the record
+// fail — an unknown, duplicated or case-mismatched field included — the
+// returned Input carries the normalized batch id whenever exactly one
+// "batch" member holds valid, non-blank text, so the caller can name the
+// batch in the error; otherwise it stays empty.
 func parseManifestRecord(raw json.RawMessage) (Input, error) {
 	var in Input
 	members, err := parseObjectFields(raw)
 	if err != nil {
 		return in, errors.New("record must be a JSON object with batch, product, quantity and unit")
+	}
+	// Attach the batch id to whatever error this record raises, but only when
+	// it is unambiguous: exactly one "batch" member (compared after JSON key
+	// decoding, so an escaped respelling counts as the same field) carrying a
+	// JSON string whose decoded text is valid UTF-8 and non-blank once
+	// trimmed. A missing, duplicated, mistyped, blank or malformed "batch"
+	// member leaves the id out — never a U+FFFD substitution, and never one
+	// of two duplicate values picked arbitrarily, even when both are equal.
+	// Where the "batch" member sits relative to the offending field does not
+	// matter.
+	if countField(members, "batch") == 1 {
+		if rawID, ok := findField(members, "batch"); ok {
+			if id, idErr := unmarshalStringStrict(rawID); idErr == nil {
+				if normalized, normErr := NormalizeField(id); normErr == nil {
+					in.Batch = normalized
+				}
+			}
+		}
 	}
 	fields := make(map[string]json.RawMessage, len(members))
 	for _, f := range members {

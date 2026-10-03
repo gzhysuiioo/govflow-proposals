@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -530,6 +531,85 @@ func TestParseManifestRecordErrorPosition(t *testing.T) {
 	}
 	if re.Position != 2 || re.Batch != "B2" {
 		t.Fatalf("position=%d batch=%q, want 2/B2", re.Position, re.Batch)
+	}
+}
+
+// A record rejected for an unknown, duplicated or case-mismatched field must
+// still name its batch id whenever exactly one "batch" member carries valid,
+// non-blank text — wherever the "batch" member sits in the object.
+func TestParseManifestRecordErrorNamesBatch(t *testing.T) {
+	cases := []struct {
+		name      string
+		record    string
+		wantPos   int
+		wantBatch string
+		wantField string // decoded field name the reason must mention
+	}{
+		{"unknown field after batch", `{"batch":" B-002 ","product":"P","quantity":1,"unit":"kg","supplier":"S"}`, 1, "B-002", "supplier"},
+		{"unknown field before batch", `{"supplier":"S","batch":"B-002","product":"P","quantity":1,"unit":"kg"}`, 1, "B-002", "supplier"},
+		{"case-mismatched field", `{"batch":"B-002","Product":"P","product":"P","quantity":1,"unit":"kg"}`, 1, "B-002", "Product"},
+		{"duplicate product identical values", `{"batch":"B-002","product":"P","product":"P","quantity":1,"unit":"kg"}`, 1, "B-002", "product"},
+		{"escaped unknown field name", `{"batch":"B-002","product":"P","quantity":1,"unit":"kg","supplie\u0072":"S"}`, 1, "B-002", "supplier"},
+		{"escaped batch spelling", `{"bat\u0063h":"B-002","product":"P","quantity":1,"unit":"kg","extra":1}`, 1, "B-002", "extra"},
+		{"unicode batch", `{"batch":"批次-🚚","product":"P","quantity":1,"unit":"kg","extra":1}`, 1, "批次-🚚", "extra"},
+		{"genuine replacement char batch", `{"batch":"�","product":"P","quantity":1,"unit":"kg","extra":1}`, 1, "�", "extra"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			content := `[{"batch":"B-001","product":"P","quantity":1,"unit":"kg"},` + tc.record + `]`
+			_, err := ParseManifest([]byte(content))
+			var re *ManifestRecordError
+			if !errors.As(err, &re) {
+				t.Fatalf("expected ManifestRecordError, got %v", err)
+			}
+			if re.Position != tc.wantPos+1 {
+				t.Fatalf("position=%d, want %d", re.Position, tc.wantPos+1)
+			}
+			if re.Batch != tc.wantBatch {
+				t.Fatalf("batch=%q, want %q (error: %v)", re.Batch, tc.wantBatch, err)
+			}
+			if !strings.Contains(re.Reason, strconv.Quote(tc.wantField)) {
+				t.Fatalf("reason %q must name field %q", re.Reason, tc.wantField)
+			}
+			if !strings.Contains(err.Error(), strconv.Quote(tc.wantBatch)) {
+				t.Fatalf("error text must name the batch id: %v", err)
+			}
+		})
+	}
+}
+
+// The batch id stays out of the error when it cannot be determined uniquely
+// and reliably: missing, mistyped, blank, malformed or duplicated "batch"
+// members — duplicates even with identical values or an escaped respelling.
+func TestParseManifestRecordErrorOmitsAmbiguousBatch(t *testing.T) {
+	cases := map[string]string{
+		"missing batch":             `[{"product":"P","quantity":1,"unit":"kg","supplier":"S"}]`,
+		"numeric batch":             `[{"batch":7,"product":"P","quantity":1,"unit":"kg","supplier":"S"}]`,
+		"null batch":                `[{"batch":null,"product":"P","quantity":1,"unit":"kg","supplier":"S"}]`,
+		"blank batch":               `[{"batch":"  ","product":"P","quantity":1,"unit":"kg","supplier":"S"}]`,
+		"duplicate batch distinct":  `[{"batch":"B-002","batch":"B-003","product":"P","quantity":1,"unit":"kg"}]`,
+		"duplicate batch identical": `[{"batch":"B-002","batch":"B-002","product":"P","quantity":1,"unit":"kg"}]`,
+		"duplicate batch escaped":   `[{"batch":"B-002","bat\u0063h":"B-002","product":"P","quantity":1,"unit":"kg"}]`,
+		"lone surrogate batch":      `[{"batch":"\ud800","product":"P","quantity":1,"unit":"kg","supplier":"S"}]`,
+		"invalid utf8 batch":        "[{\"batch\":\"B-\xff\",\"product\":\"P\",\"quantity\":1,\"unit\":\"kg\",\"supplier\":\"S\"}]",
+	}
+	for name, content := range cases {
+		t.Run(name, func(t *testing.T) {
+			_, err := ParseManifest([]byte(content))
+			var re *ManifestRecordError
+			if !errors.As(err, &re) {
+				t.Fatalf("expected ManifestRecordError, got %v", err)
+			}
+			if re.Position != 1 {
+				t.Fatalf("position=%d, want 1", re.Position)
+			}
+			if re.Batch != "" {
+				t.Fatalf("batch=%q, want no batch id (error: %v)", re.Batch, err)
+			}
+			if strings.Contains(err.Error(), "batch \"") {
+				t.Fatalf("error text must not quote a batch id: %v", err)
+			}
+		})
 	}
 }
 

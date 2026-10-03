@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -153,6 +154,64 @@ func TestBatchImportCLIRejectsAndPreserves(t *testing.T) {
 			}
 			if _, statErr := os.Stat(registry); !os.IsNotExist(statErr) {
 				t.Fatal("a rejected import must not create the registry file")
+			}
+		})
+	}
+}
+
+// A record rejected for an unknown, duplicated or case-mismatched field must
+// name the manifest path, the 1-based record position, the normalized batch
+// id and the offending field — and leave both files untouched.
+func TestBatchImportCLIFieldErrorNamesBatch(t *testing.T) {
+	cases := map[string]struct {
+		record    string
+		wantBatch string
+		wantField string
+	}{
+		"unknown field":         {`{"batch":" B-002 ","product":"P","quantity":1,"unit":"kg","supplier":"S"}`, "B-002", "supplier"},
+		"duplicate product":     {`{"batch":"B-002","product":"P","product":"P","quantity":1,"unit":"kg"}`, "B-002", "product"},
+		"case-mismatched field": {`{"batch":"B-002","Product":"P","product":"P","quantity":1,"unit":"kg"}`, "B-002", "Product"},
+		"duplicate batch":       {`{"batch":"B-002","batch":"B-002","product":"P","quantity":1,"unit":"kg"}`, "", "batch"},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			registry := filepath.Join(dir, "reg.json")
+			manifest := filepath.Join(dir, "in.json")
+			original := `{"version":1,"batches":[{"batch":"B-001","product":"P","quantity":1,"unit":"kg"}]}`
+			writeFile(t, registry, original)
+			writeFile(t, manifest, `[
+  {"batch":"B-001","product":"P","quantity":1,"unit":"kg"},
+  `+tc.record+`
+]`)
+
+			var stdout bytes.Buffer
+			err := runBatchImport([]string{"--registry", registry, "--input", manifest}, &stdout)
+			if err == nil {
+				t.Fatal("expected rejection")
+			}
+			msg := err.Error()
+			for _, want := range []string{manifest, "record 2", strconv.Quote(tc.wantField)} {
+				if !strings.Contains(msg, want) {
+					t.Fatalf("error must contain %q: %v", want, msg)
+				}
+			}
+			if tc.wantBatch != "" {
+				if !strings.Contains(msg, "batch "+strconv.Quote(tc.wantBatch)) {
+					t.Fatalf("error must name batch %q: %v", tc.wantBatch, msg)
+				}
+			} else if strings.Contains(msg, "batch \"") {
+				t.Fatalf("error must not quote a batch id: %v", msg)
+			}
+			if stdout.Len() != 0 {
+				t.Fatalf("stdout must stay empty on failure, got %q", stdout.String())
+			}
+			after, rerr := os.ReadFile(registry)
+			if rerr != nil {
+				t.Fatal(rerr)
+			}
+			if string(after) != original {
+				t.Fatalf("registry changed: %s", after)
 			}
 		})
 	}
