@@ -27,6 +27,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 )
 
 // FormatVersion is the only registry file format understood by this build.
@@ -36,6 +37,138 @@ const FormatVersion = 1
 const MaxQuantity = int64(1<<63 - 1)
 
 var quantityPattern = regexp.MustCompile(`^[0-9]+$`)
+
+// ErrInvalidUTF8 reports that a batch, product or unit value carries bytes
+// that are not valid UTF-8 (or a JSON string escape that does not encode a
+// Unicode scalar, such as a lone surrogate). Go's JSON decoder otherwise
+// rewrites such input to the replacement character U+FFFD, which would merge
+// distinct inputs into one value; the value is rejected instead. A genuine,
+// deliberately typed U+FFFD is valid and never triggers this error. Call
+// sites wrap it so the field name and record position stay attached.
+var ErrInvalidUTF8 = errors.New("value is not valid UTF-8 text")
+
+// invalidUTF8Field names the field whose encoding is invalid.
+func invalidUTF8Field(field string) error {
+	return fmt.Errorf("field %q is not valid UTF-8 text and must not be replaced with %q: %w", field, "�", ErrInvalidUTF8)
+}
+
+// jsonStringTokenValid reports whether raw is a syntactically complete JSON
+// string literal whose decoded text is a valid Unicode string. It inspects
+// the raw token only: malformed bytes fail as JSON, and a \u escape denoting
+// a lone surrogate fails as invalid encoding, while a surrogate pair and the
+// escape "�" stay valid. Raw invalid UTF-8 bytes fail as well.
+func jsonStringTokenValid(raw []byte) bool {
+	return jsonStringTokenError(raw) == nil
+}
+
+// jsonStringTokenError validates one JSON string token, returning
+// errMalformedJSONString for malformed JSON and ErrInvalidUTF8 for a decoded
+// string that is not valid Unicode. Callers treat anything other than
+// ErrInvalidUTF8 as an ordinary "must be a JSON string" type error.
+func jsonStringTokenError(raw []byte) error {
+	if len(raw) < 2 || raw[0] != '"' || raw[len(raw)-1] != '"' {
+		return jsonSyntaxError()
+	}
+	body := raw[1 : len(raw)-1]
+	for i := 0; i < len(body); {
+		b := body[i]
+		if b == '"' {
+			return jsonSyntaxError() // unescaped quote ends the token early
+		}
+		if b < 0x20 {
+			return jsonSyntaxError() // control characters must be escaped
+		}
+		if b != '\\' {
+			// A literal byte >= 0x80 starts a UTF-8 sequence; verify it
+			// decodes to a rune (RuneError with width 1 means an invalid byte).
+			if b >= 0x80 {
+				r, size := utf8.DecodeRune(body[i:])
+				if r == utf8.RuneError && size == 1 {
+					return ErrInvalidUTF8
+				}
+				i += size
+				continue
+			}
+			i++
+			continue
+		}
+		if i+1 >= len(body) {
+			return jsonSyntaxError()
+		}
+		switch body[i+1] {
+		case '"', '\\', '/', 'b', 'f', 'n', 'r', 't':
+			i += 2
+			continue
+		case 'u':
+			lo, end, ok := readHex4(body, i+2)
+			if !ok {
+				return jsonSyntaxError()
+			}
+			// A lone surrogate never denotes a Unicode scalar. A paired
+			// surrogate (\uD800-\uDBFF immediately followed by a
+			// \uDC00-\uDFFF) is consumed together and is valid.
+			if lo >= 0xD800 && lo <= 0xDBFF {
+				if lo2, _, ok2 := readFollowingUEScape(body, end); ok2 && lo2 >= 0xDC00 && lo2 <= 0xDFFF {
+					i = end + 6 // skip both "\uXXXX" escapes
+					continue
+				}
+				return ErrInvalidUTF8
+			}
+			if lo >= 0xDC00 && lo <= 0xDFFF {
+				return ErrInvalidUTF8 // low surrogate with no leading high surrogate
+			}
+			i = end
+			continue
+		default:
+			return jsonSyntaxError()
+		}
+	}
+	return nil
+}
+
+// readHex4 reads four hex digits from body starting at start, returning the
+// code unit value and the index just past the fourth digit.
+func readHex4(body []byte, start int) (value, end int, ok bool) {
+	if start+4 > len(body) {
+		return 0, 0, false
+	}
+	var v int
+	for k := 0; k < 4; k++ {
+		c := body[start+k]
+		var d int
+		switch {
+		case c >= '0' && c <= '9':
+			d = int(c - '0')
+		case c >= 'a' && c <= 'f':
+			d = int(c-'a') + 10
+		case c >= 'A' && c <= 'F':
+			d = int(c-'A') + 10
+		default:
+			return 0, 0, false
+		}
+		v = v<<4 | d
+	}
+	return v, start + 4, true
+}
+
+// readFollowingUEScape checks that body at index at begins with a "\uXXXX"
+// escape and returns its code unit along with the index just past the four
+// hex digits.
+func readFollowingUEScape(body []byte, at int) (value, end int, ok bool) {
+	if at+6 > len(body) || body[at] != '\\' || body[at+1] != 'u' {
+		return 0, 0, false
+	}
+	return readHex4(body, at+2)
+}
+
+// errMalformedJSONString marks a string token that is not well-formed JSON;
+// callers report it the same way as a wrong-typed field.
+var errMalformedJSONString = errors.New("invalid JSON string literal")
+
+// jsonSyntaxError builds the malformed-token error.
+func jsonSyntaxError() error {
+	return errMalformedJSONString
+}
 
 // Batch is the four-piece record of one supply-chain batch.
 type Batch struct {
@@ -122,8 +255,15 @@ func (e *FormatError) Error() string {
 
 // NormalizeField trims leading and trailing whitespace; the result must stay
 // non-empty. Interior characters, including interior whitespace, are kept,
-// and casing is preserved so "B1" and "b1" are different values.
+// and casing is preserved so "B1" and "b1" are different values. The value
+// must be valid UTF-8 before trimming: invalid bytes are rejected rather than
+// replaced, including when they sit next to leading or trailing whitespace.
+// File parsers additionally check the raw token with jsonStringTokenError so
+// they can reject lone surrogate escapes before decoding.
 func NormalizeField(value string) (string, error) {
+	if !utf8.ValidString(value) {
+		return "", fmt.Errorf("value is not valid UTF-8 text: %w", ErrInvalidUTF8)
+	}
 	trimmed := strings.TrimSpace(value)
 	if trimmed == "" {
 		return "", errors.New("value must not be empty after trimming whitespace")
@@ -267,14 +407,18 @@ func parseRegistryRecord(raw json.RawMessage, pos int) (Batch, error) {
 		return b, &FormatError{Position: pos, Reason: "record must be a JSON object holding exactly \"batch\", \"product\", \"quantity\" and \"unit\""}
 	}
 	// The batch id is attached to errors only when it is unambiguous:
-	// exactly one "batch" member carrying a JSON string. When the "batch"
-	// member itself is duplicated, no id is picked arbitrarily.
+	// exactly one "batch" member carrying a JSON string whose decoded text is
+	// valid UTF-8. When the "batch" member is duplicated or its encoding is
+	// invalid, no id is picked or reconstructed from replacement characters.
 	batchID := ""
 	if countField(fields, "batch") == 1 {
 		if rawID, _ := findField(fields, "batch"); rawID != nil {
-			var id string
-			if json.Unmarshal(rawID, &id) == nil {
-				batchID = id
+			trimmedID := bytes.TrimSpace(rawID)
+			if len(trimmedID) > 0 && trimmedID[0] == '"' && jsonStringTokenValid(trimmedID) {
+				var id string
+				if json.Unmarshal(rawID, &id) == nil {
+					batchID = id
+				}
 			}
 		}
 	}
@@ -296,7 +440,17 @@ func parseRegistryRecord(raw json.RawMessage, pos int) (Batch, error) {
 		if !ok {
 			return "", &FormatError{Position: pos, Batch: batchID, Field: name, Reason: "required field is missing"}
 		}
-		if trimmed := bytes.TrimSpace(rawValue); len(trimmed) == 0 || trimmed[0] != '"' {
+		trimmed := bytes.TrimSpace(rawValue)
+		if len(trimmed) == 0 || trimmed[0] != '"' {
+			return "", &FormatError{Position: pos, Batch: batchID, Field: name, Reason: "must be a JSON string"}
+		}
+		// Validate the raw token before decoding so invalid bytes are never
+		// silently turned into U+FFFD.
+		if err := jsonStringTokenError(trimmed); err != nil {
+			if errors.Is(err, ErrInvalidUTF8) {
+				return "", &FormatError{Position: pos, Batch: batchID, Field: name,
+					Reason: "value is not valid UTF-8 text; the invalid bytes must not be replaced with \"�\""}
+			}
 			return "", &FormatError{Position: pos, Batch: batchID, Field: name, Reason: "must be a JSON string"}
 		}
 		var s string
@@ -575,6 +729,19 @@ func parseManifestRecord(raw json.RawMessage) (Input, error) {
 		if !ok {
 			return "", fmt.Errorf("missing required field %q", name)
 		}
+		trimmed := bytes.TrimSpace(value)
+		if len(trimmed) == 0 || trimmed[0] != '"' {
+			return "", fmt.Errorf("field %q must be a JSON string", name)
+		}
+		// Validate the raw token before decoding so invalid bytes are never
+		// silently turned into U+FFFD. Returning early on an invalid "batch"
+		// also keeps the replacement value out of the error's batch id.
+		if err := jsonStringTokenError(trimmed); err != nil {
+			if errors.Is(err, ErrInvalidUTF8) {
+				return "", fmt.Errorf("field %q is not valid UTF-8 text; the invalid bytes must not be replaced with %q", name, "�")
+			}
+			return "", fmt.Errorf("field %q must be a JSON string", name)
+		}
 		var text string
 		if err := json.Unmarshal(value, &text); err != nil {
 			return "", fmt.Errorf("field %q must be a JSON string", name)
@@ -681,6 +848,20 @@ func Import(reg *Registry, inputs []Input) (results []ImportResult, err error) {
 	out := make([]ImportResult, len(inputs))
 	for i, in := range inputs {
 		pos := i + 1
+		// Defense in depth for inputs built directly rather than via
+		// ParseManifest: invalid text is rejected before anything is touched.
+		for _, f := range []struct{ name, value string }{
+			{"batch", in.Batch}, {"product", in.Product}, {"unit", in.Unit},
+		} {
+			if !utf8.ValidString(f.value) {
+				batch := in.Batch
+				if f.name == "batch" || !utf8.ValidString(batch) {
+					batch = ""
+				}
+				return nil, &ManifestRecordError{Position: pos, Batch: batch,
+					Reason: fmt.Sprintf("field %q is not valid UTF-8 text; the invalid bytes must not be replaced with %q", f.name, "�")}
+			}
+		}
 		if idx, known := indexByID[in.Batch]; known {
 			existing := working[idx]
 			diffs := diffFields(existing, in)
@@ -720,6 +901,22 @@ func diffFields(existing Batch, in Input) []string {
 	return diffs
 }
 
+// validateTextInputs rejects a request whose batch, product or unit carries
+// invalid UTF-8. The CLI reaches Register and Import only through
+// NormalizeField, but a direct library caller must be stopped too: such a
+// string would otherwise be re-encoded as U+FFFD on save and merge with an
+// unrelated value.
+func validateTextInputs(in Input) error {
+	for _, f := range []struct{ name, value string }{
+		{"batch", in.Batch}, {"product", in.Product}, {"unit", in.Unit},
+	} {
+		if !utf8.ValidString(f.value) {
+			return invalidUTF8Field(f.name)
+		}
+	}
+	return nil
+}
+
 // Register adds in to reg, or confirms the identical record already stored
 // under the same batch id. A batch id held by a record differing in product,
 // quantity or unit produces a *ConflictError and leaves reg untouched. The
@@ -727,6 +924,9 @@ func diffFields(existing Batch, in Input) []string {
 func Register(reg *Registry, in Input) (Outcome, error) {
 	if reg.Version != FormatVersion {
 		return Outcome{}, fmt.Errorf("unsupported registry version %d", reg.Version)
+	}
+	if err := validateTextInputs(in); err != nil {
+		return Outcome{}, err
 	}
 	if in.Batch == "" || in.Product == "" || in.Unit == "" {
 		return Outcome{}, errors.New("batch, product and unit must be non-empty")
@@ -765,6 +965,17 @@ func Register(reg *Registry, in Input) (Outcome, error) {
 func Save(path string, reg *Registry) error {
 	if reg.Version != FormatVersion {
 		return fmt.Errorf("cannot write registry format version %d", reg.Version)
+	}
+	// Final backstop: a record with invalid text must never be serialized,
+	// since encoding/json would rewrite the bytes to U+FFFD on disk.
+	for i, b := range reg.Batches {
+		for _, f := range []struct{ name, value string }{
+			{"batch", b.Batch}, {"product", b.Product}, {"unit", b.Unit},
+		} {
+			if !utf8.ValidString(f.value) {
+				return fmt.Errorf("cannot save registry %q: batches record %d field %q is not valid UTF-8 text", path, i+1, f.name)
+			}
+		}
 	}
 	mode := os.FileMode(0o644)
 	if info, err := os.Stat(path); err == nil {

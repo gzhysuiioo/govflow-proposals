@@ -96,9 +96,12 @@ batch-import flags:
   --registry FILE   registry file to read and write (required)
   --input FILE      read-only JSON manifest (required); a non-empty array of
                     objects carrying exactly batch, product, quantity and
-                    unit. Text fields must be non-blank after trimming, and
-                    quantity must be a JSON integer from 1 to
-                    9223372036854775807 (no strings, fractions or exponents)
+                    unit. Text fields must be valid UTF-8 and non-blank after
+                    trimming (Chinese, emoji, non-ASCII ids and a genuinely
+                    typed "�" are allowed; invalid bytes or a lone surrogate
+                    reject the whole manifest), and quantity must be a JSON
+                    integer from 1 to 9223372036854775807 (no strings,
+                    fractions or exponents)
 
 The whole manifest is rejected unless every record can be registered or
 confirmed as a duplicate: a batch id already stored or seen earlier in the
@@ -113,6 +116,14 @@ file byte-for-byte untouched.
 Batch, product and unit values have leading and trailing whitespace removed
 and must be non-empty afterwards; interior characters and casing are kept
 ("B1" and "b1" are different batches). One invocation registers one batch.
+
+The three text values must be valid UTF-8. A value carrying bytes that are
+not valid UTF-8 (or a JSON string escape with no Unicode meaning, such as a
+lone surrogate) is rejected and named; it is never rewritten to the
+replacement character "�", so two different corrupt inputs cannot collapse
+into one batch. Valid Unicode is fully accepted, including Chinese, emoji,
+non-ASCII ids and a replacement character the user actually typed or wrote
+as �; that character alone is not an error.
 
 On success stdout contains a single JSON object, e.g.
   {"batch":"B-001","product":"P-7","quantity":120,"unit":"kg","status":"created"}
@@ -137,10 +148,13 @@ batches (an array, empty allowed), each record exactly the four lowercase
 fields batch, product, quantity and unit; missing, null, mistyped, unknown
 or case-variant fields (Version, Batch, ...) are rejected, and so is any
 field appearing twice in one object — even with identical values, even when
-one spelling hides behind a JSON escape. The error names the file, the
-field and the reason, plus the 1-based record position (and the batch id
-when it is unambiguous) for record-level problems. Failures print
-the reason to stderr and exit non-zero without touching the registry.
+one spelling hides behind a JSON escape. The batch, product and unit text in
+every record must itself be valid UTF-8; an invalid byte sequence or a lone
+surrogate escape is rejected with the record position and field rather than
+read in as a replacement character. The error names the file, the field and
+the reason, plus the 1-based record position (and the batch id when it is
+unambiguous) for record-level problems. Failures print the reason to stderr
+and exit non-zero without touching the registry.
 `
 }
 
@@ -191,17 +205,33 @@ func runBatchRegister(args []string, stdout io.Writer) error {
 		}
 	}
 
-	batch, err := batchreg.NormalizeField(*batchRaw)
-	if err != nil {
-		return &usageError{msg: "batch-register: invalid --batch: " + err.Error(), usage: batchRegisterUsage}
+	// Each text flag is validated as UTF-8 before trimming: invalid bytes
+	// are rejected and never reach the registry, even beside leading or
+	// trailing whitespace.
+	normalizeText := func(flag, raw string) (string, error) {
+		value, err := batchreg.NormalizeField(raw)
+		if err != nil {
+			if errors.Is(err, batchreg.ErrInvalidUTF8) {
+				return "", &usageError{
+					msg:   fmt.Sprintf("batch-register: invalid %s: value is not valid UTF-8 text; the invalid bytes are rejected rather than replaced with %q", flag, "�"),
+					usage: batchRegisterUsage,
+				}
+			}
+			return "", &usageError{msg: "batch-register: invalid " + flag + ": " + err.Error(), usage: batchRegisterUsage}
+		}
+		return value, nil
 	}
-	product, err := batchreg.NormalizeField(*productRaw)
+	batch, err := normalizeText("--batch", *batchRaw)
 	if err != nil {
-		return &usageError{msg: "batch-register: invalid --product: " + err.Error(), usage: batchRegisterUsage}
+		return err
 	}
-	unit, err := batchreg.NormalizeField(*unitRaw)
+	product, err := normalizeText("--product", *productRaw)
 	if err != nil {
-		return &usageError{msg: "batch-register: invalid --unit: " + err.Error(), usage: batchRegisterUsage}
+		return err
+	}
+	unit, err := normalizeText("--unit", *unitRaw)
+	if err != nil {
+		return err
 	}
 	quantity, err := batchreg.ParseQuantity(*quantityRaw)
 	if err != nil {

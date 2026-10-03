@@ -7,7 +7,50 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"unicode/utf8"
 )
+
+func TestNormalizeFieldUTF8(t *testing.T) {
+	// Invalid bytes are rejected outright, never rewritten to U+FFFD, even
+	// when adjacent to leading or trailing whitespace.
+	invalid := []string{
+		"B\xff1",
+		"  B\xff",
+		"B\xff  ",
+		"\tB\xff1\n",
+		"\xff",
+		"ok\xff",
+	}
+	for _, in := range invalid {
+		got, err := NormalizeField(in)
+		if err == nil {
+			t.Fatalf("NormalizeField(% x) expected error, got %q", in, got)
+		}
+		if !errors.Is(err, ErrInvalidUTF8) {
+			t.Fatalf("NormalizeField(% x) error must wrap ErrInvalidUTF8, got %v", in, err)
+		}
+	}
+
+	// Valid Unicode keeps working: Chinese, emoji, an explicitly entered
+	// U+FFFD, and ASCII must all pass; the real replacement character alone
+	// must never be treated as an encoding error.
+	valid := map[string]string{
+		"批次-1": "批次-1",
+		"a😀b":  "a😀b",
+		"a�b":  "a�b",
+		"�":    "�",
+		" B1 ": "B1",
+	}
+	for in, want := range valid {
+		got, err := NormalizeField(in)
+		if err != nil {
+			t.Fatalf("NormalizeField(%q) unexpected error: %v", in, err)
+		}
+		if got != want {
+			t.Fatalf("NormalizeField(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
 
 func TestNormalizeField(t *testing.T) {
 	cases := []struct {
@@ -632,5 +675,288 @@ func TestImportConflictNamesAllFields(t *testing.T) {
 func TestImportEmpty(t *testing.T) {
 	if _, err := Import(&Registry{Version: FormatVersion}, nil); err == nil {
 		t.Fatal("empty manifest must be rejected")
+	}
+}
+
+// invalidUTF8Byte is one byte that can never start a valid UTF-8 sequence.
+const invalidUTF8Byte = "\xff"
+
+func TestJSONStringTokenValidation(t *testing.T) {
+	valid := []string{
+		`""`,
+		`"abc"`,
+		`"批次"`,
+		`"😀"`,
+		`"a�b"`, // a literal, genuine U+FFFD
+		`"a�b"`, // the same character written as an escape
+		`"x😀y"`, // a proper surrogate pair -> emoji
+		`"line\nbreak"`,
+		`"quote\"q"`,
+		`"A"`,
+	}
+	for _, tok := range valid {
+		if err := jsonStringTokenError([]byte(tok)); err != nil {
+			t.Errorf("token %s unexpectedly rejected: %v", tok, err)
+		}
+	}
+	invalidEncoding := []string{
+		`"` + invalidUTF8Byte + `"`,
+		`"a` + invalidUTF8Byte + `b"`,
+		`"\ud800"`,   // lone high surrogate
+		`"\udc00"`,   // lone low surrogate
+		`"x\ud800y"`, // high surrogate not followed by a low
+		`"x\ud800A"`, // high surrogate followed by a non-low escape
+	}
+	for _, tok := range invalidEncoding {
+		err := jsonStringTokenError([]byte(tok))
+		if !errors.Is(err, ErrInvalidUTF8) {
+			t.Errorf("token %s expected ErrInvalidUTF8, got %v", tok, err)
+		}
+	}
+	malformed := []string{
+		`"abc`,     // unterminated
+		`abc"`,     // no opening quote
+		`"a"b"`,    // unescaped quote
+		`"\q"`,     // bad escape
+		`"\u12"`,   // truncated \u escape
+		`"\ud800"`, // (also) covered above
+	}
+	for _, tok := range malformed {
+		if err := jsonStringTokenError([]byte(tok)); err == nil {
+			t.Errorf("malformed token %s expected an error", tok)
+		}
+	}
+}
+
+func TestParseManifestRejectsInvalidUTF8(t *testing.T) {
+	cases := map[string]string{
+		"invalid batch":   `[{"batch":"B` + invalidUTF8Byte + `1","product":"P","quantity":1,"unit":"kg"}]`,
+		"invalid product": `[{"batch":"B1","product":"P` + invalidUTF8Byte + `","quantity":1,"unit":"kg"}]`,
+		"invalid unit":    `[{"batch":"B1","product":"P","quantity":1,"unit":"k` + invalidUTF8Byte + `g"}]`,
+		"lone surrogate":  `[{"batch":"x\ud800","product":"P","quantity":1,"unit":"kg"}]`,
+	}
+	for name, content := range cases {
+		t.Run(name, func(t *testing.T) {
+			inputs, err := ParseManifest([]byte(content))
+			if err == nil {
+				t.Fatalf("expected rejection, got %+v", inputs)
+			}
+			var re *ManifestRecordError
+			if !errors.As(err, &re) {
+				t.Fatalf("expected ManifestRecordError, got %v", err)
+			}
+			if re.Position != 1 {
+				t.Errorf("position = %d, want 1", re.Position)
+			}
+			if !strings.Contains(err.Error(), "UTF-8") {
+				t.Errorf("error must mention the encoding problem: %v", err)
+			}
+		})
+	}
+}
+
+func TestParseManifestInvalidUTF8PositionAndBatch(t *testing.T) {
+	// The first record is fine; the second has invalid bytes in "unit", so
+	// the error must point at record 2 and name the batch only when that
+	// field itself is valid.
+	content := `[{"batch":"B1","product":"P","quantity":1,"unit":"kg"},` +
+		`{"batch":"B2","product":"P","quantity":1,"unit":"k` + invalidUTF8Byte + `g"}]`
+	_, err := ParseManifest([]byte(content))
+	var re *ManifestRecordError
+	if !errors.As(err, &re) {
+		t.Fatalf("expected ManifestRecordError, got %v", err)
+	}
+	if re.Position != 2 || re.Batch != "B2" {
+		t.Fatalf("position=%d batch=%q, want 2/B2", re.Position, re.Batch)
+	}
+	if !strings.Contains(re.Error(), `field "unit"`) {
+		t.Fatalf("error must name field unit: %v", re)
+	}
+
+	// When the batch field itself carries the invalid bytes, the error must
+	// not identify the batch using a substituted replacement character.
+	content = `[{"batch":"B` + invalidUTF8Byte + `1","product":"P","quantity":1,"unit":"kg"}]`
+	_, err = ParseManifest([]byte(content))
+	if !errors.As(err, &re) {
+		t.Fatalf("expected ManifestRecordError, got %v", err)
+	}
+	if re.Position != 1 || re.Batch != "" {
+		t.Fatalf("position=%d batch=%q, want 1 with empty batch", re.Position, re.Batch)
+	}
+	if !strings.Contains(re.Error(), `field "batch"`) {
+		t.Fatalf("error must name field batch: %v", re)
+	}
+	// A batch id must not be echoed at all (and so never as a substituted
+	// replacement character); only the trailing explanation may mention U+FFFD.
+	if strings.Contains(re.Error(), "(batch ") {
+		t.Fatalf("error must not name a substituted batch id: %v", re)
+	}
+}
+
+func TestParseManifestAcceptsValidUnicode(t *testing.T) {
+	content := `[
+  {"batch":"批次-1","product":"产品","quantity":3,"unit":"箱"},
+  {"batch":"a😀b","product":"P","quantity":1,"unit":"kg"},
+  {"batch":"r` + "�" + `","product":"P","quantity":1,"unit":"kg"},
+  {"batch":"r�","product":"P","quantity":1,"unit":"kg"}
+]`
+	got, err := ParseManifest([]byte(content))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 4 {
+		t.Fatalf("got %d records", len(got))
+	}
+	// A literal U+FFFD and the � escape are the same batch text, so the
+	// last two records share an id and differ nowhere (duplicate confirmation
+	// is handled by Import); here they just parse to equal strings.
+	if got[2].Batch != got[3].Batch || got[2].Batch != "r�" {
+		t.Fatalf("U+FFFD escape and literal must match: %q vs %q", got[2].Batch, got[3].Batch)
+	}
+	if got[1].Batch != "a😀b" {
+		t.Fatalf("surrogate pair must decode to emoji, got %q", got[1].Batch)
+	}
+	if !utf8.ValidString(got[0].Batch) {
+		t.Fatal("Chinese batch must be valid UTF-8")
+	}
+}
+
+func TestLoadRejectsInvalidUTF8Registry(t *testing.T) {
+	cases := map[string]string{
+		"invalid batch":   `{"version":1,"batches":[{"batch":"B` + invalidUTF8Byte + `","product":"P","quantity":1,"unit":"kg"}]}`,
+		"invalid product": `{"version":1,"batches":[{"batch":"B1","product":"P` + invalidUTF8Byte + `","quantity":1,"unit":"kg"}]}`,
+		"invalid unit":    `{"version":1,"batches":[{"batch":"B1","product":"P","quantity":1,"unit":"k` + invalidUTF8Byte + `"}]}`,
+		"invalid record 2": `{"version":1,"batches":[
+			{"batch":"B1","product":"P","quantity":1,"unit":"kg"},
+			{"batch":"B2","product":"P` + invalidUTF8Byte + `","quantity":1,"unit":"kg"}]}`,
+		"lone surrogate": `{"version":1,"batches":[{"batch":"x\ud800","product":"P","quantity":1,"unit":"kg"}]}`,
+	}
+	for name, content := range cases {
+		t.Run(name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "reg.json")
+			writeRegistry(t, path, content)
+			_, _, err := Load(path)
+			if err == nil {
+				t.Fatal("expected the registry to be rejected")
+			}
+			var fe *FormatError
+			if !errors.As(err, &fe) {
+				t.Fatalf("expected FormatError, got %v", err)
+			}
+			if strings.Contains(fe.Batch, "�") && fe.Field == "batch" {
+				t.Fatalf("an invalid batch id must not be echoed back replaced: %+v", fe)
+			}
+			if !strings.Contains(err.Error(), "UTF-8") {
+				t.Fatalf("error must mention the encoding problem: %v", err)
+			}
+		})
+	}
+}
+
+func TestLoadInvalidUTF8PointsAtRecordAndField(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "reg.json")
+	// Record 2 has an invalid "unit"; its valid batch id stays attached.
+	writeRegistry(t, path, `{"version":1,"batches":[
+		{"batch":"B1","product":"P","quantity":1,"unit":"kg"},
+		{"batch":"B2","product":"P","quantity":1,"unit":"k`+invalidUTF8Byte+`g"}]}`)
+	_, _, err := Load(path)
+	var fe *FormatError
+	if !errors.As(err, &fe) {
+		t.Fatalf("expected FormatError, got %v", err)
+	}
+	if fe.Position != 2 || fe.Batch != "B2" || fe.Field != "unit" {
+		t.Fatalf("unexpected FormatError: %+v", fe)
+	}
+
+	// An invalid batch id in record 1 yields no batch and names the field.
+	path2 := filepath.Join(t.TempDir(), "reg2.json")
+	writeRegistry(t, path2, `{"version":1,"batches":[{"batch":"B`+invalidUTF8Byte+`1","product":"P","quantity":1,"unit":"kg"}]}`)
+	_, _, err = Load(path2)
+	if !errors.As(err, &fe) {
+		t.Fatalf("expected FormatError, got %v", err)
+	}
+	if fe.Position != 1 || fe.Batch != "" || fe.Field != "batch" {
+		t.Fatalf("unexpected FormatError: %+v", fe)
+	}
+}
+
+func TestLoadAcceptsRegistryWithValidUnicode(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "reg.json")
+	writeRegistry(t, path, `{"version":1,"batches":[
+		{"batch":"批次-1","product":"产品","quantity":3,"unit":"箱"},
+		{"batch":"a�b","product":"P","quantity":1,"unit":"kg"}
+	]}`)
+	reg, existed, err := Load(path)
+	if err != nil || !existed || len(reg.Batches) != 2 {
+		t.Fatalf("existed=%v batches=%+v err=%v", existed, reg, err)
+	}
+	if reg.Batches[0].Batch != "批次-1" || reg.Batches[0].Unit != "箱" {
+		t.Fatalf("Chinese values must round-trip: %+v", reg.Batches[0])
+	}
+	if reg.Batches[1].Batch != "a�b" {
+		t.Fatalf("genuine U+FFFD must round-trip: %q", reg.Batches[1].Batch)
+	}
+}
+
+func TestRegisterAndImportRejectInvalidUTF8Directly(t *testing.T) {
+	// Inputs bypassing ParseManifest/NormalizeField must still be refused so
+	// they can never reach Save as replacement characters.
+	reg := &Registry{Version: FormatVersion, Batches: []Batch{
+		{Batch: "OLD", Product: "P", Quantity: 1, Unit: "kg"},
+	}}
+	original := append([]Batch(nil), reg.Batches...)
+
+	bad := Input{Batch: "B\xff", Product: "P", Quantity: 1, Unit: "kg"}
+	if _, err := Register(reg, bad); !errors.Is(err, ErrInvalidUTF8) {
+		t.Fatalf("Register error = %v, want ErrInvalidUTF8", err)
+	}
+	bad = Input{Batch: "NEW", Product: "P\xff", Quantity: 1, Unit: "kg"}
+	if _, err := Register(reg, bad); !errors.Is(err, ErrInvalidUTF8) {
+		t.Fatalf("Register product error = %v, want ErrInvalidUTF8", err)
+	}
+	if len(reg.Batches) != len(original) || reg.Batches[0] != original[0] {
+		t.Fatalf("Register mutated the registry: %+v", reg.Batches)
+	}
+
+	_, err := Import(reg, []Input{
+		{Batch: "NEW", Product: "P", Quantity: 1, Unit: "kg"},
+		{Batch: "B2", Product: "P", Quantity: 1, Unit: "k\xffg"},
+	})
+	var mre *ManifestRecordError
+	if !errors.As(err, &mre) {
+		t.Fatalf("Import error = %v, want ManifestRecordError", err)
+	}
+	if mre.Position != 2 || mre.Batch != "B2" {
+		t.Fatalf("position=%d batch=%q, want 2/B2", mre.Position, mre.Batch)
+	}
+	if len(reg.Batches) != len(original) {
+		t.Fatalf("Import must not add records on an encoding error: %+v", reg.Batches)
+	}
+
+	// Save is the final backstop: a hand-built invalid record is not written.
+	reg.Batches = append(reg.Batches, Batch{Batch: "X\xff", Product: "P", Quantity: 1, Unit: "kg"})
+	path := filepath.Join(t.TempDir(), "reg.json")
+	if err := Save(path, reg); err == nil {
+		t.Fatal("Save must reject a record with invalid UTF-8")
+	}
+	if _, statErr := os.Stat(path); !os.IsNotExist(statErr) {
+		t.Fatal("a failed Save must leave no registry file")
+	}
+}
+
+func TestDistinctInvalidInputsDoNotCollide(t *testing.T) {
+	// Two values that both used to be normalized to "B�1" must each be
+	// rejected, rather than accepted and merged into one batch.
+	reg := &Registry{Version: FormatVersion}
+	for _, in := range []Input{
+		{Batch: "B\xff1", Product: "P", Quantity: 1, Unit: "kg"},
+		{Batch: "B\xfe1", Product: "P", Quantity: 1, Unit: "kg"},
+	} {
+		if _, err := Register(reg, in); !errors.Is(err, ErrInvalidUTF8) {
+			t.Fatalf("expected rejection of % x, got %v (batches=%+v)", in.Batch, err, reg.Batches)
+		}
+	}
+	if len(reg.Batches) != 0 {
+		t.Fatalf("no invalid batch may be stored, got %+v", reg.Batches)
 	}
 }
