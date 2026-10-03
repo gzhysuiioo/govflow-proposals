@@ -461,47 +461,11 @@ func (s *Store) Execute(id string, now int64) (*Receipt, error) {
 		return nil, execReject(fmt.Sprintf("proposal %s has no actions", id))
 	}
 
-	// 第一阶段：在副本上校验并预演全部动作。任何一步失败都不得落盘。
-	type step struct {
-		account        string
-		amount         int64
-		treasuryBefore int64
-		treasuryAfter  int64
-		accountBefore  int64
-		accountAfter   int64
-	}
-	simTreasury := state.Treasury
-	simBalances := map[string]int64{}
-	for k, v := range state.Balances {
-		simBalances[k] = v
-	}
-	steps := make([]step, 0, len(target.actions))
-	for i, raw := range target.actions {
-		account, amount, perr := ParseTransfer(raw)
-		if perr != nil {
-			// 双 %w：调用方既可按 ErrExecutionRejected 判定执行被拒，
-			// 也可按 ErrInvalidAction 区分“动作格式错误”这一具体原因。
-			return nil, fmt.Errorf("%w: action %d (%q): %w", ErrExecutionRejected, i, raw, perr)
-		}
-		balanceBefore := simBalances[account]
-		balanceAfter, ok := addInt64(balanceBefore, amount)
-		if !ok {
-			return nil, execReject(fmt.Sprintf("recipient balance overflow at action %d: account=%s balance=%d amount=%d", i, account, balanceBefore, amount))
-		}
-		if simTreasury < amount {
-			return nil, execReject(fmt.Sprintf("insufficient treasury balance at action %d: treasury=%d amount=%d", i, simTreasury, amount))
-		}
-		treasuryBefore := simTreasury
-		simTreasury -= amount
-		simBalances[account] = balanceAfter
-		steps = append(steps, step{
-			account:        account,
-			amount:         amount,
-			treasuryBefore: treasuryBefore,
-			treasuryAfter:  simTreasury,
-			accountBefore:  balanceBefore,
-			accountAfter:   balanceAfter,
-		})
+	// 第一阶段：在副本上按统一转账规则（planTransfers）校验并预演全部
+	// 动作。任何一步失败都直接返回，副本之外的状态不落盘。
+	steps, simTreasury, simBalances, perr := planTransfers(target.actions, state.Treasury, state.Balances)
+	if perr != nil {
+		return nil, perr
 	}
 
 	// 第二阶段：全部预演成功后构造凭据并一次性原子提交。
@@ -515,20 +479,7 @@ func (s *Store) Execute(id string, now int64) (*Receipt, error) {
 	// executed_at 判定时不会把本进程新建的凭据误判为字段缺失。
 	receipt.executedAtRaw, _ = json.Marshal(now)
 	for i, st := range steps {
-		receipt.Actions = append(receipt.Actions, ActionReceipt{
-			Index:  i,
-			Action: target.actions[i],
-			Treasury: BalanceUpdate{
-				Account: "treasury",
-				Before:  st.treasuryBefore,
-				After:   st.treasuryAfter,
-			},
-			Recipient: BalanceUpdate{
-				Account: st.account,
-				Before:  st.accountBefore,
-				After:   st.accountAfter,
-			},
-		})
+		receipt.Actions = append(receipt.Actions, st.actionReceipt(i, target.actions[i]))
 	}
 	state.Treasury = simTreasury
 	state.Balances = simBalances
@@ -887,36 +838,14 @@ func validateState(state *storedState) error {
 		if err := validateReceiptExecutedAt(order, rcpt, ownerTimelock); err != nil {
 			return err
 		}
-		if len(rcpt.Actions) != len(ownerActions) {
-			return fmt.Errorf("receipt %q action count %d does not match proposal %d", rcpt.ProposalID, len(rcpt.Actions), len(ownerActions))
-		}
-		for i, ar := range rcpt.Actions {
-			if ar.Index != i {
-				return fmt.Errorf("receipt %q action %d has index %d", rcpt.ProposalID, i, ar.Index)
-			}
-			if ar.Action != ownerActions[i] {
-				return fmt.Errorf("receipt %q action %d text does not match registered action", rcpt.ProposalID, i)
-			}
-			account, amount, err := ParseTransfer(ar.Action)
-			if err != nil {
-				return fmt.Errorf("receipt %q action %d is not executable: %v", rcpt.ProposalID, i, err)
-			}
-			if ar.Treasury.Account != "treasury" || ar.Treasury.Before != simTreasury {
-				return fmt.Errorf("receipt %q action %d treasury before-balance mismatch", rcpt.ProposalID, i)
-			}
-			if simTreasury < amount || ar.Treasury.After != simTreasury-amount {
-				return fmt.Errorf("receipt %q action %d treasury after-balance mismatch", rcpt.ProposalID, i)
-			}
-			before := simBalances[account]
-			if ar.Recipient.Account != account || ar.Recipient.Before != before {
-				return fmt.Errorf("receipt %q action %d recipient before-balance mismatch", rcpt.ProposalID, i)
-			}
-			after, ok := addInt64(before, amount)
-			if !ok || ar.Recipient.After != after {
-				return fmt.Errorf("receipt %q action %d recipient after-balance mismatch", rcpt.ProposalID, i)
-			}
-			simTreasury -= amount
-			simBalances[account] = after
+		// 凭据声明的逐笔转账由统一转账规则（verifyReceiptTransfers）重放
+		// 核对：动作条数/编号/原文、资金库与收款账户前后余额任一不符都带
+		// 动作位置报损坏原因；本函数随即返回错误，整份状态被拒绝，重放结果
+		// 不会被查询或落盘采纳。
+		var verr error
+		simTreasury, verr = verifyReceiptTransfers(rcpt, ownerActions, simTreasury, simBalances)
+		if verr != nil {
+			return verr
 		}
 	}
 	if simTreasury != state.Treasury {
