@@ -365,6 +365,218 @@ func TestCorruptStateRejected(t *testing.T) {
 	}
 }
 
+// removeLineContaining 删除文本中包含子串的整行（含行尾换行）。
+func removeLineContaining(s, substr string) string {
+	idx := strings.Index(s, substr)
+	if idx < 0 {
+		return s
+	}
+	start := strings.LastIndex(s[:idx], "\n") + 1
+	end := strings.Index(s[idx:], "\n")
+	if end < 0 {
+		return s[:start]
+	}
+	return s[:start] + s[idx+end+1:]
+}
+
+// TestReceiptExecutedAtValidated：保存凭据的 executed_at 与首次执行受同一条
+// 执行资格规则约束——必须明确写出且不得早于所属提案的 timelock_end；
+// 缺失、null、类型不符或早于时间锁的凭据让整份状态文件判为损坏。
+func TestReceiptExecutedAtValidated(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "treasury.json")
+	store, err := InitTreasury(path, 1000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustRegister(t, store, "gip-1", 5000, "transfer:a:100")
+	// 时间锁为 0、在 0 执行的旧凭据：明确写出的 0 是合法执行时间。
+	mustRegister(t, store, "gip-zero", 0, "transfer:z:50")
+	// 登记提案的负时间取值保持兼容。
+	mustRegister(t, store, "gip-neg", -100, "transfer:n:1")
+	if _, err := store.Execute("gip-1", 5001); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Execute("gip-zero", 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Execute("gip-neg", -50); err != nil {
+		t.Fatal(err)
+	}
+	// 投票通过的提案走到 executed：恰好等于时间锁的执行时间有效。
+	mustCreateVote(t, store, baseVoteInput("gip-vote"))
+	if _, err := store.CastVote("gip-vote", "alice", true, 150); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.CastVote("gip-vote", "dave", true, 150); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.TallyVote("gip-vote", 200); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Execute("gip-vote", 300); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	good, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 基线可读：合法凭据（含明确写出的 0 与负时间）照常返回。
+	t.Run("baseline readable", func(t *testing.T) {
+		s, err := Open(path)
+		if err != nil {
+			t.Fatalf("reopen: %v", err)
+		}
+		defer s.Close()
+		r, ok, err := s.Receipt("gip-zero")
+		if err != nil || !ok || r.ExecutedAt != 0 {
+			t.Fatalf("Receipt(gip-zero) = %+v ok=%v err=%v, want executed_at 0", r, ok, err)
+		}
+		r, ok, err = s.Receipt("gip-neg")
+		if err != nil || !ok || r.ExecutedAt != -50 {
+			t.Fatalf("Receipt(gip-neg) = %+v ok=%v err=%v, want executed_at -50", r, ok, err)
+		}
+		// 合法已执行提案用更早的 now 重试：仍返回首次凭据，不重新扣款、
+		// 不改写首次执行时间与凭据顺序。
+		again, err := s.Execute("gip-1", 4000)
+		if err != nil {
+			t.Fatalf("retry with earlier now: %v", err)
+		}
+		if again.ExecutedAt != 5001 || again.Order != 0 {
+			t.Fatalf("retry rewrote first receipt: %+v", again)
+		}
+		if bal, _ := s.TreasuryBalance(); bal != 749 {
+			t.Fatalf("treasury after retry = %d, want 749", bal)
+		}
+		receipts, _ := s.Receipts()
+		if len(receipts) != 4 || receipts[0].ProposalID != "gip-1" {
+			t.Fatalf("receipts changed on retry: %v", receipts)
+		}
+	})
+
+	// 时间恰好等于时间锁仍然有效。
+	t.Run("equal to timelock readable", func(t *testing.T) {
+		raw := strings.Replace(string(good), `"executed_at": 5001`, `"executed_at": 5000`, 1)
+		p := filepath.Join(dir, "equal.json")
+		if err := os.WriteFile(p, []byte(raw), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		s, err := Open(p)
+		if err != nil {
+			t.Fatalf("executed_at == timelock_end rejected: %v", err)
+		}
+		defer s.Close()
+		r, ok, _ := s.Receipt("gip-1")
+		if !ok || r.ExecutedAt != 5000 {
+			t.Fatalf("Receipt(gip-1) = %+v ok=%v", r, ok)
+		}
+	})
+
+	corruptions := []struct {
+		name    string
+		raw     string
+		wantMsg []string
+	}{
+		{
+			name:    "executed_at before timelock",
+			raw:     strings.Replace(string(good), `"executed_at": 5001`, `"executed_at": 4999`, 1),
+			wantMsg: []string{`receipt 0`, `"gip-1"`, "4999", "5000", "before timelock_end"},
+		},
+		{
+			name:    "executed_at missing",
+			raw:     removeLineContaining(string(good), `"executed_at": 5001`),
+			wantMsg: []string{`receipt 0`, `"gip-1"`, "executed_at", "missing"},
+		},
+		{
+			name:    "executed_at null",
+			raw:     strings.Replace(string(good), `"executed_at": 5001`, `"executed_at": null`, 1),
+			wantMsg: []string{`receipt 0`, `"gip-1"`, "null"},
+		},
+		{
+			name:    "executed_at wrong type",
+			raw:     strings.Replace(string(good), `"executed_at": 5001`, `"executed_at": "5001"`, 1),
+			wantMsg: []string{`receipt 0`, `"gip-1"`, "wrong type"},
+		},
+		{
+			// 投票通过的提案与登记提案使用一致的判断。
+			name:    "vote proposal executed_at before timelock",
+			raw:     strings.Replace(string(good), `"executed_at": 300`, `"executed_at": 299`, 1),
+			wantMsg: []string{`"gip-vote"`, "299", "300", "before timelock_end"},
+		},
+		{
+			name:    "negative timelock executed_at before timelock",
+			raw:     strings.Replace(string(good), `"executed_at": -50`, `"executed_at": -101`, 1),
+			wantMsg: []string{`"gip-neg"`, "-101", "-100", "before timelock_end"},
+		},
+	}
+	for _, tc := range corruptions {
+		t.Run(tc.name, func(t *testing.T) {
+			bad := filepath.Join(dir, "corrupt-"+strings.ReplaceAll(tc.name, " ", "-")+".json")
+			if err := os.WriteFile(bad, []byte(tc.raw), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			// 文件中其余提案与凭据均正常，也不能掩盖一条非法凭据。
+			s, err := Open(bad)
+			if !errors.Is(err, ErrStateCorrupt) {
+				if s != nil {
+					s.Close()
+				}
+				t.Fatalf("Open err=%v, want ErrStateCorrupt", err)
+			}
+			for _, want := range tc.wantMsg {
+				if !strings.Contains(err.Error(), want) {
+					t.Fatalf("error %q does not locate %q", err.Error(), want)
+				}
+			}
+			// 原状态文件保持原样，不被修复或覆盖。
+			got, rerr := os.ReadFile(bad)
+			if rerr != nil || string(got) != tc.raw {
+				t.Fatalf("corrupt file was modified")
+			}
+		})
+	}
+
+	// 已打开资金库之后的查询与执行同样识别该问题：文件在打开后被替换成
+	// 含非法凭据的版本，后续每个操作都必须报损坏，且不得把非法凭据对应的
+	// 提案当作未执行再扣一次款。
+	t.Run("detected after open", func(t *testing.T) {
+		p := filepath.Join(dir, "swap.json")
+		if err := os.WriteFile(p, good, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		s, err := Open(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer s.Close()
+		corrupt := strings.Replace(string(good), `"executed_at": 5001`, `"executed_at": 4999`, 1)
+		if err := os.WriteFile(p, []byte(corrupt), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.Receipts(); !errors.Is(err, ErrStateCorrupt) {
+			t.Fatalf("Receipts err=%v, want ErrStateCorrupt", err)
+		}
+		if _, _, err := s.Receipt("gip-zero"); !errors.Is(err, ErrStateCorrupt) {
+			t.Fatalf("Receipt err=%v, want ErrStateCorrupt", err)
+		}
+		if _, err := s.BalanceSnapshot(); !errors.Is(err, ErrStateCorrupt) {
+			t.Fatalf("BalanceSnapshot err=%v, want ErrStateCorrupt", err)
+		}
+		if _, err := s.Execute("gip-1", 5001); !errors.Is(err, ErrStateCorrupt) {
+			t.Fatalf("Execute err=%v, want ErrStateCorrupt", err)
+		}
+		got, _ := os.ReadFile(p)
+		if string(got) != corrupt {
+			t.Fatalf("state file was modified by rejected operations")
+		}
+	})
+}
+
 func equalBytes(a, b []byte) bool {
 	if len(a) != len(b) {
 		return false
