@@ -1,6 +1,8 @@
 package govflow
 
 import (
+	"bytes"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"sort"
@@ -100,11 +102,101 @@ type storedDelegation struct {
 	To   string `json:"to"`
 }
 
+// ballotFieldKind 与 ballotFieldNames 描述一张已保存票据必须显式给出的四个字段。
+// 任何一个缺失或为 JSON null 都意味着治理记录不完整：绝不能退回到 Go 零值，
+// 把赞成票补成反对票、把缺失的首次投票时间补成窗口起点 0。
+type ballotFieldKind int
+
+const (
+	ballotFieldRepresentative ballotFieldKind = iota
+	ballotFieldWeight
+	ballotFieldSupport
+	ballotFieldVotedAt
+)
+
+var ballotFieldNames = [...]string{
+	ballotFieldRepresentative: "representative",
+	ballotFieldWeight:         "weight",
+	ballotFieldSupport:        "support",
+	ballotFieldVotedAt:        "voted_at",
+}
+
+// ballotFieldDefect 记录某个票据字段相对保存格式的缺陷类别。
+type ballotFieldDefect struct {
+	field  string
+	reason string // "missing"（字段未出现）、"null"（JSON 空值）、"wrong type"（类型不符）
+}
+
+// storedBallot 是一张已投出的票在磁盘上的形状。四个字段都必须显式给出且类型正确：
+// 代表编号为字符串、票重与首次投票时间为有符号 64 位整数、选择为 JSON 布尔值。
+// 显式写出的 false 是合法反对票，窗口允许时显式写出的 0 是合法投票时间；
+// 这两种合法值由 defects 为空而不是“解码后的零值”来识别，因此不会与缺失混淆。
 type storedBallot struct {
 	Representative string `json:"representative"`
 	Weight         int64  `json:"weight"`
 	Support        bool   `json:"support"`
 	VotedAt        int64  `json:"voted_at"`
+
+	// defects 只在解码状态文件时填充：逐项记录缺失、空值或类型不符的字段。
+	// 正常写盘路径（json.MarshalIndent）不会调用 UnmarshalJSON，故始终为空。
+	// null 单独记为“空值”，不再继续做类型判定；类型不符（如数字冒充布尔）才记 wrong type。
+	defects []ballotFieldDefect
+}
+
+// rawStoredBallot 用 RawMessage 暂存票据字段：未出现的字段为 nil/空，
+// null 与实际值（含显式 false、0）因此可以区分开。
+type rawStoredBallot struct {
+	Representative json.RawMessage `json:"representative"`
+	Weight         json.RawMessage `json:"weight"`
+	Support        json.RawMessage `json:"support"`
+	VotedAt        json.RawMessage `json:"voted_at"`
+}
+
+// UnmarshalJSON 逐字段核对票据的存在性、空值与类型。
+// encoding/json 对数组中的 null 元素同样会调用本方法，因此整票为 null
+// （而非票据对象）也能在此被四个字段的“空值”缺陷捕获。
+// 未知字段已由外层解码器的 DisallowUnknownFields 拒绝；本方法保持同一设置，
+// 使票据对象自身的解码规则与状态文件其余部分一致。
+func (b *storedBallot) UnmarshalJSON(data []byte) error {
+	if string(bytes.TrimSpace(data)) == "null" {
+		b.defects = make([]ballotFieldDefect, 0, len(ballotFieldNames))
+		for _, name := range ballotFieldNames {
+			b.defects = append(b.defects, ballotFieldDefect{field: name, reason: "null"})
+		}
+		return nil
+	}
+	var raw rawStoredBallot
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&raw); err != nil {
+		return err
+	}
+	parse := func(kind ballotFieldKind, msg json.RawMessage, decode func() error) {
+		name := ballotFieldNames[kind]
+		switch {
+		case len(msg) == 0:
+			b.defects = append(b.defects, ballotFieldDefect{field: name, reason: "missing"})
+		case string(bytes.TrimSpace(msg)) == "null":
+			b.defects = append(b.defects, ballotFieldDefect{field: name, reason: "null"})
+		default:
+			if err := decode(); err != nil {
+				b.defects = append(b.defects, ballotFieldDefect{field: name, reason: "wrong type"})
+			}
+		}
+	}
+	parse(ballotFieldRepresentative, raw.Representative, func() error {
+		return json.Unmarshal(raw.Representative, &b.Representative)
+	})
+	parse(ballotFieldWeight, raw.Weight, func() error { return json.Unmarshal(raw.Weight, &b.Weight) })
+	parse(ballotFieldSupport, raw.Support, func() error { return json.Unmarshal(raw.Support, &b.Support) })
+	parse(ballotFieldVotedAt, raw.VotedAt, func() error { return json.Unmarshal(raw.VotedAt, &b.VotedAt) })
+	return nil
+}
+
+// ballotDefectError 把首个缺陷表述为带提案编号、票据下标、字段与原因的错误；
+// 调用方（打开校验或首次计票路径）再统一包装为 ErrStateCorrupt。
+func ballotDefectError(id string, index int, d ballotFieldDefect) error {
+	return fmt.Errorf("proposal %s ballot %d field %q is %s", id, index, d.field, d.reason)
 }
 
 type storedTally struct {
@@ -436,6 +528,14 @@ func countBallots(ballots []storedBallot) (ballotCounts, error) {
 // 汇总只含实际投出的票；任一条件不符返回带具体原因的错误，
 // 错误分类（ErrStateCorrupt）由调用方按自身路径统一包装。
 func verifyBallots(id string, ballots []storedBallot, spec *proposalSpec) (ballotCounts, error) {
+	// 字段完整性先于一切语义判定：缺失/空值/类型不符的票据绝不能进入后续核对，
+	// 否则被删成 null 的 support 会按零值 false 计入反对，缺失的 voted_at
+	// 会按 0 通过窗口检查。任一票据不完整即整份状态损坏，不给出部分汇总。
+	for i, b := range ballots {
+		if len(b.defects) > 0 {
+			return ballotCounts{}, ballotDefectError(id, i, b.defects[0])
+		}
+	}
 	seen := map[string]bool{}
 	for i, b := range ballots {
 		if b.Representative == "" {

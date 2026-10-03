@@ -2,6 +2,7 @@ package govflow
 
 import (
 	"bytes"
+	"encoding/json"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -464,5 +465,119 @@ func TestCLIRejectsCaseVariantField(t *testing.T) {
 	}
 	if got, err := os.ReadFile(state); err != nil || string(got) != corrupt {
 		t.Fatalf("corrupt file was modified")
+	}
+}
+
+// mutateBallotJSON 读取状态文件，结构化改写指定投票提案的第 0 张票据，
+// 返回改写后的完整 JSON（重排缩进，故比较只针对改写后的字节）。
+func mutateBallotJSON(t *testing.T, state, proposalID string, fn func(b map[string]any)) []byte {
+	t.Helper()
+	raw, err := os.ReadFile(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var doc map[string]any
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		t.Fatal(err)
+	}
+	ballot := doc["vote_proposals"].(map[string]any)[proposalID].(map[string]any)["ballots"].([]any)[0].(map[string]any)
+	fn(ballot)
+	out, err := json.MarshalIndent(doc, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	out = append(out, '\n')
+	if err := os.WriteFile(state, out, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return out
+}
+
+// TestCLIRejectsIncompleteBallot：票据的 support 字段被删除后，文本与 JSON 查询、
+// 计票乃至任意资金库命令都必须以域错误退出码 1 结束，原因写入 stderr 并指出
+// 提案编号、票据与字段，stdout 不出现部分结果，原文件不被补默认值或写回。
+func TestCLIRejectsIncompleteBallot(t *testing.T) {
+	binary := buildCLI(t)
+	dir := t.TempDir()
+	state := filepath.Join(dir, "treasury.json")
+	if _, se, code := runCLI(t, binary, state, "init", "--balance", "1000"); code != 0 {
+		t.Fatalf("init: %s", se)
+	}
+	create := []string{"create-vote", "--id", "gip-cli",
+		"--member", "alice:600", "--member", "dave:400",
+		"--quorum", "600", "--start", "0", "--deadline", "200", "--timelock", "300",
+		"--action", "transfer:audits:100"}
+	if _, se, code := runCLI(t, binary, state, create...); code != 0 {
+		t.Fatalf("create-vote: %s", se)
+	}
+	// 窗口从 0 开始；alice 的赞成票首次投票时间为 0。
+	if _, se, code := runCLI(t, binary, state, "vote", "--id", "gip-cli",
+		"--voter", "alice", "--choice", "for", "--now", "0"); code != 0 {
+		t.Fatalf("vote at start 0: %s", se)
+	}
+	// 删除 support：若误按默认值处理，这张赞成票会被当成反对票。
+	corrupt := mutateBallotJSON(t, state, "gip-cli", func(b map[string]any) { delete(b, "support") })
+
+	wantSubs := []string{"corrupt", "gip-cli", "ballot 0", `"support"`, "missing"}
+	assertReject := func(name string, args ...string) {
+		t.Helper()
+		so, se, code := runCLI(t, binary, state, args...)
+		if code != 1 {
+			t.Fatalf("%s exit=%d, want 1 (stderr=%s)", name, code, se)
+		}
+		if so != "" {
+			t.Fatalf("%s printed partial results on stdout: %s", name, so)
+		}
+		for _, sub := range wantSubs {
+			if !strings.Contains(se, sub) {
+				t.Fatalf("%s stderr=%q must mention %q", name, se, sub)
+			}
+		}
+	}
+	// 文本与 JSON 查询采用相同的有效性判定。
+	assertReject("text proposal", "proposal", "--id", "gip-cli")
+	assertReject("json proposal", "proposal", "--id", "gip-cli", "--json")
+	assertReject("text proposals", "proposals")
+	assertReject("json proposals", "proposals", "--json")
+	// 计票不能使用其它正常票据给出部分结论，也不能把缺损补成反对票后落盘。
+	assertReject("tally", "tally", "--id", "gip-cli", "--now", "200")
+	assertReject("json tally", "tally", "--id", "gip-cli", "--now", "200", "--json")
+	// 整份状态文件损坏：资金查询与执行入口同样拒绝。
+	assertReject("balances", "balances")
+	assertReject("execute", "execute", "--id", "gip-cli", "--now", "300")
+
+	// 全部失败后原文件字节保持不变。
+	if got, err := os.ReadFile(state); err != nil || string(got) != string(corrupt) {
+		t.Fatalf("corrupt state file was modified after failed commands")
+	}
+}
+
+// TestCLIAcceptsExplicitAgainstAtZero：窗口从 0 开始时，显式反对（false）与
+// 首次投票时间 0 是合法治理记录：投票成功、查询展示、计票据此给 rejected。
+func TestCLIAcceptsExplicitAgainstAtZero(t *testing.T) {
+	binary := buildCLI(t)
+	state := filepath.Join(t.TempDir(), "treasury.json")
+	if _, _, code := runCLI(t, binary, state, "init", "--balance", "1000"); code != 0 {
+		t.Fatal("init failed")
+	}
+	if _, se, code := runCLI(t, binary, state, "create-vote", "--id", "gip-zero",
+		"--member", "alice:600", "--member", "dave:400",
+		"--quorum", "1", "--start", "0", "--deadline", "200", "--timelock", "300"); code != 0 {
+		t.Fatalf("create-vote: %s", se)
+	}
+	so, se, code := runCLI(t, binary, state, "vote", "--id", "gip-zero",
+		"--voter", "alice", "--choice", "against", "--now", "0", "--json")
+	if code != 0 || !strings.Contains(so, `"support": false`) || !strings.Contains(so, `"voted_at": 0`) {
+		t.Fatalf("explicit against at 0 code=%d so=%s se=%s", code, so, se)
+	}
+	// 600 反对、0 赞成 => 不通过；证明 false 被当作真实反对票而非缺失。
+	so, _, code = runCLI(t, binary, state, "tally", "--id", "gip-zero", "--now", "200", "--json")
+	if code != 0 || !strings.Contains(so, `"passed": false`) || !strings.Contains(so, `"against_weight": 600`) {
+		t.Fatalf("tally against-only: code=%d so=%s", code, so)
+	}
+	// 重开式查询（新进程）仍能读出显式 false/0 票据。
+	so, _, code = runCLI(t, binary, state, "proposal", "--id", "gip-zero", "--json")
+	if code != 0 || !strings.Contains(so, `"support": false`) || !strings.Contains(so, `"voted_at": 0`) {
+		t.Fatalf("proposal query after tally: code=%d so=%s", code, so)
 	}
 }

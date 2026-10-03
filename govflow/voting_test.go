@@ -1300,3 +1300,257 @@ func TestTamperedTallyConclusionKeepsFile(t *testing.T) {
 		})
 	}
 }
+
+// TestIncompleteBallotRejectedAsCorrupt：已保存票据的 representative、weight、
+// support、voted_at 四个字段中任何一个缺失、为 null 或类型不符，整份状态文件
+// 都判为损坏；错误必须指出提案编号、票据下标、字段与缺陷类别，且原文件不被改写。
+// 特别地：删掉一张赞成票的 support 绝不能把它当成反对票，而是拒绝打开。
+func TestIncompleteBallotRejectedAsCorrupt(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "treasury.json")
+	store, err := InitTreasury(path, 1000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 窗口从 0 开始：alice 在 0 时刻投赞成（600 权重），dave 在窗口内反对（400）。
+	in := baseVoteInput("gip-incomplete")
+	in.StartAt, in.Deadline, in.TimelockEnd = 0, 200, 300
+	mustCreateVote(t, store, in)
+	if _, err := store.CastVote("gip-incomplete", "alice", true, 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.CastVote("gip-incomplete", "dave", false, 100); err != nil {
+		t.Fatal(err)
+	}
+	store.Close()
+
+	good, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// mutateBallot 结构化改写第 ballotIdx 张票据，避免依赖缩进与字段次序。
+	mutateBallot := func(ballotIdx int, fn func(b map[string]any)) []byte {
+		var clone map[string]any
+		if err := json.Unmarshal(good, &clone); err != nil {
+			t.Fatal(err)
+		}
+		fn(clone["vote_proposals"].(map[string]any)["gip-incomplete"].(map[string]any)["ballots"].([]any)[ballotIdx].(map[string]any))
+		raw, err := json.MarshalIndent(clone, "", "  ")
+		if err != nil {
+			t.Fatal(err)
+		}
+		return append(raw, '\n')
+	}
+	mutateBallots := func(fn func(p map[string]any)) []byte {
+		var clone map[string]any
+		if err := json.Unmarshal(good, &clone); err != nil {
+			t.Fatal(err)
+		}
+		fn(clone["vote_proposals"].(map[string]any)["gip-incomplete"].(map[string]any))
+		raw, err := json.MarshalIndent(clone, "", "  ")
+		if err != nil {
+			t.Fatal(err)
+		}
+		return append(raw, '\n')
+	}
+	del := func(key string) func(b map[string]any) {
+		return func(b map[string]any) { delete(b, key) }
+	}
+	set := func(key string, v any) func(b map[string]any) {
+		return func(b map[string]any) { b[key] = v }
+	}
+
+	// 每个变体都必须被拒绝，并在原因中给出提案、票据下标、字段与 missing/null/wrong type。
+	cases := map[string]struct {
+		raw    []byte
+		ballot string
+		field  string
+		defect string
+	}{
+		"support deleted":     {mutateBallot(0, del("support")), "ballot 0", `"support"`, "missing"},
+		"support null":        {mutateBallot(0, set("support", nil)), "ballot 0", `"support"`, "null"},
+		"support as string":   {mutateBallot(0, set("support", "true")), "ballot 0", `"support"`, "wrong type"},
+		"support as number":   {mutateBallot(0, set("support", 1)), "ballot 0", `"support"`, "wrong type"},
+		"voted_at deleted":    {mutateBallot(0, del("voted_at")), "ballot 0", `"voted_at"`, "missing"},
+		"voted_at null":       {mutateBallot(0, set("voted_at", nil)), "ballot 0", `"voted_at"`, "null"},
+		"voted_at as bool":    {mutateBallot(0, set("voted_at", true)), "ballot 0", `"voted_at"`, "wrong type"},
+		"voted_at as string":  {mutateBallot(0, set("voted_at", "0")), "ballot 0", `"voted_at"`, "wrong type"},
+		"weight deleted":      {mutateBallot(0, del("weight")), "ballot 0", `"weight"`, "missing"},
+		"weight null":         {mutateBallot(0, set("weight", nil)), "ballot 0", `"weight"`, "null"},
+		"weight as string":    {mutateBallot(0, set("weight", "600")), "ballot 0", `"weight"`, "wrong type"},
+		"weight as fraction":  {mutateBallot(0, set("weight", 600.5)), "ballot 0", `"weight"`, "wrong type"},
+		"representative del":  {mutateBallot(0, del("representative")), "ballot 0", `"representative"`, "missing"},
+		"representative null": {mutateBallot(0, set("representative", nil)), "ballot 0", `"representative"`, "null"},
+		"representative num":  {mutateBallot(0, set("representative", 7)), "ballot 0", `"representative"`, "wrong type"},
+		// 缺损发生在第二张票据时，下标必须是 1，且不能只凭第一张正常票据给出部分结果。
+		"second ballot support null": {mutateBallot(1, set("support", nil)), "ballot 1", `"support"`, "null"},
+		// 整个票据元素是 null：四个字段同时缺失，按代表字段的空值缺陷报告并定位到该票据。
+		"null ballot element": {
+			mutateBallots(func(p map[string]any) { p["ballots"] = []any{nil} }),
+			"ballot 0", `"representative"`, "null",
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			bad := filepath.Join(dir, "bad-"+strings.ReplaceAll(name, " ", "-")+".json")
+			if err := os.WriteFile(bad, tc.raw, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			s, err := Open(bad)
+			if !errors.Is(err, ErrStateCorrupt) {
+				if s != nil {
+					s.Close()
+				}
+				t.Fatalf("Open err=%v, want ErrStateCorrupt", err)
+			}
+			msg := err.Error()
+			for _, want := range []string{"gip-incomplete", tc.ballot, tc.field, tc.defect} {
+				if !strings.Contains(msg, want) {
+					t.Fatalf("error %q must identify %s", msg, want)
+				}
+			}
+			// 缺损文件原样保留：不补默认值、不整理、不覆盖。
+			if got, rerr := os.ReadFile(bad); rerr != nil || string(got) != string(tc.raw) {
+				t.Fatalf("corrupt file was modified on rejected open")
+			}
+			// 损坏文件同样禁止 init 覆盖（沿用既有规则）。
+			if _, err := InitTreasury(bad, 0); !errors.Is(err, ErrTreasuryAlreadyInit) {
+				t.Fatalf("InitTreasury over corrupt file err=%v", err)
+			}
+		})
+	}
+}
+
+// TestExplicitFalseAndZeroBallotStillValid：显式写出的 false 是合法反对票，
+// 窗口从 0 开始时显式写出的 voted_at=0 是合法投票时间；二者都不得被当成缺失。
+// 空票据列表的未投票提案继续可读，相同选择重试保留首次（0 时刻）记录。
+func TestExplicitFalseAndZeroBallotStillValid(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "treasury.json")
+	store, err := InitTreasury(path, 1000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	in := baseVoteInput("gip-explicit")
+	in.Quorum = 1
+	in.StartAt, in.Deadline, in.TimelockEnd = 0, 200, 300
+	mustCreateVote(t, store, in)
+
+	// 尚未投票：空票据列表合法，可查询。
+	if v, _, err := store.VoteProposal("gip-explicit"); err != nil || len(v.Ballots) != 0 {
+		t.Fatalf("empty ballots view: %+v err=%v", v, err)
+	}
+	// alice 在起始时刻 0 投反对票：false 与 0 都是显式合法值。
+	b, err := store.CastVote("gip-explicit", "alice", false, 0)
+	if err != nil {
+		t.Fatalf("explicit false/0 vote: %v", err)
+	}
+	if b.Support || b.VotedAt != 0 || b.Weight != 600 {
+		t.Fatalf("ballot=%+v, want support=false voted_at=0 weight=600", b)
+	}
+	// 相同选择在更晚时间重试：返回首次记录（voted_at 仍为 0），不新增票据。
+	again, err := store.CastVote("gip-explicit", "alice", false, 150)
+	if err != nil || again.VotedAt != 0 {
+		t.Fatalf("same-choice retry changed record: %+v err=%v", again, err)
+	}
+	// 截止计票：600 反对、0 赞成，参与达到法定人数但赞成不占多数 => rejected，
+	// 证明 false 被当作真实反对票而非缺失。
+	res, err := store.TallyVote("gip-explicit", 200)
+	if err != nil || res.Passed || res.AgainstWeight != 600 || res.ForWeight != 0 {
+		t.Fatalf("tally explicit-against: %+v err=%v", res, err)
+	}
+	store.Close()
+
+	// 重开：显式 false/0 票据原样可读，结论保留为 rejected。
+	reopened, err := Open(path)
+	if err != nil {
+		t.Fatalf("reopen explicit false/0 ballot: %v", err)
+	}
+	defer reopened.Close()
+	v, ok, err := reopened.VoteProposal("gip-explicit")
+	if err != nil || !ok {
+		t.Fatalf("query after reopen: %v ok=%v", err, ok)
+	}
+	if len(v.Ballots) != 1 || v.Ballots[0].Support || v.Ballots[0].VotedAt != 0 || v.Ballots[0].Weight != 600 {
+		t.Fatalf("ballot after reopen = %+v", v.Ballots)
+	}
+	if v.State != "rejected" || v.Tally == nil || v.Tally.Passed {
+		t.Fatalf("state/tally after reopen = %s %+v", v.State, v.Tally)
+	}
+}
+
+// TestCorruptionAfterOpenRejectsNextRead：句柄已成功打开后，状态文件才被改成
+// 缺损票据，下一次读取或操作必须返回 ErrStateCorrupt：不返回任何部分查询结果，
+// 不把缺损字段补成反对票或时间 0 后写回，提案状态与资金余额保持原样。
+func TestCorruptionAfterOpenRejectsNextRead(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "treasury.json")
+	store, err := InitTreasury(path, 1000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	in := baseVoteInput("gip-late-corrupt")
+	in.StartAt, in.Deadline, in.TimelockEnd = 0, 200, 300
+	mustCreateVote(t, store, in)
+	// 一张赞成票：若缺损被补成 false，计票会被翻成 rejected；正确行为是直接报错。
+	if _, err := store.CastVote("gip-late-corrupt", "alice", true, 100); err != nil {
+		t.Fatal(err)
+	}
+
+	good, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var clone map[string]any
+	if err := json.Unmarshal(good, &clone); err != nil {
+		t.Fatal(err)
+	}
+	b := clone["vote_proposals"].(map[string]any)["gip-late-corrupt"].(map[string]any)["ballots"].([]any)[0].(map[string]any)
+	b["voted_at"] = nil // 首次投票时间被改成 null
+	raw, err := json.MarshalIndent(clone, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	corrupt := append(raw, '\n')
+	if err := os.WriteFile(path, corrupt, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// 句柄仍开着：下一次任何读取或操作都必须因状态损坏失败，且不产生结果。
+	if _, _, err := store.VoteProposal("gip-late-corrupt"); !errors.Is(err, ErrStateCorrupt) {
+		t.Fatalf("VoteProposal after corruption err=%v", err)
+	}
+	if _, err := store.VoteProposals(); !errors.Is(err, ErrStateCorrupt) {
+		t.Fatalf("VoteProposals after corruption err=%v", err)
+	}
+	if _, err := store.ProposalsSnapshot(); !errors.Is(err, ErrStateCorrupt) {
+		t.Fatalf("ProposalsSnapshot after corruption err=%v", err)
+	}
+	if _, err := store.TreasuryBalance(); !errors.Is(err, ErrStateCorrupt) {
+		t.Fatalf("TreasuryBalance after corruption err=%v", err)
+	}
+	if _, err := store.BalanceSnapshot(); !errors.Is(err, ErrStateCorrupt) {
+		t.Fatalf("BalanceSnapshot after corruption err=%v", err)
+	}
+	if _, err := store.TallyVote("gip-late-corrupt", 200); !errors.Is(err, ErrStateCorrupt) {
+		t.Fatalf("TallyVote after corruption err=%v", err)
+	}
+	if _, err := store.CastVote("gip-late-corrupt", "dave", false, 150); !errors.Is(err, ErrStateCorrupt) {
+		t.Fatalf("CastVote after corruption err=%v", err)
+	}
+
+	// 失败不得写回：缺损文件内容、提案状态、资金余额全部保持失败前的样子。
+	if got, rerr := os.ReadFile(path); rerr != nil || string(got) != string(corrupt) {
+		t.Fatalf("state file was rewritten after failed read/operation")
+	}
+	store.Close()
+
+	// 另一个文件里的正常提案不受影响（不同状态文件互不影响，对照项）。
+	goodPath := filepath.Join(t.TempDir(), "treasury.json")
+	goodStore, err := InitTreasury(goodPath, 50)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer goodStore.Close()
+	if bal, err := goodStore.TreasuryBalance(); err != nil || bal != 50 {
+		t.Fatalf("unrelated store balance=%d err=%v, want 50", bal, err)
+	}
+}
