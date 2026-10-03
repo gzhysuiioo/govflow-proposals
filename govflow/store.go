@@ -690,7 +690,10 @@ func (s *Store) loadLocked() (*storedState, error) {
 	if len(bytes.TrimSpace(raw)) == 0 {
 		return nil, fmt.Errorf("%w: %s: file is empty", ErrStateCorrupt, s.path)
 	}
-	if err := rejectDuplicateKeys(raw); err != nil {
+	// 单次 token 扫描即完成三件事：重复键（按 JSON 解码后的字符串判定，
+	// 不同转义写法也视为同一个键）、固定字段名必须与保存格式逐字一致
+	// （拒绝 Treasury/State/Support 等大小写变体）、业务编号表的键任意。
+	if err := scanStrictKeys(raw); err != nil {
 		return nil, fmt.Errorf("%w: %s: %v", ErrStateCorrupt, s.path, err)
 	}
 	var state storedState
@@ -902,14 +905,188 @@ func validateState(state *storedState) error {
 	return nil
 }
 
-// scanFrame 是重复键扫描的栈帧。
+// 记录/容器类型：决定一个对象里允许哪些固定字段名。
+const (
+	recInvalidObject = iota // 结构上不应出现对象的位置：拒绝其中一切字段
+	recRoot                 // 状态文件顶层
+	recBalancesMap          // balances：业务编号表（键为收款账户名）
+	recProposalsMap         // proposals：业务编号表（键为提案编号）
+	recVotesMap             // vote_proposals：业务编号表（键为提案编号）
+	recProposal
+	recVoteProposal
+	recReceipt
+	recActionReceipt
+	recBalanceUpdate
+	recMember
+	recDelegation
+	recBallot
+	recTally
+)
+
+// scanFrame 是严格键扫描的栈帧。
 type scanFrame struct {
 	isArray bool
-	seen    map[string]bool
-	atValue bool // 对象帧：下一个待消费 token 是值而非键
+	kind    int
+	// fields 非 nil 表示“固定字段对象”：键必须逐字命中 fields；
+	// nil 表示业务编号表（balances/proposals/vote_proposals），键是
+	// 账户名或提案编号，只拒绝同一对象内逐字重复的键。
+	fields map[string]bool
+	idKey  string // 记录中用于错误定位的编号字段（如 id/proposal_id）
+
+	seen       map[string]bool
+	atValue    bool   // 对象帧：下一个待消费 token 是值而非键
+	pendingKey string // 对象帧：当前值正在解析的键
+	path       string // 帧在文档中的位置，用于错误定位
+	idValue    string // 已读到的编号字段值
+
+	elemKind  int // 数组帧：其中对象元素的记录类型
+	nextIndex int // 数组帧：下一个元素的下标，用于路径定位
 }
 
-func rejectDuplicateKeys(raw []byte) error {
+// 各固定字段对象允许的全部字段名，取自磁盘结构的 json tag，
+// 必须与当前保存格式的拼写逐字一致。业务编号表不在此列。
+var (
+	strictRootFields = fixedFieldSet(
+		"magic", "version", "initial_treasury", "treasury",
+		"balances", "proposals", "receipts", "vote_proposals")
+	strictProposalFields      = fixedFieldSet("id", "state", "timelock_end", "actions")
+	strictReceiptFields       = fixedFieldSet("proposal_id", "executed_at", "order", "actions")
+	strictActionReceiptFields = fixedFieldSet("index", "action", "treasury", "recipient")
+	strictBalanceUpdateFields = fixedFieldSet("account", "before", "after")
+	strictVoteProposalFields  = fixedFieldSet(
+		"id", "state", "members", "delegations", "quorum",
+		"start_at", "deadline", "timelock_end", "actions", "ballots", "tally")
+	strictMemberFields     = fixedFieldSet("id", "weight")
+	strictDelegationFields = fixedFieldSet("from", "to")
+	strictBallotFields     = fixedFieldSet("representative", "weight", "support", "voted_at")
+	strictTallyFields      = fixedFieldSet("for_weight", "against_weight", "tallied_at")
+	noFields               = map[string]bool{}
+)
+
+func fixedFieldSet(names ...string) map[string]bool {
+	m := make(map[string]bool, len(names))
+	for _, n := range names {
+		m[n] = true
+	}
+	return m
+}
+
+func fixedFields(kind int) map[string]bool {
+	switch kind {
+	case recRoot:
+		return strictRootFields
+	case recProposal:
+		return strictProposalFields
+	case recVoteProposal:
+		return strictVoteProposalFields
+	case recReceipt:
+		return strictReceiptFields
+	case recActionReceipt:
+		return strictActionReceiptFields
+	case recBalanceUpdate:
+		return strictBalanceUpdateFields
+	case recMember:
+		return strictMemberFields
+	case recDelegation:
+		return strictDelegationFields
+	case recBallot:
+		return strictBallotFields
+	case recTally:
+		return strictTallyFields
+	case recInvalidObject:
+		return noFields
+	default: // 业务编号表
+		return nil
+	}
+}
+
+func idKeyOf(kind int) string {
+	switch kind {
+	case recProposal, recVoteProposal, recMember:
+		return "id"
+	case recReceipt:
+		return "proposal_id"
+	case recBallot:
+		return "representative"
+	case recBalanceUpdate:
+		return "account"
+	default:
+		return ""
+	}
+}
+
+// objectKindUnder 决定对象父帧某个键对应的对象值类型；未知形状返回
+// recInvalidObject（其中任何字段都会被拒绝，随后的正常解码也会拒绝）。
+func objectKindUnder(parentKind int, key string) int {
+	switch parentKind {
+	case recRoot:
+		switch key {
+		case "balances":
+			return recBalancesMap
+		case "proposals":
+			return recProposalsMap
+		case "vote_proposals":
+			return recVotesMap
+		}
+	case recProposalsMap:
+		return recProposal
+	case recVotesMap:
+		return recVoteProposal
+	case recVoteProposal:
+		if key == "tally" {
+			return recTally
+		}
+	case recActionReceipt:
+		if key == "treasury" || key == "recipient" {
+			return recBalanceUpdate
+		}
+	}
+	return recInvalidObject
+}
+
+// arrayElemKind 决定某数组中对象元素的记录类型；标量数组返回 recInvalidObject，
+// 因为其内部不应当出现任何对象字段。
+func arrayElemKind(parentKind int, key string) int {
+	switch parentKind {
+	case recRoot:
+		if key == "receipts" {
+			return recReceipt
+		}
+	case recVoteProposal:
+		switch key {
+		case "members":
+			return recMember
+		case "delegations":
+			return recDelegation
+		case "ballots":
+			return recBallot
+		}
+	case recReceipt:
+		if key == "actions" {
+			return recActionReceipt
+		}
+	}
+	return recInvalidObject
+}
+
+func joinPath(base, key string) string {
+	if base == "" {
+		return "/" + key
+	}
+	return base + "/" + key
+}
+
+// scanStrictKeys 用一次 json.Decoder token 流完成结构相关的键检查：
+//   - 固定字段对象只接受与保存格式逐字一致的字段名：把 treasury 写成
+//     Treasury、把票据里的 support 写成 Support 一律拒绝；未知字段同样拒绝；
+//   - 同一对象内重复键按 JSON 解读后的字符串判定："state" 与转义写法
+//     state 是同一个键，出现两次即重复；state 与 State 不是同一个键，
+//     但 State 会因大小写不符被拒绝；
+//   - 业务编号表（balances/proposals/vote_proposals）的键是账户名或提案
+//     编号：Audit 与 audit、GIP-1 与 gip-1 都是不同编号，允许共存，
+//     不拒绝、不合并、不改正；
+//   - 重复与字段名检查只作用于同一个对象，不同记录各自拥有 state 等字段正常。
+func scanStrictKeys(raw []byte) error {
 	dec := json.NewDecoder(bytes.NewReader(raw))
 	var stack []*scanFrame
 	for {
@@ -927,10 +1104,40 @@ func rejectDuplicateKeys(raw []byte) error {
 		case json.Delim:
 			switch t {
 			case '{':
-				stack = append(stack, &scanFrame{seen: map[string]bool{}})
+				kind, path := recRoot, ""
+				if len(stack) > 0 {
+					parent := stack[len(stack)-1]
+					if parent.isArray {
+						kind = parent.elemKind
+						path = fmt.Sprintf("%s[%d]", parent.path, parent.nextIndex)
+						parent.nextIndex++
+					} else {
+						kind = objectKindUnder(parent.kind, parent.pendingKey)
+						path = joinPath(parent.path, parent.pendingKey)
+					}
+				}
+				stack = append(stack, &scanFrame{
+					kind:   kind,
+					fields: fixedFields(kind),
+					idKey:  idKeyOf(kind),
+					seen:   map[string]bool{},
+					path:   path,
+				})
 				continue
 			case '[':
-				stack = append(stack, &scanFrame{isArray: true})
+				frame := &scanFrame{isArray: true, kind: recInvalidObject, path: ""}
+				if len(stack) > 0 {
+					parent := stack[len(stack)-1]
+					if !parent.isArray {
+						frame.elemKind = arrayElemKind(parent.kind, parent.pendingKey)
+						frame.path = joinPath(parent.path, parent.pendingKey)
+					} else {
+						frame.elemKind = recInvalidObject
+						frame.path = fmt.Sprintf("%s[%d]", parent.path, parent.nextIndex)
+						parent.nextIndex++
+					}
+				}
+				stack = append(stack, frame)
 				continue
 			case '}', ']':
 				if len(stack) == 0 {
@@ -940,27 +1147,74 @@ func rejectDuplicateKeys(raw []byte) error {
 				// 关闭的容器本身是外层对象的某个“值”，消费完毕后外层等待下一个键。
 				if len(stack) > 0 && !stack[len(stack)-1].isArray {
 					stack[len(stack)-1].atValue = false
+					stack[len(stack)-1].pendingKey = ""
 				}
 				continue
 			}
 		default:
 			// 标量 token。
 		}
-		if len(stack) > 0 && !stack[len(stack)-1].isArray {
-			frame := stack[len(stack)-1]
-			if !frame.atValue {
-				key, ok := tok.(string)
-				if !ok {
-					return errors.New("object key must be a string")
-				}
-				if frame.seen[key] {
-					return fmt.Errorf("duplicate key %q", key)
-				}
-				frame.seen[key] = true
-				frame.atValue = true
-			} else {
-				frame.atValue = false
+		if len(stack) == 0 {
+			// 顶层标量（如 123）不是状态文档；交给正常解码报错。
+			continue
+		}
+		frame := stack[len(stack)-1]
+		if frame.isArray {
+			frame.nextIndex++ // 消费一个标量数组元素
+			continue
+		}
+		if !frame.atValue {
+			// 对象键（Token 已把转义解读为最终字符串）。
+			key, ok := tok.(string)
+			if !ok {
+				return errors.New("object key must be a string")
+			}
+			if frame.seen[key] {
+				return fmt.Errorf("duplicate key %q%s", key, locationOf(frame))
+			}
+			frame.seen[key] = true
+			if frame.fields != nil && !frame.fields[key] {
+				return fieldNameError(key, frame)
+			}
+			frame.atValue = true
+			frame.pendingKey = key
+			continue
+		}
+		// 标量值：顺手记录编号字段，供错误信息定位记录。
+		if frame.idKey != "" && frame.pendingKey == frame.idKey {
+			if sv, ok := tok.(string); ok && frame.idValue == "" {
+				frame.idValue = sv
 			}
 		}
+		frame.atValue = false
+		frame.pendingKey = ""
 	}
+}
+
+// locationOf 给出对象帧在文档中的位置；能读到记录编号时一并附上。
+func locationOf(frame *scanFrame) string {
+	where := frame.path
+	if frame.idValue != "" {
+		if where == "" {
+			where = "/"
+		}
+		where += fmt.Sprintf(" (%s=%q)", frame.idKey, frame.idValue)
+	}
+	if where == "" {
+		return ""
+	}
+	return " at " + where
+}
+
+// fieldNameError 区分“大小写变体”与真正的未知字段：前者给出保存格式中的
+// 正确拼写建议，便于用户直接定位被拒字段与所在记录。
+func fieldNameError(key string, frame *scanFrame) error {
+	where := locationOf(frame)
+	for f := range frame.fields {
+		if strings.EqualFold(f, key) {
+			return fmt.Errorf("wrong-case field name %q%s: fixed field names are case-sensitive, did you mean %q?",
+				key, where, f)
+		}
+	}
+	return fmt.Errorf("unknown field %q%s", key, where)
 }
