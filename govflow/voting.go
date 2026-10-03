@@ -277,10 +277,91 @@ func isInt64Number(raw json.RawMessage) bool {
 	return err == nil
 }
 
+// storedTally 是已保存的首次计票结果。只要提案有计票结果，for_weight 与
+// against_weight 就必须各自明确写出：即使某一侧（或两侧）实际票重为零，
+// 也不得靠零值/默认值补出治理记录——缺失或 null 的 for_weight 不得被当作
+// 0 赞成，缺失或 null 的 against_weight 不得被当作 0 反对。
+//
+// 两个权重字段先用 RawMessage 接住，使“字段缺失”与“显式 null/写错类型”在
+// 解码后仍可区分：encoding/json 直接解进 int64 时会把这三种情况都折叠成 0。
+// 每个字段的“缺失/空值/类型不符”由 validateStoredTally 判定。
 type storedTally struct {
 	ForWeight     int64 `json:"for_weight"`
 	AgainstWeight int64 `json:"against_weight"`
 	TalliedAt     int64 `json:"tallied_at"`
+
+	forWeightRaw     json.RawMessage
+	againstWeightRaw json.RawMessage
+}
+
+// tallyJSONShape 只用于解码，按保存格式的字段名逐字接住每个权重字段的原始 JSON。
+type tallyJSONShape struct {
+	ForWeight     json.RawMessage `json:"for_weight"`
+	AgainstWeight json.RawMessage `json:"against_weight"`
+	TalliedAt     int64           `json:"tallied_at"`
+}
+
+// UnmarshalJSON 保留权重字段是否出现及其原始写法（缺失为 nil、null 为 "null"），
+// 供 validateStoredTally 区分缺失、空值与类型不符。单个字段类型不符时这里不返回
+// 错误（对应治理字段保持零值），以免解码器在不含提案编号的通用错误处提前失败；
+// 定位与判定统一交给 validateStoredTally。
+func (t *storedTally) UnmarshalJSON(data []byte) error {
+	var shape tallyJSONShape
+	if err := json.Unmarshal(data, &shape); err != nil {
+		return err
+	}
+	t.TalliedAt = shape.TalliedAt
+	t.forWeightRaw, t.againstWeightRaw = shape.ForWeight, shape.AgainstWeight
+	// 仅当字段确实是 int64 整数时才填充治理字段；类型不符留待校验拒绝，
+	// 绝不能让错误类型悄悄落成 0 并参与查询或再次计票。
+	if isInt64Number(shape.ForWeight) {
+		_ = json.Unmarshal(shape.ForWeight, &t.ForWeight)
+	}
+	if isInt64Number(shape.AgainstWeight) {
+		_ = json.Unmarshal(shape.AgainstWeight, &t.AgainstWeight)
+	}
+	return nil
+}
+
+// mustStoreTally 构造一份内存中的合法计票结果（首次计票路径使用）。
+// 同步填上字段原始片段，使“提交前校验”与“打开重放校验”走同一份
+// validateStoredTally 判定时不会把本进程新建的计票结果误判为字段缺失。
+func mustStoreTally(forWeight, againstWeight, talliedAt int64) *storedTally {
+	forRaw, _ := json.Marshal(forWeight)
+	againstRaw, _ := json.Marshal(againstWeight)
+	return &storedTally{
+		ForWeight:        forWeight,
+		AgainstWeight:    againstWeight,
+		TalliedAt:        talliedAt,
+		forWeightRaw:     forRaw,
+		againstWeightRaw: againstRaw,
+	}
+}
+
+// validateStoredTally 严格判定一份已保存计票结果的两个必填权重字段：
+// for_weight 或 against_weight 未写出、显式为 null 或不是 int64 整数
+// （字符串/小数/指数/超界等均不接受）都返回带提案编号、字段名与原因的错误。
+// 明确写出的 0 是合法权重（该侧没有票或双方都没有票），不得当成缺失。
+func validateStoredTally(id string, t *storedTally) error {
+	check := func(field string, raw json.RawMessage) error {
+		switch {
+		case raw == nil:
+			return fmt.Errorf("voting proposal %q tally field %q is missing", id, field)
+		case string(raw) == "null":
+			return fmt.Errorf("voting proposal %q tally field %q is null", id, field)
+		case !isInt64Number(raw):
+			return fmt.Errorf("voting proposal %q tally field %q has wrong type: want integer, got %s",
+				id, field, jsonValueType(raw))
+		}
+		return nil
+	}
+	if err := check("for_weight", t.forWeightRaw); err != nil {
+		return err
+	}
+	if err := check("against_weight", t.againstWeightRaw); err != nil {
+		return err
+	}
+	return nil
 }
 
 // storedVoteProposal 按成员提交顺序保存成员与委托（顺序不影响相等性），
@@ -732,7 +813,7 @@ func (s *Store) TallyVote(id string, now int64) (*TallyResultView, error) {
 		return nil, fmt.Errorf("%w: %v", ErrStateCorrupt, verr)
 	}
 	passed := votePasses(counts.forWeight, counts.againstWeight, p.Quorum)
-	p.Tally = &storedTally{ForWeight: counts.forWeight, AgainstWeight: counts.againstWeight, TalliedAt: now}
+	p.Tally = mustStoreTally(counts.forWeight, counts.againstWeight, now)
 	p.State = tallyVerdict(passed)
 	if err := s.commitLocked(state); err != nil {
 		return nil, err
@@ -917,6 +998,13 @@ func validateVoteProposals(state *storedState) error {
 		default:
 			if p.State == "voting" {
 				return fmt.Errorf("voting proposal %q has a tally but is still in voting state", p.ID)
+			}
+			// 已有计票结果的提案，for_weight 与 against_weight 必须各自明确写出
+			// 且非 null、JSON 类型正确。先于重放核对执行：权重字段缺损时直接判整份
+			// 文件损坏，绝不能把缺失的一侧默认补成 0、根据票据补写，或用重新计票
+			// 替代首次记录后再继续给出查询或计票结果。明确写出的 0 是合法权重。
+			if err := validateStoredTally(p.ID, p.Tally); err != nil {
+				return err
 			}
 			if p.Tally.TalliedAt < p.Deadline {
 				return fmt.Errorf("voting proposal %q tallied at %d before deadline %d", p.ID, p.Tally.TalliedAt, p.Deadline)

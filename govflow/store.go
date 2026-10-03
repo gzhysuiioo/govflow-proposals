@@ -978,6 +978,13 @@ func init() {
 	// 提案编号与凭据位置，统一由 validateReceiptExecutedAt 报错，结构扫描在此
 	// 叶子位置保持宽松。
 	storedStateSchema.fields["receipts"].elem.fields["executed_at"].kind = kindAny
+	// 计票结果的 for_weight/against_weight 同理：缺失/空值/类型不符的判定需要
+	// 带上提案编号与字段名，统一由 validateStoredTally 报错，结构扫描在这两个
+	// 叶子位置保持宽松。
+	tallyFields := storedStateSchema.fields["vote_proposals"].elem.fields["tally"].fields
+	for _, name := range []string{"for_weight", "against_weight"} {
+		tallyFields[name].kind = kindAny
+	}
 }
 
 // scanFrame 是结构扫描的栈帧。

@@ -2,6 +2,7 @@ package govflow
 
 import (
 	"bytes"
+	"encoding/json"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -564,5 +565,82 @@ func TestCLIRejectsIncompleteBallot(t *testing.T) {
 		t.Fatalf("legal false/0 ballot json query exit=%d: %s", code, se)
 	} else if !strings.Contains(so, `"support": false`) || !strings.Contains(so, `"voted_at": 0`) {
 		t.Fatalf("json query should preserve false/0, got %s", so)
+	}
+}
+
+// TestCLIRejectsIncompleteTally：已计票提案的保存记录缺一侧权重时，命令行的
+// 文本输出与 JSON 输出结论一致：失败原因写入标准错误，退出码为 1，
+// 标准输出不出现成功结果；状态文件不被改写。
+func TestCLIRejectsIncompleteTally(t *testing.T) {
+	binary := buildCLI(t)
+	state := filepath.Join(t.TempDir(), "treasury.json")
+	if _, _, code := runCLI(t, binary, state, "init", "--balance", "1000"); code != 0 {
+		t.Fatal("init failed")
+	}
+	if _, se, code := runCLI(t, binary, state, "create-vote", "--id", "gip-vote-1",
+		"--member", "alice:300", "--member", "bob:200", "--member", "carol:100", "--member", "dave:400",
+		"--delegate", "bob:alice", "--delegate", "carol:alice",
+		"--quorum", "600", "--start", "100", "--deadline", "200", "--timelock", "300",
+		"--action", "transfer:audits:100"); code != 0 {
+		t.Fatalf("create-vote failed: %s", se)
+	}
+	if _, se, code := runCLI(t, binary, state, "vote", "--id", "gip-vote-1",
+		"--voter", "alice", "--choice", "for", "--now", "150"); code != 0 {
+		t.Fatalf("vote failed: %s", se)
+	}
+	// 600 赞成、0 反对、quorum 600 => passed。
+	if so, se, code := runCLI(t, binary, state, "tally", "--id", "gip-vote-1", "--now", "200"); code != 0 ||
+		!strings.Contains(so, "for=600 against=0") {
+		t.Fatalf("tally code=%d so=%s se=%s", code, so, se)
+	}
+
+	// 删掉保存记录中的 against_weight（该侧实际票重恰为 0）。
+	good, err := os.ReadFile(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var doc map[string]any
+	if err := json.Unmarshal(good, &doc); err != nil {
+		t.Fatal(err)
+	}
+	tally := doc["vote_proposals"].(map[string]any)["gip-vote-1"].(map[string]any)["tally"].(map[string]any)
+	delete(tally, "against_weight")
+	bad, err := json.MarshalIndent(doc, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	bad = append(bad, '\n')
+	if err := os.WriteFile(state, bad, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// 文本与 JSON 两种输出方式、查询与再次计票，结论一致：退出码 1、
+	// 标准错误写明提案编号与缺失字段、标准输出为空。
+	commands := [][]string{
+		{"proposal", "--id", "gip-vote-1"},
+		{"proposal", "--id", "gip-vote-1", "--json"},
+		{"tally", "--id", "gip-vote-1", "--now", "300"},
+		{"tally", "--id", "gip-vote-1", "--now", "300", "--json"},
+		{"proposals"},
+		{"proposals", "--json"},
+		{"balances"},
+		{"balances", "--json"},
+	}
+	for _, args := range commands {
+		so, se, code := runCLI(t, binary, state, args...)
+		if code != 1 {
+			t.Fatalf("%v: exit code=%d, want 1 (stderr=%s)", args, code, se)
+		}
+		if so != "" {
+			t.Fatalf("%v: stdout must be empty on failure, got %q", args, so)
+		}
+		if !strings.Contains(se, "gip-vote-1") || !strings.Contains(se, "against_weight") {
+			t.Fatalf("%v: stderr must name proposal and missing field, got %q", args, se)
+		}
+	}
+
+	// 失败不得改写状态文件（不得把缺失权重补成 0 后保存）。
+	if got, rerr := os.ReadFile(state); rerr != nil || string(got) != string(bad) {
+		t.Fatalf("corrupt state file was rewritten by failing commands")
 	}
 }
