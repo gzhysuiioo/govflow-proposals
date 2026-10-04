@@ -1022,42 +1022,149 @@ func Register(reg *Registry, in Input) (Outcome, error) {
 	return Outcome{Batch: b, Created: true}, nil
 }
 
-// Save atomically writes reg to path, replacing the file only after the new
-// content is fully on disk so an existing registry stays usable on failure.
-// Records are serialized in their current order; the file is created with
-// 0644 permissions or, when replacing an existing file, with its permissions.
-func Save(path string, reg *Registry) error {
-	if reg.Version != FormatVersion {
-		return fmt.Errorf("cannot write registry format version %d", reg.Version)
+// SaveError reports that directly assembled registry content failed Save's
+// validity rules: an unsupported version (Position == 0, Field == ""), a
+// record carrying empty text, malformed UTF-8 or an out-of-range quantity
+// (Position is its 1-based index, Batch carries the record's batch id only
+// when that id is itself non-empty valid UTF-8 text, and Field/Reason name
+// the problem), or two records sharing one batch id compared by their
+// original Go string (Position and First are the 1-based positions of the
+// repeat and the first occurrence, Batch is the shared id). Nothing is
+// written and the caller's Registry is never modified.
+type SaveError struct {
+	Path     string
+	Position int
+	First    int
+	Batch    string
+	Field    string
+	Reason   string
+}
+
+// Field takes the sentinel value "batch-id" for a duplicate batch id; every
+// other failure uses the offending record member ("batch", "product",
+// "quantity" or "unit") or, for an unsupported version, the empty string.
+func (e *SaveError) Error() string {
+	switch {
+	case e.Field == "batch-id":
+		return fmt.Sprintf("cannot save registry %q: duplicate batch id %q at records %d and %d",
+			e.Path, e.Batch, e.First, e.Position)
+	case e.Field != "" && e.Position > 0:
+		if e.Batch != "" {
+			return fmt.Sprintf("cannot save registry %q: batches record %d (batch %q): field %q: %s",
+				e.Path, e.Position, e.Batch, e.Field, e.Reason)
+		}
+		return fmt.Sprintf("cannot save registry %q: batches record %d: field %q: %s",
+			e.Path, e.Position, e.Field, e.Reason)
+	default:
+		return fmt.Sprintf("cannot save registry %q: %s", e.Path, e.Reason)
 	}
-	// Never persist U+FFFD substitutions: every text field must round-trip
-	// as valid UTF-8. Load already guarantees this; the guard also covers
-	// registries assembled by hand inside other code.
+}
+
+// saveDocument is the on-disk view of a registry: Batches is never nil, so a
+// registry with zero batches is written as "batches": [] rather than
+// "batches": null. It is built fresh on every Save, so the caller's Registry
+// — including a nil or empty Batches slice — is never modified.
+type saveDocument struct {
+	Version int     `json:"version"`
+	Batches []Batch `json:"batches"`
+}
+
+// validateForSave applies the public format's record rules to directly
+// assembled content. The three text fields must be non-empty valid UTF-8 and
+// quantity must lie in 1..MaxQuantity; batch ids must be unique when
+// compared as their original Go strings (byte for byte, no trimming or case
+// folding). The first violation wins, so an illegal record earlier in the
+// table is never skipped, merged or corrected. A batch id is attached to the
+// error only when it is itself non-empty valid UTF-8 text; it is never
+// invented or replaced with U+FFFD when the "batch" field is empty or
+// malformed.
+func validateForSave(reg *Registry) error {
+	seen := make(map[string]int, len(reg.Batches))
 	for i, b := range reg.Batches {
-		for _, tv := range []struct{ field, value string }{
+		pos := i + 1
+		batchID := ""
+		if b.Batch != "" && utf8.ValidString(b.Batch) {
+			batchID = b.Batch
+		}
+		fail := func(field, reason string) *SaveError {
+			return &SaveError{Position: pos, Batch: batchID, Field: field, Reason: reason}
+		}
+		textFields := []struct {
+			field, value string
+		}{
 			{"batch", b.Batch}, {"product", b.Product}, {"unit", b.Unit},
-		} {
+		}
+		for _, tv := range textFields {
 			if !utf8.ValidString(tv.value) {
-				return fmt.Errorf("cannot save registry %q: batches record %d field %q is not valid UTF-8", path, i+1, tv.field)
+				// batchID is already empty when the batch field itself is
+				// malformed, so attaching it unconditionally is safe.
+				return fail(tv.field, "must be valid UTF-8 text: malformed bytes are rejected instead of being replaced with U+FFFD")
 			}
 		}
+		for _, tv := range textFields {
+			if tv.value == "" {
+				return fail(tv.field, "must not be empty")
+			}
+		}
+		switch {
+		case b.Quantity <= 0:
+			return fail("quantity", "must be greater than zero")
+		case b.Quantity > MaxQuantity:
+			return fail("quantity", fmt.Sprintf("must be an integer no greater than %d", MaxQuantity))
+		}
+		if first, dup := seen[b.Batch]; dup {
+			return &SaveError{Position: pos, First: first, Batch: b.Batch, Field: "batch-id"}
+		}
+		seen[b.Batch] = pos
 	}
+	return nil
+}
+
+// Save atomically writes reg to path, replacing the file only after the new
+// content is fully on disk so an existing registry stays usable on failure.
+// Records are serialized in their current order; a registry with no records
+// is written with "batches": [] and reads back through Load as an empty
+// registry. The file is created with 0644 permissions or, when replacing an
+// existing file, with its permissions.
+//
+// Save is the last line of defense for registries assembled directly in Go
+// rather than produced by Register or Import: an unsupported version, an
+// empty or malformed text field, a quantity outside 1..MaxQuantity or a
+// duplicate batch id rejects the whole write — no bad record is skipped,
+// merged or corrected — before any file or temporary file is created, so an
+// existing target keeps its bytes and modification time and a missing target
+// stays absent.
+func Save(path string, reg *Registry) error {
+	if reg.Version != FormatVersion {
+		return &SaveError{Path: path, Reason: fmt.Sprintf("unsupported registry version %d, want %d", reg.Version, FormatVersion)}
+	}
+	if err := validateForSave(reg); err != nil {
+		if se, ok := err.(*SaveError); ok {
+			se.Path = path
+		}
+		return err
+	}
+
 	mode := os.FileMode(0o644)
 	if info, err := os.Stat(path); err == nil {
 		mode = info.Mode().Perm()
 	} else if !errors.Is(err, fs.ErrNotExist) {
-		return fmt.Errorf("cannot inspect registry %q: %w", path, err)
+		return fmt.Errorf("cannot save registry %q: %w", path, err)
 	}
 
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return fmt.Errorf("cannot save registry %q: %w", path, err)
 	}
 
+	doc := saveDocument{Version: FormatVersion, Batches: reg.Batches}
+	if doc.Batches == nil {
+		doc.Batches = []Batch{}
+	}
 	var buf bytes.Buffer
 	enc := json.NewEncoder(&buf)
 	enc.SetEscapeHTML(false)
 	enc.SetIndent("", "  ")
-	if err := enc.Encode(reg); err != nil {
+	if err := enc.Encode(doc); err != nil {
 		return fmt.Errorf("cannot encode registry %q: %w", path, err)
 	}
 
