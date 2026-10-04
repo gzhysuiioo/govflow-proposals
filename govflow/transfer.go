@@ -157,20 +157,14 @@ func planTransfers(actions []string, treasury int64, balances map[string]int64) 
 // actionReceipt 按统一转账规则的计算结果构造凭据中的逐笔留痕。
 // 资金库侧账户名固定为 "treasury"，收款侧为动作解析出的账户；
 // 逐笔前后余额直接取自规则结果，凭据记载的变动与实际提交的变动同源。
+// mustBalanceUpdate 同步填上各字段的原始 JSON 片段，使提交前的 validateState
+// 与打开时的重放校验走同一份判定，不把本进程新建的凭据误判为字段缺失。
 func (s transferStep) actionReceipt(index int, raw string) ActionReceipt {
 	return ActionReceipt{
-		Index:  index,
-		Action: raw,
-		Treasury: BalanceUpdate{
-			Account: "treasury",
-			Before:  s.treasuryBefore,
-			After:   s.treasuryAfter,
-		},
-		Recipient: BalanceUpdate{
-			Account: s.account,
-			Before:  s.recipientBefore,
-			After:   s.recipientAfter,
-		},
+		Index:     index,
+		Action:    raw,
+		Treasury:  mustBalanceUpdate("treasury", s.treasuryBefore, s.treasuryAfter),
+		Recipient: mustBalanceUpdate(s.account, s.recipientBefore, s.recipientAfter),
 	}
 }
 

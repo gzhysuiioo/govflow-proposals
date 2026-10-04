@@ -260,6 +260,199 @@ func TestExecuteExactRemainingAndOverflowBeforeInsufficient(t *testing.T) {
 	}
 }
 
+// TestReceiptBalanceFieldsMustBePresent：凭据每项动作的四个余额字段
+// （资金库/收款账户 × before/after）都必须明确写出。任何一侧任一字段缺失、
+// 为 null 或类型不符——包括按转账金额推算本来应为 0 的字段——都判整份状态
+// 损坏，错误指出提案编号、动作下标（0 起）、所在侧与字段名；不能根据转账
+// 金额、账户余额或其它凭据补出。明确写出的整数 0 是合法记录，照常可读。
+func TestReceiptBalanceFieldsMustBePresent(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "treasury.json")
+	store, err := InitTreasury(path, 400)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 同一账户连续收款：第二笔的 before 承接第一笔的 after。
+	// 凭据逐笔记为 资金库 400->250->0、收款账户 0->150->300。
+	mustRegister(t, store, "gip-1", 0, "transfer:new:150", "transfer:new:150")
+	if _, err := store.Execute("gip-1", 0); err != nil {
+		t.Fatal(err)
+	}
+	// 投票通过的提案产生的凭据受同一条字段规则约束；其资金库 after 明确写出 0。
+	mustCreateVote(t, store, baseVoteInput("gip-vote"))
+	if _, err := store.CastVote("gip-vote", "alice", true, 150); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.CastVote("gip-vote", "dave", true, 150); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.TallyVote("gip-vote", 200); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Execute("gip-vote", 300); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	good, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 基线：明确写出 0 的完整凭据照常可读，查询与执行重试行为不变。
+	t.Run("baseline readable with explicit zeros", func(t *testing.T) {
+		s, err := Open(path)
+		if err != nil {
+			t.Fatalf("reopen: %v", err)
+		}
+		defer s.Close()
+		r, ok, err := s.Receipt("gip-1")
+		if err != nil || !ok {
+			t.Fatalf("Receipt(gip-1) ok=%v err=%v", ok, err)
+		}
+		want := []struct{ tb, ta, rb, ra int64 }{
+			{400, 250, 0, 150},
+			{250, 100, 150, 300}, // 同一账户连续收款，承接上一笔结果
+		}
+		for i, w := range want {
+			ar := r.Actions[i]
+			if ar.Treasury.Before != w.tb || ar.Treasury.After != w.ta ||
+				ar.Recipient.Before != w.rb || ar.Recipient.After != w.ra {
+				t.Fatalf("action %d = %+v, want treasury %d->%d recipient %d->%d",
+					i, ar, w.tb, w.ta, w.rb, w.ra)
+			}
+		}
+		// 投票凭据：资金库 100->0、收款账户 0->100，两个明确写出的 0。
+		vr, ok, err := s.Receipt("gip-vote")
+		if err != nil || !ok {
+			t.Fatalf("Receipt(gip-vote) ok=%v err=%v", ok, err)
+		}
+		if va := vr.Actions[0]; va.Treasury.Before != 100 || va.Treasury.After != 0 ||
+			va.Recipient.Before != 0 || va.Recipient.After != 100 {
+			t.Fatalf("unexpected vote action receipt: %+v", va)
+		}
+		if bal, _ := s.TreasuryBalance(); bal != 0 {
+			t.Fatalf("treasury = %d, want 0", bal)
+		}
+		if bal, _ := s.Balance("new"); bal != 300 {
+			t.Fatalf("new = %d, want 300", bal)
+		}
+		again, err := s.Execute("gip-1", 999)
+		if err != nil || again.ExecutedAt != 0 {
+			t.Fatalf("retry execute: %+v err=%v", again, err)
+		}
+	})
+
+	// mutateReceipt 改写第 ri 张凭据第 ai 个动作的余额字段；
+	// value 为 nil 时删除该字段（模拟缺损凭据）。
+	mutateReceipt := func(ri, ai int, side, field string, value any) []byte {
+		var doc map[string]any
+		if err := json.Unmarshal(good, &doc); err != nil {
+			t.Fatal(err)
+		}
+		entry := doc["receipts"].([]any)[ri].(map[string]any)["actions"].([]any)[ai].(map[string]any)[side].(map[string]any)
+		if value == nil {
+			delete(entry, field)
+		} else {
+			entry[field] = value
+		}
+		raw, err := json.MarshalIndent(doc, "", "  ")
+		if err != nil {
+			t.Fatal(err)
+		}
+		return append(raw, '\n')
+	}
+
+	corruptions := []struct {
+		name string
+		raw  []byte
+		want []string
+	}{
+		// 任务示例：删除资金库侧的 after（本来应为 0）必须拒绝；
+		// 投票通过提案的凭据与登记提案适用同一规则。
+		{"treasury after missing (would be 0)", mutateReceipt(1, 0, "treasury", "after", nil),
+			[]string{`"gip-vote"`, "action 0", "treasury", `"after"`, "missing"}},
+		// 任务示例：删除收款账户侧的 before（本来应为 0）必须拒绝。
+		{"recipient before missing (would be 0)", mutateReceipt(0, 0, "recipient", "before", nil),
+			[]string{`"gip-1"`, "action 0", "recipient", `"before"`, "missing"}},
+		// 非零字段缺失适用同一规则。
+		{"treasury before missing (non-zero)", mutateReceipt(0, 0, "treasury", "before", nil),
+			[]string{`"gip-1"`, "action 0", "treasury", `"before"`, "missing"}},
+		{"recipient after missing (non-zero)", mutateReceipt(0, 1, "recipient", "after", nil),
+			[]string{`"gip-1"`, "action 1", "recipient", `"after"`, "missing"}},
+		// null 与类型不符同样不得折叠成 0。
+		{"treasury after null", mutateReceipt(0, 1, "treasury", "after", json.RawMessage("null")),
+			[]string{`"gip-1"`, "action 1", "treasury", `"after"`, "null"}},
+		{"recipient before wrong type", mutateReceipt(0, 0, "recipient", "before", "0"),
+			[]string{`"gip-1"`, "action 0", "recipient", `"before"`, "wrong type"}},
+		// 投票凭据的收款侧同样适用。
+		{"vote receipt recipient after missing", mutateReceipt(1, 0, "recipient", "after", nil),
+			[]string{`"gip-vote"`, "action 0", "recipient", `"after"`, "missing"}},
+	}
+	for _, tc := range corruptions {
+		t.Run(tc.name, func(t *testing.T) {
+			bad := filepath.Join(dir, "missing-"+strings.ReplaceAll(strings.ReplaceAll(tc.name, " ", "-"), "(", "")+".json")
+			if err := os.WriteFile(bad, tc.raw, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			s, err := Open(bad)
+			if !errors.Is(err, ErrStateCorrupt) {
+				if s != nil {
+					s.Close()
+				}
+				t.Fatalf("Open err=%v, want ErrStateCorrupt", err)
+			}
+			for _, want := range tc.want {
+				if !strings.Contains(err.Error(), want) {
+					t.Fatalf("error %q does not locate %q", err.Error(), want)
+				}
+			}
+			// 缺损凭据不被删除或重写，原文件保持原样。
+			if got, rerr := os.ReadFile(bad); rerr != nil || string(got) != string(tc.raw) {
+				t.Fatalf("corrupt file was modified")
+			}
+		})
+	}
+
+	// 打开后文件被换成缺损凭据：余额、提案、凭据查询与继续执行都失败，
+	// 不输出文件中其他正常记录的部分结果，也不改写原文件。
+	t.Run("all operations fail after corruption", func(t *testing.T) {
+		p := filepath.Join(dir, "swap.json")
+		if err := os.WriteFile(p, good, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		s, err := Open(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer s.Close()
+		corrupt := mutateReceipt(0, 0, "treasury", "after", nil)
+		if err := os.WriteFile(p, corrupt, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.BalanceSnapshot(); !errors.Is(err, ErrStateCorrupt) {
+			t.Fatalf("BalanceSnapshot err=%v, want ErrStateCorrupt", err)
+		}
+		if _, _, err := s.Proposal("gip-1"); !errors.Is(err, ErrStateCorrupt) {
+			t.Fatalf("Proposal err=%v, want ErrStateCorrupt", err)
+		}
+		if _, _, err := s.Receipt("gip-vote"); !errors.Is(err, ErrStateCorrupt) {
+			t.Fatalf("Receipt err=%v, want ErrStateCorrupt", err)
+		}
+		if _, err := s.Receipts(); !errors.Is(err, ErrStateCorrupt) {
+			t.Fatalf("Receipts err=%v, want ErrStateCorrupt", err)
+		}
+		if _, err := s.Execute("gip-1", 500); !errors.Is(err, ErrStateCorrupt) {
+			t.Fatalf("Execute err=%v, want ErrStateCorrupt", err)
+		}
+		if got, _ := os.ReadFile(p); string(got) != string(corrupt) {
+			t.Fatalf("state file was modified by rejected operations")
+		}
+	})
+}
+
 // TestTamperedReceiptBalancesRejectWithCause：凭据中资金库/收款账户的
 // 前后余额被篡改时，整份状态判为损坏，错误沿用既有原因与动作位置，
 // 原文件保持原样，不改成重算结果后继续提供查询。
