@@ -404,9 +404,30 @@ func newStoredState(treasury int64) *storedState {
 // 编号必须非空；动作列表可为空（执行时会因动作为空被拒绝），动作原文不做改写。
 // 同编号且时间锁、动作原文与首次登记完全相同的重试返回 existed=true；
 // 内容不同则返回 ErrProposalConflict。
+//
+// 提案编号与每一项动作原文还必须是合法 UTF-8：状态文件以 JSON 保存，
+// encoding/json 会把字符串中的非法 UTF-8 字节悄悄改写成替换字符 U+FFFD
+// 且不报错。登记入口若放行，落盘的编号/动作原文就不再是用户提交的原文——
+// 原编号无法查询，收款账户名称与原文不同。因此这两类文本在一切落盘之前
+// 逐字校验，非法输入整项登记失败（ErrInvalidRegistration），不新增提案、
+// 不保存部分动作；错误说明是编号还是动作原文，动作出错时指出它在提交
+// 列表中的位置（0 起）。即使非法输入改写后恰好等于状态中已存在的合法
+// 编号（如含真实 U+FFFD 的编号），也不被当作该编号的成功重试或内容冲突。
+// 合法文本（含中文、表情、用户明确写出的 U+FFFD，以及 "\uD800" 这类
+// 由反斜杠与普通字母组成的字面文本——登记参数不是 JSON 字符串，不做
+// 转义重解释）原样保留。编码合法但转账格式错误的动作照常登记，
+// 由执行操作按现有规则拒绝。
 func (s *Store) Register(id string, timelockEnd int64, actions []string) (existed bool, err error) {
 	if id == "" {
 		return false, fmt.Errorf("%w: proposal id must not be empty", ErrInvalidRegistration)
+	}
+	if problem := invalidUTF8(id); problem != "" {
+		return false, fmt.Errorf("%w: proposal id is not valid UTF-8: %s", ErrInvalidRegistration, problem)
+	}
+	for i, action := range actions {
+		if problem := invalidUTF8(action); problem != "" {
+			return false, fmt.Errorf("%w: action %d text is not valid UTF-8: %s", ErrInvalidRegistration, i, problem)
+		}
 	}
 	commit, err := s.begin()
 	if err != nil {

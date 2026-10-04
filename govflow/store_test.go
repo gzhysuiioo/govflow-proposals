@@ -102,6 +102,121 @@ func TestRegisterIdempotentAndConflict(t *testing.T) {
 	}
 }
 
+// TestRegisterRejectsInvalidUTF8：提案编号或任意一项动作原文含有非法 UTF-8
+// 字节（非法首字节、残缺多字节序列、UTF-8 形式直接编码的代理码位）时整项
+// 登记失败，错误分类为 ErrInvalidRegistration，且说明是编号还是动作原文、
+// 动作在提交列表中的位置（0 起）；状态文件逐字节保持原样，不新增提案。
+func TestRegisterRejectsInvalidUTF8(t *testing.T) {
+	store, path := openTempStore(t, 1000)
+	defer store.Close()
+
+	// 状态中先存在一项编号含真实 U+FFFD 的合法提案与一项普通提案，
+	// 验证失败不重试/覆盖已有内容，已有提案与余额不受影响。
+	mustRegister(t, store, "gip-�", 100, "transfer:audits:10")
+	mustRegister(t, store, "gip-ok", 100, "transfer:legal:5")
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read state: %v", err)
+	}
+
+	cases := []struct {
+		name      string
+		id        string
+		actions   []string
+		wantInErr []string
+	}{
+		{"proposal id illegal byte", "gip-\xff", []string{"transfer:a:1"}, []string{"proposal id", "UTF-8"}},
+		{"proposal id truncated rune", "gip-\xe4\xb8", []string{"transfer:a:1"}, []string{"proposal id", "UTF-8"}}, // “中”缺少最后一个字节
+		{"proposal id encoded surrogate", "gip-\xed\xa0\x80", []string{"transfer:a:1"}, []string{"proposal id", "UTF-8"}}, // UTF-8 形式直接编码的 U+D800
+		{"action text illegal byte", "gip-bad-a0", []string{"transfer:audits:\xff"}, []string{"action 0", "UTF-8"}},
+		{"action text truncated rune", "gip-bad-a1", []string{"transfer:a:1", "\xf0\x9f\x98"}, []string{"action 1", "UTF-8"}}, // 表情缺少最后一个字节
+		{"action text encoded surrogate", "gip-bad-a2", []string{"ok", "also-ok", "\xed\xb0\x80"}, []string{"action 2", "UTF-8"}}, // UTF-8 形式直接编码的 U+DC00
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			existed, err := store.Register(tc.id, 100, tc.actions)
+			if err == nil || existed {
+				t.Fatalf("expected rejection, existed=%v err=%v", existed, err)
+			}
+			if !errors.Is(err, ErrInvalidRegistration) {
+				t.Fatalf("err=%v, want ErrInvalidRegistration", err)
+			}
+			for _, want := range tc.wantInErr {
+				if !strings.Contains(err.Error(), want) {
+					t.Fatalf("err=%q, want substring %q", err.Error(), want)
+				}
+			}
+		})
+	}
+
+	// 非法字节输入落盘时会被改写成真实 U+FFFD，恰好等于已存在的合法编号：
+	// 仍必须整项失败（ErrInvalidRegistration），不得当作该编号的相同内容重试，
+	// 也不得报普通内容冲突。
+	if existed, err := store.Register("gip-\xef\xbf", 100, []string{"transfer:audits:10"}); err == nil || existed ||
+		!errors.Is(err, ErrInvalidRegistration) {
+		t.Fatalf("invalid-UTF-8 collision with real U+FFFD id: existed=%v err=%v", existed, err)
+	}
+	// 提交的动作与已有登记只有一处非法字节不同：同样是编码错误，不是内容冲突。
+	if existed, err := store.Register("gip-ok", 100, []string{"transfer:legal:\xff"}); err == nil || existed ||
+		!errors.Is(err, ErrInvalidRegistration) {
+		t.Fatalf("invalid action against existing id: existed=%v err=%v", existed, err)
+	}
+
+	// 状态文件逐字节保持原样；已有合法提案仍可按原编号查询。
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read state: %v", err)
+	}
+	if string(after) != string(before) {
+		t.Fatalf("state file changed after rejected registrations")
+	}
+	record, ok, err := store.Proposal("gip-�")
+	if err != nil || !ok || record.ID != "gip-�" {
+		t.Fatalf("existing U+FFFD proposal: ok=%v err=%v record=%+v", ok, err, record)
+	}
+	if bal, err := store.TreasuryBalance(); err != nil || bal != 1000 {
+		t.Fatalf("treasury changed: bal=%d err=%v", bal, err)
+	}
+}
+
+// TestRegisterPreservesValidText：中文、表情、用户明确写出的 U+FFFD 以及
+// 由反斜杠与普通字母组成的字面文本（如 "\uD800"：登记参数不是 JSON 字符串，
+// 不得把其中看似 Unicode 转义的文字重解释成字符）都按原文保存与展示。
+// 编码合法但转账格式错误的动作照常登记，由执行操作按现有规则拒绝。
+func TestRegisterPreservesValidText(t *testing.T) {
+	store, _ := openTempStore(t, 1000)
+	defer store.Close()
+
+	id := "提案-�-😀"
+	actions := []string{
+		"transfer:账户:100",
+		"transfer:smi�le-😀:50",
+		`transfer:back\uD800slash:1`, // 反斜杠 + 普通字母的字面文本
+		"not-a-transfer",             // 编码合法但格式错误：登记时不拒绝
+	}
+	mustRegister(t, store, id, 100, actions...)
+
+	// 相同内容的合法重试仍返回已有登记。
+	existed, err := store.Register(id, 100, actions)
+	if err != nil || !existed {
+		t.Fatalf("identical retry existed=%v err=%v", existed, err)
+	}
+
+	record, ok, err := store.Proposal(id)
+	if err != nil || !ok {
+		t.Fatalf("query %q: ok=%v err=%v", id, ok, err)
+	}
+	if record.ID != id || len(record.Actions) != len(actions) {
+		t.Fatalf("unexpected record: %+v", record)
+	}
+	for i, action := range actions {
+		if record.Actions[i] != action {
+			t.Fatalf("action %d = %q, want %q", i, record.Actions[i], action)
+		}
+	}
+}
+
+
 func TestExecuteHappyPathAndReceiptShape(t *testing.T) {
 	store, _ := openTempStore(t, 1000)
 	defer store.Close()
