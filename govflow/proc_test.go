@@ -734,3 +734,289 @@ func TestCLIRejectsIncompleteReceiptOrderIndex(t *testing.T) {
 		})
 	}
 }
+
+// createVoteArgs 汇集一次 create-vote 的参数，便于在各用例间只替换委托原文。
+type createVoteArgs struct {
+	id        string
+	members   []string // 每项形如 ID:WEIGHT，ID 自身可含冒号
+	delegates []string // 委托原文 FROM:TO，切分点由名单唯一确定
+	quorum    string
+}
+
+func runCreateVote(t *testing.T, binary, state string, a createVoteArgs) (string, string, int) {
+	t.Helper()
+	args := []string{"create-vote", "--id", a.id}
+	for _, m := range a.members {
+		args = append(args, "--member", m)
+	}
+	for _, d := range a.delegates {
+		args = append(args, "--delegate", d)
+	}
+	args = append(args, "--quorum", a.quorum, "--start", "0", "--deadline", "100", "--timelock", "200",
+		"--action", "transfer:audits:10")
+	return runCLI(t, binary, state, args...)
+}
+
+// TestCLIColonsInMemberIDs：成员编号允许冒号出现在开头（":alice"）或中间
+// （"team:bob"）。委托原文 ":alice:team:bob" 必须被理解为 :alice 把权重
+// 委托给 team:bob，而不是按第一个冒号误切成空委托人。查询完整保留两个编号
+// 与委托路径；team:bob 作为最终代表投出票重 100，:alice 已委托出去不能直投。
+func TestCLIColonsInMemberIDs(t *testing.T) {
+	binary := buildCLI(t)
+	state := filepath.Join(t.TempDir(), "treasury.json")
+	if _, _, code := runCLI(t, binary, state, "init", "--balance", "1000"); code != 0 {
+		t.Fatal("init failed")
+	}
+	base := createVoteArgs{
+		id:        "gip-colon",
+		members:   []string{":alice:70", "team:bob:30"},
+		delegates: []string{":alice:team:bob"},
+		quorum:    "100",
+	}
+	if _, se, code := runCreateVote(t, binary, state, base); code != 0 {
+		t.Fatalf("create with colon-leading delegator failed, exit=%d: %s", code, se)
+	}
+
+	// 文本查询：两个编号逐字保留，委托路径从 :alice 到 team:bob。
+	so, se, code := runCLI(t, binary, state, "proposal", "--id", base.id)
+	if code != 0 {
+		t.Fatalf("text proposal query exit=%d: %s", code, se)
+	}
+	for _, want := range []string{
+		"member :alice weight=70 path=:alice->team:bob",
+		"member team:bob weight=30 representative=self",
+	} {
+		if !strings.Contains(so, want) {
+			t.Fatalf("text query missing %q:\n%s", want, so)
+		}
+	}
+
+	// JSON 查询：编号大小写、冒号位置逐字保留，路径含首尾两个完整编号。
+	jo, je, jcode := runCLI(t, binary, state, "proposal", "--id", base.id, "--json")
+	if jcode != 0 {
+		t.Fatalf("json proposal query exit=%d: %s", jcode, je)
+	}
+	for _, want := range []string{
+		`"id": ":alice"`,
+		`"id": "team:bob"`,
+		`"path": [
+        ":alice",
+        "team:bob"
+      ]`,
+		`"delegate": "team:bob"`,
+		`"direct_to": "team:bob"`,
+	} {
+		if !strings.Contains(jo, want) {
+			t.Fatalf("json query missing %q:\n%s", want, jo)
+		}
+	}
+
+	// 最终代表 team:bob 代表沿途全部 70+30=100 权重投票。
+	if vo, ve, vcode := runCLI(t, binary, state, "vote", "--id", base.id,
+		"--voter", "team:bob", "--choice", "for", "--now", "50", "--json"); vcode != 0 ||
+		!strings.Contains(vo, `"representative": "team:bob"`) || !strings.Contains(vo, `"weight": 100`) {
+		t.Fatalf("team:bob vote exit=%d so=%s se=%s", vcode, vo, ve)
+	}
+	// :alice 已委托出去，直接投票被域错误拒绝。
+	if _, ve, vcode := runCLI(t, binary, state, "vote", "--id", base.id,
+		"--voter", ":alice", "--choice", "for", "--now", "50"); vcode != 1 ||
+		!strings.Contains(ve, "may not vote directly") {
+		t.Fatalf(":alice direct vote exit=%d want 1: %s", vcode, ve)
+	}
+	// 计票：100 赞成达到法定人数 => passed；结论中代表编号完整。
+	if to, te, tcode := runCLI(t, binary, state, "tally", "--id", base.id, "--now", "100", "--json"); tcode != 0 ||
+		!strings.Contains(to, `"passed": true`) || !strings.Contains(to, `"for_weight": 100`) {
+		t.Fatalf("tally exit=%d so=%s se=%s", tcode, to, te)
+	}
+}
+
+// TestCLIDelegationColonParsing：委托原文在冒号出现在开头、末尾、连续出现时
+// 的失败分类与成功识别。判定只依据切分语法与成员名单：
+//   - 无冒号，或不存在两端均非空的写法：格式错误，退出码 2；
+//   - 有非空写法但没有任何一对都在名单：退出码 1；
+//   - 两对或更多同时命中（含某种解释为自委托）：歧义，退出码 2 并列出成员对；
+//   - 唯一确定成员对之后，自委托、循环仍按业务规则拒绝（退出码 1）。
+func TestCLIDelegationColonParsing(t *testing.T) {
+	binary := buildCLI(t)
+	state := filepath.Join(t.TempDir(), "treasury.json")
+	if _, _, code := runCLI(t, binary, state, "init", "--balance", "1000"); code != 0 {
+		t.Fatal("init failed")
+	}
+
+	cases := []struct {
+		name      string
+		id        string
+		members   []string
+		delegates []string
+		wantCode  int
+		wantMsgs  []string // stderr 必须包含的片段
+	}{
+		{
+			name:      "ambiguous two roster pairs",
+			id:        "gip-amb",
+			members:   []string{"a:10", "a:b:10", "b:c:10", "c:10"},
+			delegates: []string{"a:b:c"}, // (a)->(b:c) 与 (a:b)->(c) 同时命中
+			wantCode:  2,
+			wantMsgs:  []string{"ambiguous", `"a:b:c"`, `"a" delegating to "b:c"`, `"a:b" delegating to "c"`},
+		},
+		{
+			name:      "ambiguous even though one reading is self-delegation",
+			id:        "gip-amb-self",
+			members:   []string{"a:10", "a:b:10", "b:a:b:10"},
+			delegates: []string{"a:b:a:b"}, // (a)->(b:a:b) 与 (a:b)->(a:b)（自委托）同时命中
+			wantCode:  2,
+			wantMsgs:  []string{"ambiguous", `"a" delegating to "b:a:b"`, `"a:b" delegating to "a:b"`},
+		},
+		{
+			name:      "no colon at all is a format error",
+			id:        "gip-nocolon",
+			members:   []string{"a:10"},
+			delegates: []string{"nocolon"},
+			wantCode:  2,
+			wantMsgs:  []string{"malformed", `"nocolon"`},
+		},
+		{
+			name:      "only a leading colon has no non-empty split",
+			id:        "gip-leading",
+			members:   []string{"alice:10"}, // 注意名单里没有 ":alice"
+			delegates: []string{":alice"},
+			wantCode:  2,
+			wantMsgs:  []string{"malformed", `":alice"`},
+		},
+		{
+			name:      "trailing colon still has a non-empty split but no roster match",
+			id:        "gip-trailing",
+			members:   []string{"a:10", "b:10"},
+			delegates: []string{"a:b:"}, // (a)->(b:) 非空但不命中；结尾切分空 to 不算写法
+			wantCode:  1,
+			wantMsgs:  []string{"does not match any pair of members", `"a:b:"`},
+		},
+		{
+			name:      "well-formed split matching nobody is a domain error",
+			id:        "gip-nomatch",
+			members:   []string{"a:10"},
+			delegates: []string{"zzz:yyy"},
+			wantCode:  1,
+			wantMsgs:  []string{"does not match any pair of members", `"zzz:yyy"`},
+		},
+		{
+			name:      "unique self-delegation stays rejected after identification",
+			id:        "gip-self",
+			members:   []string{"a:b:10"},
+			delegates: []string{"a:b:a:b"}, // 唯一命中 (a:b)->(a:b)
+			wantCode:  1,
+			wantMsgs:  []string{"must not delegate to itself"},
+		},
+		{
+			name:      "unique cycle stays rejected after identification",
+			id:        "gip-cycle",
+			members:   []string{"a:b:10", "c:a:10"},
+			delegates: []string{"a:b:c:a", "c:a:a:b"}, // (a:b)->(c:a)->(a:b) 成环
+			wantCode:  1,
+			wantMsgs:  []string{"delegation cycle"},
+		},
+		{
+			name:      "case variant must not match a colon-leading member",
+			id:        "gip-case",
+			members:   []string{":Alice:70", "team:bob:30"},
+			delegates: []string{":alice:team:bob"},
+			wantCode:  1,
+			wantMsgs:  []string{"does not match any pair of members"},
+		},
+		{
+			name:      "deleted character must not match",
+			id:        "gip-delchar",
+			members:   []string{":alice:70", "team:bob:30"},
+			delegates: []string{"alic:team:bob"},
+			wantCode:  1,
+			wantMsgs:  []string{"does not match any pair of members"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			a := createVoteArgs{id: tc.id, members: tc.members, delegates: tc.delegates, quorum: "1"}
+			_, se, code := runCreateVote(t, binary, state, a)
+			if code != tc.wantCode {
+				t.Fatalf("exit=%d want %d, stderr=%s", code, tc.wantCode, se)
+			}
+			for _, want := range tc.wantMsgs {
+				if !strings.Contains(se, want) {
+					t.Fatalf("stderr %q missing %q", se, want)
+				}
+			}
+		})
+	}
+
+	// 连续冒号：编号 "a:"（冒号结尾）与 ":b"（冒号开头）经原文 "a:::b"
+	// 唯一切成 (a:)->(:b)，委托创建成功且查询逐字保留两个编号。
+	ok := createVoteArgs{
+		id:        "gip-dcolon",
+		members:   []string{"a::10", ":b:10"},
+		delegates: []string{"a:::b"},
+		quorum:    "1",
+	}
+	if _, se, code := runCreateVote(t, binary, state, ok); code != 0 {
+		t.Fatalf("consecutive-colon delegation exit=%d: %s", code, se)
+	}
+	if so, _, code := runCLI(t, binary, state, "proposal", "--id", ok.id); code != 0 ||
+		!strings.Contains(so, "member a: weight=10 path=a:->:b") ||
+		!strings.Contains(so, "member :b weight=10 representative=self") {
+		t.Fatalf("consecutive-colon query exit=%d:\n%s", code, so)
+	}
+
+	// 上面所有失败创建都不得留下提案，也不得改变资金库余额。
+	so, _, code := runCLI(t, binary, state, "proposals", "--json")
+	if code != 0 {
+		t.Fatalf("proposals query failed")
+	}
+	for _, rejected := range []string{"gip-amb", "gip-amb-self", "gip-nocolon", "gip-leading",
+		"gip-trailing", "gip-nomatch", "gip-self", "gip-cycle", "gip-case", "gip-delchar"} {
+		if strings.Contains(so, rejected) {
+			t.Fatalf("rejected proposal %q must not be persisted:\n%s", rejected, so)
+		}
+	}
+	if bo, _, code := runCLI(t, binary, state, "balances", "--json"); code != 0 ||
+		!strings.Contains(bo, `"treasury": 1000`) {
+		t.Fatalf("treasury changed after failed creates:\n%s", bo)
+	}
+}
+
+// TestCLIDelegationParamOrderIrrelevant：成员与委托参数的排列先后（包括
+// --delegate 整体出现在 --member 之前、成员与委托各自换序）不改变同一项
+// 委托的含义，相同内容重试幂等返回且不改动状态。
+func TestCLIDelegationParamOrderIrrelevant(t *testing.T) {
+	binary := buildCLI(t)
+	state := filepath.Join(t.TempDir(), "treasury.json")
+	if _, _, code := runCLI(t, binary, state, "init", "--balance", "1000"); code != 0 {
+		t.Fatal("init failed")
+	}
+	first := []string{"create-vote", "--id", "gip-order",
+		"--member", ":alice:70", "--member", "team:bob:30",
+		"--delegate", ":alice:team:bob",
+		"--quorum", "100", "--start", "0", "--deadline", "100", "--timelock", "200"}
+	if _, se, code := runCLI(t, binary, state, first...); code != 0 {
+		t.Fatalf("first create exit=%d: %s", code, se)
+	}
+	// 成员换序、委托标记出现在成员之前，内容仍逐项相同。
+	second := []string{"create-vote", "--id", "gip-order",
+		"--delegate", ":alice:team:bob",
+		"--member", "team:bob:30", "--member", ":alice:70",
+		"--quorum", "100", "--start", "0", "--deadline", "100", "--timelock", "200"}
+	if so, se, code := runCLI(t, binary, state, second...); code != 0 ||
+		!strings.Contains(so, "already exists") {
+		t.Fatalf("reordered identical retry should be idempotent, exit=%d so=%s se=%s", code, so, se)
+	}
+	// 普通不含冒号的编号继续按原有方式工作，且冒号编号与普通编号可混用。
+	mixed := []string{"create-vote", "--id", "gip-mixed",
+		"--member", "plain:40", "--member", ":alice:30", "--member", "team:bob:30",
+		"--delegate", ":alice:team:bob", "--delegate", "plain:team:bob",
+		"--quorum", "100", "--start", "0", "--deadline", "100", "--timelock", "200"}
+	if _, se, code := runCLI(t, binary, state, mixed...); code != 0 {
+		t.Fatalf("mixed plain/colon members create exit=%d: %s", code, se)
+	}
+	if vo, _, code := runCLI(t, binary, state, "vote", "--id", "gip-mixed",
+		"--voter", "team:bob", "--choice", "for", "--now", "50", "--json"); code != 0 ||
+		!strings.Contains(vo, `"weight": 100`) {
+		t.Fatalf("team:bob should carry all 100 weight: exit=%d so=%s", code, vo)
+	}
+}

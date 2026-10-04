@@ -260,12 +260,21 @@ type delegationUsageError struct{ reason string }
 func (e *delegationUsageError) Error() string { return e.reason }
 
 // resolveDelegations 结合本次提交的完整成员名单理解每条 FROM:TO 委托原文。
-// 成员编号保持原文并区分大小写；编号可含冒号，所以一条委托原文在每个冒号
-// 位置都有一种候选切分。恰好一种切分让两端都是名单成员时按该对成员创建委托；
-// 多种切分都成立时该委托有歧义，整项拒绝（参数错误），不能默认选择任意一对，
-// 也不拿自委托/重复/循环等业务规则替用户消除歧义；格式正确但没有任何切分
-// 能匹配名单时按域错误拒绝并指出无法匹配的参数。成员与委托参数在命令行上的
-// 排列先后不影响结果：解析前名单已收集完毕。
+// 成员编号保持原文并区分大小写；编号可含冒号，且冒号可以出现在编号开头、
+// 末尾或连续出现（如 ":alice"、"a:"、"a::b"），所以一条委托原文在每个冒号
+// 位置都有一种候选切分，切分点两侧的编号仍须各自非空。
+//
+// 判定只依据“两端非空”这一纯语法条件与成员名单，不拿自委托/重复/循环等
+// 业务规则替用户筛选候选：
+//   - 原文不含冒号，或每个冒号位置的切分都会让某一端为空（如 ":alice"、
+//     "alice:"、":"、"::"：冒号只出现在首尾、中间再无切分点）：格式错误，
+//     参数错误（退出码 2）；
+//   - 存在两端非空的切分，但没有任何一对都在名单里：域错误（退出码 1）；
+//   - 两对或更多成员同时命中（即使其中某种解释随后会触发自委托、重复或循环）：
+//     委托有歧义，参数错误（退出码 2），错误列出有歧义的原文与全部成员对；
+//   - 恰好一对命中：按该对成员创建委托。
+//
+// 成员与委托参数在命令行上的排列先后不影响结果：解析前名单已收集完毕。
 func resolveDelegations(members []govflow.VoteMember, raws []string) ([]govflow.Delegation, error) {
 	roster := make(map[string]bool, len(members))
 	for _, m := range members {
@@ -273,18 +282,27 @@ func resolveDelegations(members []govflow.VoteMember, raws []string) ([]govflow.
 	}
 	out := make([]govflow.Delegation, 0, len(raws))
 	for _, raw := range raws {
-		from, to, ok := strings.Cut(raw, ":")
-		if !ok || from == "" || to == "" {
-			return nil, &delegationUsageError{fmt.Sprintf("malformed delegation %q, expected FROM:TO", raw)}
-		}
 		var matches []govflow.Delegation
+		hasNonEmptySplit := false
 		for i := 0; i < len(raw); i++ {
 			if raw[i] != ':' {
 				continue
 			}
-			if f, t := raw[:i], raw[i+1:]; roster[f] && roster[t] {
-				matches = append(matches, govflow.Delegation{From: f, To: t})
+			from, to := raw[:i], raw[i+1:]
+			// 纯语法候选：切分点两侧都非空才算“存在 FROM:TO 写法”。
+			// 编号本身允许以冒号开头、结尾或包含连续冒号，因此位于位置 0
+			// 的冒号产生的空 from、以及结尾冒号产生的空 to 都只是不合法的
+			// 切分点之一，绝不据此提前拒绝整条原文——其他冒号位置仍可能合法。
+			if from == "" || to == "" {
+				continue
 			}
+			hasNonEmptySplit = true
+			if roster[from] && roster[to] {
+				matches = append(matches, govflow.Delegation{From: from, To: to})
+			}
+		}
+		if !hasNonEmptySplit {
+			return nil, &delegationUsageError{fmt.Sprintf("malformed delegation %q, expected FROM:TO with non-empty member ids on both sides", raw)}
 		}
 		switch len(matches) {
 		case 0:
