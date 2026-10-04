@@ -3,6 +3,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -240,17 +241,66 @@ func splitMember(raw string) (string, int64, error) {
 	return id, weight, nil
 }
 
-// delegationList 收集重复的 --delegate FROM:TO 参数，保持提交顺序。
-type delegationList []govflow.Delegation
+// delegationList 收集重复的 --delegate FROM:TO 参数原文，保持提交顺序。
+// 成员编号本身可含冒号（如 team:alice），FROM 与 TO 两端都可能含冒号，
+// 因此不能在解析单个参数时切分：必须等完整成员名单齐备后，
+// 由 resolveDelegations 结合名单确定唯一的切分点。
+type delegationList []string
 
-func (d *delegationList) String() string { return fmt.Sprint([]govflow.Delegation(*d)) }
+func (d *delegationList) String() string { return fmt.Sprint([]string(*d)) }
 func (d *delegationList) Set(v string) error {
-	from, to, ok := strings.Cut(v, ":")
-	if !ok || from == "" || to == "" {
-		return fmt.Errorf("malformed delegation %q, expected FROM:TO", v)
-	}
-	*d = append(*d, govflow.Delegation{From: from, To: to})
+	*d = append(*d, v)
 	return nil
+}
+
+// delegationUsageError 是 --delegate 的参数错误（格式错误或切分有歧义），
+// 以退出码 2 结束；格式正确但无法匹配名单的错误不属于此类，按域错误退出码 1 处理。
+type delegationUsageError struct{ reason string }
+
+func (e *delegationUsageError) Error() string { return e.reason }
+
+// resolveDelegations 结合本次提交的完整成员名单理解每条 FROM:TO 委托原文。
+// 成员编号保持原文并区分大小写；编号可含冒号，所以一条委托原文在每个冒号
+// 位置都有一种候选切分。恰好一种切分让两端都是名单成员时按该对成员创建委托；
+// 多种切分都成立时该委托有歧义，整项拒绝（参数错误），不能默认选择任意一对，
+// 也不拿自委托/重复/循环等业务规则替用户消除歧义；格式正确但没有任何切分
+// 能匹配名单时按域错误拒绝并指出无法匹配的参数。成员与委托参数在命令行上的
+// 排列先后不影响结果：解析前名单已收集完毕。
+func resolveDelegations(members []govflow.VoteMember, raws []string) ([]govflow.Delegation, error) {
+	roster := make(map[string]bool, len(members))
+	for _, m := range members {
+		roster[m.ID] = true
+	}
+	out := make([]govflow.Delegation, 0, len(raws))
+	for _, raw := range raws {
+		from, to, ok := strings.Cut(raw, ":")
+		if !ok || from == "" || to == "" {
+			return nil, &delegationUsageError{fmt.Sprintf("malformed delegation %q, expected FROM:TO", raw)}
+		}
+		var matches []govflow.Delegation
+		for i := 0; i < len(raw); i++ {
+			if raw[i] != ':' {
+				continue
+			}
+			if f, t := raw[:i], raw[i+1:]; roster[f] && roster[t] {
+				matches = append(matches, govflow.Delegation{From: f, To: t})
+			}
+		}
+		switch len(matches) {
+		case 0:
+			return nil, fmt.Errorf("delegation %q does not match any pair of members on the roster", raw)
+		case 1:
+			out = append(out, matches[0])
+		default:
+			pairs := make([]string, len(matches))
+			for i, m := range matches {
+				pairs[i] = fmt.Sprintf("%q delegating to %q", m.From, m.To)
+			}
+			return nil, &delegationUsageError{fmt.Sprintf("ambiguous delegation %q: could mean %s",
+				raw, strings.Join(pairs, " or "))}
+		}
+	}
+	return out, nil
 }
 
 func runCreateVote(args []string) {
@@ -258,8 +308,8 @@ func runCreateVote(args []string) {
 	id := cf.fs.String("id", "", "proposal id (non-empty)")
 	var members memberList
 	cf.fs.Var(&members, "member", "member ID:WEIGHT with positive int64 weight (repeatable, order irrelevant to equality)")
-	var delegations delegationList
-	cf.fs.Var(&delegations, "delegate", "delegation FROM:TO (repeatable, order irrelevant to equality)")
+	var delegationRaws delegationList
+	cf.fs.Var(&delegationRaws, "delegate", "delegation FROM:TO (repeatable, order irrelevant to equality; either side may itself contain colons and is matched against the full member roster)")
 	quorumRaw := cf.fs.String("quorum", "", "required turnout weight between 1 and total member weight")
 	startRaw := cf.fs.String("start", "", "voting start timestamp (int64, >= 0)")
 	deadlineRaw := cf.fs.String("deadline", "", "voting deadline timestamp (int64, > start)")
@@ -279,6 +329,18 @@ func runCreateVote(args []string) {
 		fmt.Fprintf(os.Stderr, "usage error: at least one --member ID:WEIGHT is required\n")
 		os.Exit(2)
 	}
+	// 委托切分依赖完整成员名单，必须在打开状态文件之前完成：
+	// 格式错误与歧义是参数错误（退出码 2），无法匹配名单是域错误（退出码 1），
+	// 两种失败都不触碰已有状态文件。
+	delegations, derr := resolveDelegations([]govflow.VoteMember(members), []string(delegationRaws))
+	if derr != nil {
+		var usageErr *delegationUsageError
+		if errors.As(derr, &usageErr) {
+			fmt.Fprintf(os.Stderr, "usage error: %v\n", derr)
+			os.Exit(2)
+		}
+		fail(derr)
+	}
 
 	store, err := govflow.Open(cf.state)
 	if err != nil {
@@ -288,7 +350,7 @@ func runCreateVote(args []string) {
 	in := &govflow.CreateVoteInput{
 		ID:          *id,
 		Members:     []govflow.VoteMember(members),
-		Delegations: []govflow.Delegation(delegations),
+		Delegations: delegations,
 		Quorum:      quorum,
 		StartAt:     start,
 		Deadline:    deadline,
