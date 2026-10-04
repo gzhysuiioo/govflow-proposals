@@ -1,6 +1,7 @@
 package govflow
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"math"
@@ -656,6 +657,208 @@ func TestVotedProposalExecutesThroughExecute(t *testing.T) {
 	}
 	if _, err := bad.Execute("gip-rej", 300); !errors.Is(err, ErrExecutionRejected) {
 		t.Fatalf("execute rejected proposal: %v", err)
+	}
+}
+
+// TestCreateRetryAfterExecutedKeepsExecution：同一提案已投票通过并完成资金库
+// 转账后，再次提交原创建内容必须仍是“已存在”的幂等重试，而不是新建一项投票中
+// 提案。重试不能清空委托路径、投票明细与首次计票结论，也不能重新赋予提案一次
+// 转账机会；动作仅交换顺序（同一收款账户、金额不同、合计不变）仍属内容冲突，
+// 该失败同样不得改动已执行状态、投票与计票记录、原动作列表、余额与唯一一份
+// 执行凭据。
+func TestCreateRetryAfterExecutedKeepsExecution(t *testing.T) {
+	store, path := openTempStore(t, 1000)
+	defer store.Close()
+
+	const id = "gip-reexec"
+	in := &CreateVoteInput{
+		ID: id,
+		// 原始成员顺序 a,b,c,d,e；a→b→c 与 d→c 汇入最终代表 c，e 自代。
+		Members: []VoteMember{
+			{ID: "a", Weight: 1}, {ID: "b", Weight: 2}, {ID: "c", Weight: 4},
+			{ID: "d", Weight: 8}, {ID: "e", Weight: 16},
+		},
+		Delegations: []Delegation{{From: "a", To: "b"}, {From: "b", To: "c"}, {From: "d", To: "c"}},
+		Quorum:      15,
+		StartAt:     0,
+		Deadline:    10,
+		TimelockEnd: 10,
+		// 同一收款账户、金额不同的两笔动作；动作顺序是创建内容的一部分。
+		Actions: []string{"transfer:audits:100", "transfer:audits:50"},
+	}
+	mustCreateVote(t, store, in)
+	// c 归集 a+b+c+d=15，恰好达到法定人数 15 且赞成严格多于反对 => 通过。
+	if _, err := store.CastVote(id, "c", true, 5); err != nil {
+		t.Fatalf("CastVote: %v", err)
+	}
+	tally, err := store.TallyVote(id, 10)
+	if err != nil || !tally.Passed || tally.ForWeight != 15 || tally.AgainstWeight != 0 || tally.Turnout != 15 {
+		t.Fatalf("TallyVote = %+v err=%v", tally, err)
+	}
+	rcpt0, err := store.Execute(id, 10)
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	assertFirstExecutionReceipt(t, rcpt0, id)
+
+	// 记录首次执行后的状态文件字节：任何创建重试（成功或冲突）都不应触发重写。
+	persisted, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read state: %v", err)
+	}
+
+	// 相同内容重试：成员名单与委托条目换序，但编号、权重、委托关系及其余创建
+	// 内容完全相同——仍是同一次创建。
+	retry := &CreateVoteInput{
+		ID: id,
+		Members: []VoteMember{
+			{ID: "e", Weight: 16}, {ID: "d", Weight: 8}, {ID: "c", Weight: 4},
+			{ID: "b", Weight: 2}, {ID: "a", Weight: 1},
+		},
+		Delegations: []Delegation{{From: "d", To: "c"}, {From: "a", To: "b"}, {From: "b", To: "c"}},
+		Quorum:      15,
+		StartAt:     0,
+		Deadline:    10,
+		TimelockEnd: 10,
+		Actions:     []string{"transfer:audits:100", "transfer:audits:50"},
+	}
+	view, existed, err := store.CreateVoteProposal(retry)
+	if err != nil || !existed {
+		t.Fatalf("same-content retry after execution: existed=%v err=%v", existed, err)
+	}
+	// 返回的是已执行的原提案，而不是新建的投票中提案。
+	if view.State != "executed" {
+		t.Fatalf("retry view state=%q, want executed", view.State)
+	}
+	// 返回与查询展示的成员次序来自原提案，换序重排不得生效。
+	if ids := memberIDs(view.Members); !equalStrings(ids, []string{"a", "b", "c", "d", "e"}) {
+		t.Fatalf("retry reordered members: %v", ids)
+	}
+	// 多人连续委托给最终代表时仍展示完整委托路径，中间成员不能被省略。
+	assertMemberViews(t, "retry after execution", memberPaths(view), map[string]MemberView{
+		"a": {ID: "a", Weight: 1, Path: []string{"a", "b", "c"}, Delegate: "c", Direct: "b"},
+		"b": {ID: "b", Weight: 2, Path: []string{"b", "c"}, Delegate: "c", Direct: "c"},
+		"c": {ID: "c", Weight: 4, Path: []string{"c"}, Delegate: "c"},
+		"d": {ID: "d", Weight: 8, Path: []string{"d", "c"}, Delegate: "c", Direct: "c"},
+		"e": {ID: "e", Weight: 16, Path: []string{"e"}, Delegate: "e"},
+	})
+	// 投票明细保留：最终代表、归集票重、赞成选择与首次投票时间。
+	if len(view.Ballots) != 1 {
+		t.Fatalf("ballot count=%d, want 1", len(view.Ballots))
+	}
+	ballot := view.Ballots[0]
+	if ballot.Representative != "c" || ballot.Weight != 15 || !ballot.Support || ballot.VotedAt != 5 {
+		t.Fatalf("ballot after retry = %+v, want {representative:c weight:15 support:true voted_at:5}", ballot)
+	}
+	// 首次计票结论保留：计票权重、通过结论与首次计票时间。
+	if view.Tally == nil || !view.Tally.Passed || view.Tally.ForWeight != 15 ||
+		view.Tally.AgainstWeight != 0 || view.Tally.Turnout != 15 || view.Tally.Quorum != 15 ||
+		view.Tally.TalliedAt != 10 {
+		t.Fatalf("tally after retry = %+v, want passed for=15 against=0 turnout=15 tallied_at=10", view.Tally)
+	}
+	// 原动作原文与次序保留。
+	if !sameActions(view.Actions, in.Actions) {
+		t.Fatalf("actions after retry = %v, want %v", view.Actions, in.Actions)
+	}
+	// 查询展示与重试返回一致，仍对应同一次执行。
+	query, ok, err := store.VoteProposal(id)
+	if err != nil || !ok {
+		t.Fatalf("VoteProposal: ok=%v err=%v", ok, err)
+	}
+	if query.State != "executed" || !equalStrings(memberIDs(query.Members), memberIDs(view.Members)) ||
+		len(query.Ballots) != 1 || query.Ballots[0] != ballot || !sameActions(query.Actions, in.Actions) {
+		t.Fatalf("query after retry diverges from retry view: %+v", query)
+	}
+	if query.Tally == nil || !query.Tally.Passed || query.Tally.TalliedAt != 10 {
+		t.Fatalf("query tally after retry = %+v", query.Tally)
+	}
+
+	// 重试没有重新赋予转账机会：再次执行仍返回首次凭据，不产生第二次转账。
+	rcptRetry, err := store.Execute(id, 999)
+	if err != nil || rcptRetry.ExecutedAt != 10 || rcptRetry.Order != 0 {
+		t.Fatalf("execute after create retry = %+v err=%v, want first receipt (executed_at=10 order=0)", rcptRetry, err)
+	}
+
+	// 动作次序的含义必须保护：两笔金额不同、收款账户相同、合计不变，仅交换
+	// 顺序也属于不同创建内容，返回现有的内容冲突错误——不能按最终余额相同
+	// 判为成功重试。
+	swapped := *retry
+	swapped.Actions = []string{"transfer:audits:50", "transfer:audits:100"}
+	if _, existed, err := store.CreateVoteProposal(&swapped); existed || !errors.Is(err, ErrProposalConflict) {
+		t.Fatalf("swapped-order retry: existed=%v err=%v, want ErrProposalConflict", existed, err)
+	}
+
+	// 无论相同内容重试成功还是动作换序冲突：资金库与收款账户都保持首次执行后
+	// 的余额；成功执行记录仍只有原来的一份，凭据内容保持原样。
+	if bal, _ := store.TreasuryBalance(); bal != 850 {
+		t.Fatalf("treasury after retries=%d, want 850", bal)
+	}
+	if got, err := store.Balance("audits"); err != nil || got != 150 {
+		t.Fatalf("audits balance after retries=%d err=%v, want 150", got, err)
+	}
+	rcpt, ok, err := store.Receipt(id)
+	if err != nil || !ok {
+		t.Fatalf("Receipt after retries: ok=%v err=%v", ok, err)
+	}
+	assertFirstExecutionReceipt(t, rcpt, id)
+	all, err := store.Receipts()
+	if err != nil || len(all) != 1 {
+		t.Fatalf("receipts after retries len=%d err=%v, want exactly 1", len(all), err)
+	}
+	assertFirstExecutionReceipt(t, all[0], id)
+
+	// 冲突失败不改变提案的已执行状态、投票与计票记录或原动作列表；
+	// 提案查询与凭据查询仍对应同一次执行。
+	after, ok, err := store.VoteProposal(id)
+	if err != nil || !ok || after.State != "executed" {
+		t.Fatalf("VoteProposal after conflict: %+v ok=%v err=%v", after, ok, err)
+	}
+	if !sameActions(after.Actions, in.Actions) || len(after.Ballots) != 1 ||
+		after.Ballots[0] != ballot || after.Tally == nil || !after.Tally.Passed ||
+		after.Tally.TalliedAt != 10 {
+		t.Fatalf("conflict retry mutated records: actions=%v ballots=%+v tally=%+v",
+			after.Actions, after.Ballots, after.Tally)
+	}
+	// 成功重试与冲突都不落盘：状态文件字节与首次执行后完全一致，
+	// 已有凭据未被替换、成功执行记录未被追加。
+	if raw, rerr := os.ReadFile(path); rerr != nil || !bytes.Equal(raw, persisted) {
+		t.Fatalf("state file rewritten by create retries: err=%v", rerr)
+	}
+}
+
+// assertFirstExecutionReceipt 逐字段核对 gip-reexec 唯一一次成功执行的凭据：
+// 首次执行时间、提交序号、各笔动作原文、动作位置与双方前后余额都保持首次执行
+// 原样；同一收款账户的多笔收款分别留痕，不合并、不重排。
+func assertFirstExecutionReceipt(t *testing.T, r *Receipt, id string) {
+	t.Helper()
+	if r.ProposalID != id || r.ExecutedAt != 10 || r.Order != 0 || len(r.Actions) != 2 {
+		t.Fatalf("receipt header = id=%q executed_at=%d order=%d actions=%d, want id=%q executed_at=10 order=0 actions=2",
+			r.ProposalID, r.ExecutedAt, r.Order, len(r.Actions), id)
+	}
+	want := []struct {
+		index                           int64
+		action                          string
+		treasuryBefore, treasuryAfter   int64
+		recipient                       string
+		recipientBefore, recipientAfter int64
+	}{
+		{0, "transfer:audits:100", 1000, 900, "audits", 0, 100},
+		{1, "transfer:audits:50", 900, 850, "audits", 100, 150},
+	}
+	for i, w := range want {
+		a := r.Actions[i]
+		if a.Index != w.index || a.Action != w.action {
+			t.Fatalf("receipt action %d = index=%d text=%q, want index=%d text=%q",
+				i, a.Index, a.Action, w.index, w.action)
+		}
+		if a.Treasury.Account != "treasury" || a.Treasury.Before != w.treasuryBefore || a.Treasury.After != w.treasuryAfter {
+			t.Fatalf("receipt action %d treasury = %+v, want treasury %d->%d",
+				i, a.Treasury, w.treasuryBefore, w.treasuryAfter)
+		}
+		if a.Recipient.Account != w.recipient || a.Recipient.Before != w.recipientBefore || a.Recipient.After != w.recipientAfter {
+			t.Fatalf("receipt action %d recipient = %+v, want %s %d->%d",
+				i, a.Recipient, w.recipient, w.recipientBefore, w.recipientAfter)
+		}
 	}
 }
 
