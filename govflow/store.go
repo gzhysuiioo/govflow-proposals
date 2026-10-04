@@ -38,10 +38,112 @@ const (
 )
 
 // BalanceUpdate 记录一个账户在一次动作前后的余额。
+//
+// before/after 是必填余额字段：即使某次动作的真实余额恰为 0（资金库全部转出
+// 扣到 0、首次收款账户从 0 起），凭据也必须把 0 明确写出。两个字段先用
+// RawMessage 接住，使“字段缺失”与“显式 null/写错类型/明确写出的 0”在解码后
+// 仍可区分：encoding/json 直接解进 int64 会把缺失、null 与类型不符都折叠成 0，
+// 恰好与“该侧余额本来就是 0”的合法凭据无法区分。每个字段的“缺失/空值/
+// 类型不符”由 validateReceiptActionBalances 判定，绝不能按转账金额或最终
+// 余额把缺损补成 0。
 type BalanceUpdate struct {
 	Account string `json:"account"`
 	Before  int64  `json:"before"`
 	After   int64  `json:"after"`
+
+	beforeRaw json.RawMessage
+	afterRaw  json.RawMessage
+}
+
+// balanceUpdateJSONShape 只用于解码，按保存格式的字段名逐字接住前后余额的
+// 原始 JSON。account 保持普通字符串：它的 null/类型不符由结构扫描在解码前
+// 拒绝，缺失则留待凭据重放按账户名不一致判损坏，行为与既有规则一致。
+type balanceUpdateJSONShape struct {
+	Account string          `json:"account"`
+	Before  json.RawMessage `json:"before"`
+	After   json.RawMessage `json:"after"`
+}
+
+// UnmarshalJSON 保留 before/after 是否出现及其原始写法（缺失为 nil、null 为
+// "null"），供 validateReceiptActionBalances 区分缺失、空值与类型不符。单个
+// 字段类型不符时这里不返回错误（对应余额保持零值），以免解码器在不含提案
+// 编号/动作下标的通用错误处提前失败；定位与判定统一交给凭据重放校验。
+func (b *BalanceUpdate) UnmarshalJSON(data []byte) error {
+	var shape balanceUpdateJSONShape
+	if err := json.Unmarshal(data, &shape); err != nil {
+		return err
+	}
+	b.Account = shape.Account
+	b.beforeRaw, b.afterRaw = shape.Before, shape.After
+	// 仅当字段确实是 int64 整数时才填充余额；类型不符留待校验拒绝，
+	// 绝不能让错误类型悄悄落成零值并参与凭据重放或查询。
+	fillInt64(shape.Before, &b.Before)
+	fillInt64(shape.After, &b.After)
+	return nil
+}
+
+// MarshalJSON 只输出 account/before/after，RawMessage 状态（仅用于入站判定）
+// 不落盘，保存格式与查询输出字段保持不变。
+func (b BalanceUpdate) MarshalJSON() ([]byte, error) {
+	return json.Marshal(balanceUpdateOut{
+		Account: b.Account,
+		Before:  b.Before,
+		After:   b.After,
+	})
+}
+
+// balanceUpdateOut 是余额留痕的保存形状；字段名与保存格式逐字一致。
+type balanceUpdateOut struct {
+	Account string `json:"account"`
+	Before  int64  `json:"before"`
+	After   int64  `json:"after"`
+}
+
+// newBalanceUpdate 构造一份内存中的合法余额留痕（首次执行路径使用）。
+// 同步填上字段原始片段，使“提交前校验”与“打开重放校验”走同一份
+// validateReceiptActionBalances 判定时不会把本进程新建的留痕误判为字段缺失。
+func newBalanceUpdate(account string, before, after int64) BalanceUpdate {
+	beforeRaw, _ := json.Marshal(before)
+	afterRaw, _ := json.Marshal(after)
+	return BalanceUpdate{
+		Account:   account,
+		Before:    before,
+		After:     after,
+		beforeRaw: beforeRaw,
+		afterRaw:  afterRaw,
+	}
+}
+
+// validateReceiptActionBalances 严格判定一张已保存凭据中每项动作两侧的四个
+// 必填余额字段：资金库侧（treasury）与收款账户侧（recipient）的 before/after
+// 都必须明确写出、非 null 且为 int64 范围内的整数。任一字段未写出、显式为
+// null 或类型不符（字符串/小数/指数/超界）都返回带提案编号、动作下标（0 起）、
+// 侧与字段名的错误，整份状态文件据此判为损坏。明确写出的 0 是合法余额
+// （资金库恰好扣到 0、首次收款账户从 0 起），不得当成缺失；缺损也绝不能按
+// 转账金额、账户余额或其它凭据补成 0。该校验先于凭据重放核对执行。
+func validateReceiptActionBalances(rcpt *Receipt) error {
+	for i := range rcpt.Actions {
+		ar := &rcpt.Actions[i]
+		for _, side := range []struct {
+			name string
+			upd  *BalanceUpdate
+		}{
+			{"treasury", &ar.Treasury},
+			{"recipient", &ar.Recipient},
+		} {
+			err := validateRawFields([]rawField{
+				{name: "before", kind: scalarInteger, raw: side.upd.beforeRaw},
+				{name: "after", kind: scalarInteger, raw: side.upd.afterRaw},
+			}, func(field, problem string) error {
+				return fmt.Errorf("receipt for proposal %q action %d %s field %q %s",
+					rcpt.ProposalID, i, side.name, field, problem)
+			})
+			if err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 // ActionReceipt 是凭据中对单项动作的留痕：动作原文、在提案中的顺序编号（0 起），
@@ -836,6 +938,13 @@ func validateState(state *storedState) error {
 		if err := validateReceiptExecutedAt(order, rcpt, ownerTimelock); err != nil {
 			return err
 		}
+		// 每项动作两侧的四个余额字段（treasury/recipient 的 before/after）必须
+		// 各自明确写出、非 null 且为 int64 整数。先于转账重放核对执行：字段
+		// 缺损时直接判整份文件损坏，绝不能把缺失余额默认成 0（恰好等于资金库
+		// 扣到 0 或首次收款账户的真实 0）后再继续给出看似完整的凭据或查询。
+		if err := validateReceiptActionBalances(rcpt); err != nil {
+			return err
+		}
 		// 凭据声明的逐笔转账由统一转账规则（verifyReceiptTransfers）重放
 		// 核对：动作条数/编号/原文、资金库与收款账户前后余额任一不符都带
 		// 动作位置报损坏原因；本函数随即返回错误，整份状态被拒绝，重放结果
@@ -979,6 +1088,16 @@ func init() {
 	// 提案编号与凭据位置，统一由 validateReceiptExecutedAt 报错，结构扫描在此
 	// 叶子位置保持宽松。
 	storedStateSchema.fields["receipts"].elem.fields["executed_at"].kind = kindAny
+	// 凭据每项动作资金库侧与收款账户侧的 before/after 同理：这四个必填余额
+	// 字段的“缺失/空值/类型不符/超界”判定需要带上提案编号、动作下标、侧与
+	// 字段名，统一由 validateReceiptActionBalances 报错，结构扫描在这些叶子
+	// 位置保持宽松，避免用不含提案编号的通用路径信息抢先报错。
+	for _, sideName := range []string{"treasury", "recipient"} {
+		sideFields := storedStateSchema.fields["receipts"].elem.fields["actions"].elem.fields[sideName].fields
+		for _, name := range []string{"before", "after"} {
+			sideFields[name].kind = kindAny
+		}
+	}
 }
 
 // scanFrame 是结构扫描的栈帧。

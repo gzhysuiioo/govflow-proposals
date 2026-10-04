@@ -340,6 +340,205 @@ func TestTamperedReceiptBalancesRejectWithCause(t *testing.T) {
 	}
 }
 
+// TestMissingReceiptBalanceFieldsRejected：凭据每项动作资金库侧与收款账户侧的
+// before/after 是必填字段。即使某侧真实余额恰为 0（资金库全部转出扣到 0、
+// 首次收款账户从 0 起），删除对应字段也必须判整份状态文件损坏，不能按转账
+// 金额或最终余额补成 0 后给出看似完整的凭据。四个余额字段任一缺失、null 或
+// 类型不符都同样拒绝；明确写出的整数 0 是合法记录。
+func TestMissingReceiptBalanceFieldsRejected(t *testing.T) {
+	dir := t.TempDir()
+
+	// 资金库原有 100，向首次收款账户转出 100：资金库 100->0，收款账户 0->100。
+	setup := func(t *testing.T, path string, actions ...string) {
+		t.Helper()
+		store, err := InitTreasury(path, 100)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(actions) == 0 {
+			actions = []string{"transfer:acc:100"}
+		}
+		mustRegister(t, store, "gip-1", 0, actions...)
+		if _, err := store.Execute("gip-1", 0); err != nil {
+			t.Fatal(err)
+		}
+		store.Close()
+	}
+
+	path := filepath.Join(dir, "zero.json")
+	setup(t, path)
+	good, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 基线：明确写出的两个 0（资金库 after、收款账户 before）合法，重开可读、
+	// 可查凭据，已执行提案重试仍返回原凭据，不重新扣款。
+	t.Run("explicit zeros are legal", func(t *testing.T) {
+		s, err := Open(path)
+		if err != nil {
+			t.Fatalf("reopen: %v", err)
+		}
+		defer s.Close()
+		r, ok, err := s.Receipt("gip-1")
+		if err != nil || !ok {
+			t.Fatalf("Receipt ok=%v err=%v", ok, err)
+		}
+		ar := r.Actions[0]
+		if ar.Treasury.Before != 100 || ar.Treasury.After != 0 ||
+			ar.Recipient.Before != 0 || ar.Recipient.After != 100 {
+			t.Fatalf("unexpected action receipt: %+v", ar)
+		}
+		if bal, _ := s.TreasuryBalance(); bal != 0 {
+			t.Fatalf("treasury=%d, want 0", bal)
+		}
+		if bal, _ := s.Balance("acc"); bal != 100 {
+			t.Fatalf("acc=%d, want 100", bal)
+		}
+		again, err := s.Execute("gip-1", 999)
+		if err != nil || again.ExecutedAt != 0 {
+			t.Fatalf("retry execute changed receipt: %+v err=%v", again, err)
+		}
+		if bal, _ := s.TreasuryBalance(); bal != 0 {
+			t.Fatalf("treasury changed on retry: %d", bal)
+		}
+	})
+
+	// 在零余额场景下删除/置空/写错四个字段中的任意一个：尽管其余记录与最终
+	// 余额（treasury=0、acc=100）完全一致，仍必须判损坏，且错误指出提案编号、
+	// 从 0 起的动作下标、侧与字段名。
+	mutate := func(t *testing.T, raw []byte, fn func(ar map[string]any)) []byte {
+		t.Helper()
+		var doc map[string]any
+		if err := json.Unmarshal(raw, &doc); err != nil {
+			t.Fatal(err)
+		}
+		fn(doc["receipts"].([]any)[0].(map[string]any)["actions"].([]any)[0].(map[string]any))
+		out, err := json.MarshalIndent(doc, "", "  ")
+		if err != nil {
+			t.Fatal(err)
+		}
+		return append(out, '\n')
+	}
+	del := func(side, field string) func(map[string]any) {
+		return func(ar map[string]any) { delete(ar[side].(map[string]any), field) }
+	}
+	set := func(side, field string, val any) func(map[string]any) {
+		return func(ar map[string]any) { ar[side].(map[string]any)[field] = val }
+	}
+
+	cases := []struct {
+		name     string
+		fn       func(map[string]any)
+		want     string
+		zeroSide bool
+	}{
+		{"treasury after missing", del("treasury", "after"), `action 0 treasury field "after" is missing`, true},
+		{"recipient before missing", del("recipient", "before"), `action 0 recipient field "before" is missing`, true},
+		{"treasury before missing", del("treasury", "before"), `action 0 treasury field "before" is missing`, false},
+		{"recipient after missing", del("recipient", "after"), `action 0 recipient field "after" is missing`, false},
+		{"treasury after null", set("treasury", "after", nil), `treasury field "after" is null`, true},
+		{"recipient before null", set("recipient", "before", nil), `recipient field "before" is null`, true},
+		{"treasury after wrong type", set("treasury", "after", "0"), `treasury field "after" has wrong type`, true},
+		{"recipient before wrong type", set("recipient", "before", false), `recipient field "before" has wrong type`, true},
+		{"treasury before float", set("treasury", "before", 100.5), `treasury field "before" has wrong type`, false},
+		{"recipient after float", set("recipient", "after", 100.25), `recipient field "after" has wrong type`, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			bad := filepath.Join(dir, "bad-"+strings.ReplaceAll(tc.name, " ", "-")+".json")
+			raw := mutate(t, good, tc.fn)
+			if err := os.WriteFile(bad, raw, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			s, err := Open(bad)
+			if !errors.Is(err, ErrStateCorrupt) {
+				if s != nil {
+					s.Close()
+				}
+				t.Fatalf("Open err=%v, want ErrStateCorrupt", err)
+			}
+			for _, want := range []string{`"gip-1"`, tc.want} {
+				if !strings.Contains(err.Error(), want) {
+					t.Fatalf("error %q missing %q", err.Error(), want)
+				}
+			}
+			// 原文件不被修复或覆盖。
+			if got, rerr := os.ReadFile(bad); rerr != nil || string(got) != string(raw) {
+				t.Fatalf("corrupt file was modified")
+			}
+			// 缺损不得被最终余额掩盖（零字段恰好等于真实 0）。
+			if tc.zeroSide && !strings.Contains(err.Error(), "is missing") &&
+				!strings.Contains(err.Error(), "is null") && !strings.Contains(err.Error(), "wrong type") {
+				t.Fatalf("zero-valued field defect not reported: %v", err)
+			}
+		})
+	}
+
+	// 同一账户连续收款时各动作前后余额承接上一笔结果；缺损定位到正确动作下标。
+	t.Run("later action index located and chained", func(t *testing.T) {
+		mp := filepath.Join(dir, "multi.json")
+		setup(t, mp, "transfer:acc:60", "transfer:acc:40") // 100->40->0; acc 0->60->100
+		raw, _ := os.ReadFile(mp)
+		var doc map[string]any
+		if err := json.Unmarshal(raw, &doc); err != nil {
+			t.Fatal(err)
+		}
+		actions := doc["receipts"].([]any)[0].(map[string]any)["actions"].([]any)
+		// 第 2 笔收款账户 before 必须承接第 1 笔 after（60），删除即判损坏。
+		delete(actions[1].(map[string]any)["recipient"].(map[string]any), "before")
+		out, _ := json.MarshalIndent(doc, "", "  ")
+		bad := filepath.Join(dir, "multi-bad.json")
+		if err := os.WriteFile(bad, append(out, '\n'), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		_, err := Open(bad)
+		if !errors.Is(err, ErrStateCorrupt) ||
+			!strings.Contains(err.Error(), `action 1 recipient field "before" is missing`) {
+			t.Fatalf("want located action 1 defect, got %v", err)
+		}
+	})
+
+	// 文件打开后被替换成缺损版本：后续每个查询与继续执行都失败，无部分结果，
+	// 不重写原文件，也不把缺损凭据对应的提案当作未执行再扣一次款。
+	t.Run("all reads and execute fail after open", func(t *testing.T) {
+		live := filepath.Join(dir, "live.json")
+		if err := os.WriteFile(live, good, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		s, err := Open(live)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer s.Close()
+		corrupt := mutate(t, good, del("recipient", "before"))
+		if err := os.WriteFile(live, corrupt, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.BalanceSnapshot(); !errors.Is(err, ErrStateCorrupt) {
+			t.Fatalf("BalanceSnapshot err=%v", err)
+		}
+		if _, err := s.Balances(); !errors.Is(err, ErrStateCorrupt) {
+			t.Fatalf("Balances err=%v", err)
+		}
+		if _, _, err := s.Receipt("gip-1"); !errors.Is(err, ErrStateCorrupt) {
+			t.Fatalf("Receipt err=%v", err)
+		}
+		if _, err := s.Receipts(); !errors.Is(err, ErrStateCorrupt) {
+			t.Fatalf("Receipts err=%v", err)
+		}
+		if _, _, err := s.Proposal("gip-1"); !errors.Is(err, ErrStateCorrupt) {
+			t.Fatalf("Proposal err=%v", err)
+		}
+		if _, err := s.Execute("gip-1", 1); !errors.Is(err, ErrStateCorrupt) {
+			t.Fatalf("Execute err=%v", err)
+		}
+		if got, _ := os.ReadFile(live); string(got) != string(corrupt) {
+			t.Fatalf("state file was modified by rejected operations")
+		}
+	})
+}
+
 // TestRegisteredAndVotedProposalsTransferIdentically：相同动作与起始余额下，
 // 登记来源与投票通过来源的提案产生相同的资金变动与逐笔凭据，且已执行
 // 提案再次执行仍返回首次凭据。

@@ -161,16 +161,10 @@ func (s transferStep) actionReceipt(index int, raw string) ActionReceipt {
 	return ActionReceipt{
 		Index:  index,
 		Action: raw,
-		Treasury: BalanceUpdate{
-			Account: "treasury",
-			Before:  s.treasuryBefore,
-			After:   s.treasuryAfter,
-		},
-		Recipient: BalanceUpdate{
-			Account: s.account,
-			Before:  s.recipientBefore,
-			After:   s.recipientAfter,
-		},
+		Treasury: newBalanceUpdate(
+			"treasury", s.treasuryBefore, s.treasuryAfter),
+		Recipient: newBalanceUpdate(
+			s.account, s.recipientBefore, s.recipientAfter),
 	}
 }
 
