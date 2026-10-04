@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"unicode/utf8"
 )
 
 // 投票提案相关错误。
@@ -313,12 +314,25 @@ func validateProposalInput(in *CreateVoteInput) (*proposalSpec, error) {
 	if in.ID == "" {
 		return nil, invalidProposal("proposal id must not be empty")
 	}
+	// 提案编号、成员编号与动作原文必须本身就是合法 UTF-8。创建参数是普通
+	// 字符串而非 JSON 文本，不做任何转义解释；若放任非法字节进入，落盘时
+	// encoding/json 会把它们悄悄改写成替换字符 U+FFFD：原编号从此无法按
+	// 用户提交的内容查询，不同成员可能折叠成同名，重开文件时严格校验又会
+	// 把整份状态判为损坏。残缺的多字节序列与直接编码的代理码位（WTF-8）
+	// 同样属于非法文本。合法文本——中文、表情、用户明确输入的 U+FFFD、
+	// 以及 "\uD800" 之类由反斜杠与普通字母组成的字面文本——原样保留。
+	if !utf8.ValidString(in.ID) {
+		return nil, invalidProposal("proposal id %q is not valid UTF-8 text", in.ID)
+	}
 	if len(in.Members) == 0 {
 		return nil, invalidProposal("proposal %s: member list must not be empty", in.ID)
 	}
 	weights := make(map[string]int64, len(in.Members))
 	order := make([]string, 0, len(in.Members))
-	for _, m := range in.Members {
+	for i, m := range in.Members {
+		if !utf8.ValidString(m.ID) {
+			return nil, invalidProposal("proposal %s: member %d id %q is not valid UTF-8 text", in.ID, i, m.ID)
+		}
 		if m.ID == "" {
 			return nil, invalidProposal("proposal %s: member id must not be empty", in.ID)
 		}
@@ -330,6 +344,14 @@ func validateProposalInput(in *CreateVoteInput) (*proposalSpec, error) {
 		}
 		weights[m.ID] = m.Weight
 		order = append(order, m.ID)
+	}
+
+	// 动作原文同样必须合法 UTF-8（理由同提案编号）；编码合法但不符合
+	// transfer 格式的动作不在此拦截，仍由执行操作按现有规则拒绝。
+	for i, action := range in.Actions {
+		if !utf8.ValidString(action) {
+			return nil, invalidProposal("proposal %s: action %d is not valid UTF-8 text", in.ID, i)
+		}
 	}
 
 	// 总权重必须在 int64 范围内（各权重已为正）。

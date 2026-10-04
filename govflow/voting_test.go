@@ -2014,3 +2014,170 @@ func TestExplicitZeroTallyWeightsLegal(t *testing.T) {
 		t.Fatalf("zero against weight misread: %+v", v2.Tally)
 	}
 }
+
+// TestCreateVoteRejectsInvalidUTF8：提案编号、任一成员编号或任一动作原文含有
+// 非法 UTF-8 字节（含残缺多字节序列与直接编码的代理码位）时整项创建失败，
+// 错误分类为 ErrInvalidProposal 并指出文本类别与列表位置，状态文件保持原样。
+func TestCreateVoteRejectsInvalidUTF8(t *testing.T) {
+	store, path := openTempStore(t, 1000)
+	defer store.Close()
+	mustCreateVote(t, store, baseVoteInput("gip-base"))
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read state: %v", err)
+	}
+
+	cases := []struct {
+		name      string
+		mutate    func(in *CreateVoteInput)
+		wantInErr []string
+	}{
+		{"proposal id truncated multibyte", func(in *CreateVoteInput) {
+			in.ID = "gip-\xe4\xb8" // 残缺的三字节序列
+		}, []string{"proposal id", "UTF-8"}},
+		{"proposal id encoded surrogate", func(in *CreateVoteInput) {
+			in.ID = "gip-\xed\xa0\x80" // WTF-8 形式的高代理码位 U+D800
+		}, []string{"proposal id", "UTF-8"}},
+		{"proposal id stray continuation", func(in *CreateVoteInput) {
+			in.ID = "gip-\x80"
+		}, []string{"proposal id", "UTF-8"}},
+		{"member id invalid byte", func(in *CreateVoteInput) {
+			in.Members[1].ID = "bo\xffb"
+		}, []string{"member 1", "UTF-8"}},
+		{"member id truncated multibyte", func(in *CreateVoteInput) {
+			in.Members[3].ID = "dav\xf0\x9f\x98" // 残缺的四字节表情序列
+		}, []string{"member 3", "UTF-8"}},
+		{"member id encoded low surrogate", func(in *CreateVoteInput) {
+			in.Members[0].ID = "\xed\xb0\x80lice" // WTF-8 形式的低代理码位 U+DC00
+		}, []string{"member 0", "UTF-8"}},
+		{"action invalid byte", func(in *CreateVoteInput) {
+			in.Actions = []string{"transfer:audits:100", "transfer:aud\xc3its:50"}
+		}, []string{"action 1", "UTF-8"}},
+		{"action encoded surrogate", func(in *CreateVoteInput) {
+			in.Actions = []string{"\xed\xa0\x80"}
+		}, []string{"action 0", "UTF-8"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			in := baseVoteInput("gip-invalid-utf8")
+			tc.mutate(in)
+			_, existed, err := store.CreateVoteProposal(in)
+			if err == nil || existed {
+				t.Fatalf("expected rejection, existed=%v err=%v", existed, err)
+			}
+			if !errors.Is(err, ErrInvalidProposal) {
+				t.Fatalf("err=%v, want ErrInvalidProposal", err)
+			}
+			for _, want := range tc.wantInErr {
+				if !strings.Contains(err.Error(), want) {
+					t.Fatalf("err=%q, want substring %q", err.Error(), want)
+				}
+			}
+		})
+	}
+
+	// 整项失败：状态文件逐字节保持原样，已有提案不受影响。
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read state: %v", err)
+	}
+	if string(before) != string(after) {
+		t.Fatal("rejected create modified the state file")
+	}
+	if all, _ := store.VoteProposals(); len(all) != 1 || all[0].ID != "gip-base" {
+		t.Fatalf("failed creates left records: %+v", all)
+	}
+}
+
+// TestCreateVotePreservesValidText：中文、表情、用户明确输入的 U+FFFD 以及
+// 由反斜杠和普通字母组成的字面文本（如 "\uD800"，创建参数不是 JSON 字符串，
+// 不得重新解释成字符）都按原文保存与展示。
+func TestCreateVotePreservesValidText(t *testing.T) {
+	store, path := openTempStore(t, 1000)
+	in := baseVoteInput("gip-文本-😀")
+	in.Members = []VoteMember{
+		{ID: "成员甲", Weight: 300},
+		{ID: "emoji-🗳", Weight: 200},
+		{ID: "replace-�here", Weight: 100}, // 用户明确输入的 U+FFFD
+		{ID: `literal-�-text`, Weight: 400}, // 反斜杠字面文本，不是转义
+	}
+	in.Delegations = []Delegation{{From: "emoji-🗳", To: "成员甲"}}
+	in.Actions = []string{"transfer:收款账户:100", `note:� is literal`, "transfer:audits:50"}
+	view := mustCreateVote(t, store, in)
+	if view.ID != in.ID {
+		t.Fatalf("id rewritten: %q", view.ID)
+	}
+	for i, m := range view.Members {
+		if m.ID != in.Members[i].ID {
+			t.Fatalf("member %d rewritten: %q", i, m.ID)
+		}
+	}
+	for i, a := range view.Actions {
+		if a != in.Actions[i] {
+			t.Fatalf("action %d rewritten: %q", i, a)
+		}
+	}
+	store.Close()
+
+	// 重新打开：落盘文本逐字保留，查询展示原文。
+	reopened, err := Open(path)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer reopened.Close()
+	v, ok, err := reopened.VoteProposal(in.ID)
+	if err != nil || !ok {
+		t.Fatalf("query %q: ok=%v err=%v", in.ID, ok, err)
+	}
+	if v.ID != in.ID || v.Members[2].ID != "replace-�here" ||
+		v.Members[3].ID != `literal-�-text` || v.Actions[1] != `note:� is literal` {
+		t.Fatalf("text not preserved across reopen: %+v", v)
+	}
+	if v.Members[1].Delegate != "成员甲" {
+		t.Fatalf("delegation with non-ASCII ids misresolved: %+v", v.Members[1])
+	}
+}
+
+// TestCreateVoteInvalidUTF8NotMatchedToRealFFFD：状态中已存在含真实 U+FFFD 的
+// 合法编号时，含非法字节的输入不得被改写成 U+FFFD 后当作同一编号重试或覆盖。
+func TestCreateVoteInvalidUTF8NotMatchedToRealFFFD(t *testing.T) {
+	store, path := openTempStore(t, 1000)
+	defer store.Close()
+	in := baseVoteInput("gip-�")
+	in.Members[0].ID = "ali�ce"
+	in.Delegations = []Delegation{{From: "bob", To: "ali�ce"}, {From: "carol", To: "ali�ce"}}
+	mustCreateVote(t, store, in)
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read state: %v", err)
+	}
+
+	// 与已存编号仅在“真实 U+FFFD vs 非法字节”上不同的提交：必须整项拒绝，
+	// 而不是被改写后命中已有提案（existed）或报内容冲突。
+	retry := baseVoteInput("gip-\xef\xbf") // 截断序列，json 会改写成 U+FFFD
+	retry.Members[0].ID = "ali�ce"
+	if _, existed, err := store.CreateVoteProposal(retry); err == nil || existed {
+		t.Fatalf("invalid-utf8 id must not match stored U+FFFD id: existed=%v err=%v", existed, err)
+	} else if !errors.Is(err, ErrInvalidProposal) {
+		t.Fatalf("err=%v, want ErrInvalidProposal", err)
+	}
+
+	// 成员编号同理：非法字节不得折叠成已存成员的 U+FFFD 写法。
+	clash := baseVoteInput("gip-new")
+	clash.Members[0].ID = "ali\xef\xbfce"
+	if _, _, err := store.CreateVoteProposal(clash); err == nil || !errors.Is(err, ErrInvalidProposal) {
+		t.Fatalf("invalid-utf8 member id must be rejected: err=%v", err)
+	}
+
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read state: %v", err)
+	}
+	if string(before) != string(after) {
+		t.Fatal("rejected create modified the state file")
+	}
+	v, ok, err := store.VoteProposal("gip-�")
+	if err != nil || !ok || v.Members[0].ID != "ali�ce" {
+		t.Fatalf("stored U+FFFD proposal damaged: ok=%v err=%v view=%+v", ok, err, v)
+	}
+}
