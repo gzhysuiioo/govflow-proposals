@@ -37,7 +37,7 @@ func TestPlanTransfersChainsBalances(t *testing.T) {
 				i, st, w.acct, w.tb, w.ta, w.rb, w.ra)
 		}
 		if got := st.actionReceipt(i, "transfer:"+w.acct+":x"); got.Treasury.Account != "treasury" ||
-			got.Recipient.Account != w.acct || got.Index != i {
+			got.Recipient.Account != w.acct || got.Index != int64(i) {
 			t.Fatalf("actionReceipt shape wrong: %+v", got)
 		}
 	}

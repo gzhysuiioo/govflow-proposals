@@ -646,3 +646,91 @@ func TestCLIRejectsIncompleteTally(t *testing.T) {
 		t.Fatalf("corrupt file was modified or rewritten")
 	}
 }
+
+// TestCLIRejectsIncompleteReceiptOrderIndex：第一份凭据删掉 order、或第一项动作
+// 删掉 index 时，即使资金变动与动作原文完全一致，所有读取命令也把整份状态判为
+// 损坏：原因写入 stderr（含提案编号、字段与缺失原因；index 还含动作位置），以
+// 域错误退出码 1 结束，stdout 不出现任何提案的部分查询结果，文件不被改写。
+func TestCLIRejectsIncompleteReceiptOrderIndex(t *testing.T) {
+	binary := buildCLI(t)
+	dir := t.TempDir()
+	state := filepath.Join(dir, "treasury.json")
+	if _, _, code := runCLI(t, binary, state, "init", "--balance", "1000"); code != 0 {
+		t.Fatal("init failed")
+	}
+	// 同一收款账户连续两项动作：缺损修复不得合并或重排记录。
+	if _, _, code := runCLI(t, binary, state, "register", "--id", "gip-1",
+		"--timelock", "0",
+		"--action", "transfer:acct:100", "--action", "transfer:acct:50"); code != 0 {
+		t.Fatal("register failed")
+	}
+	if so, _, code := runCLI(t, binary, state, "execute", "--id", "gip-1", "--now", "0", "--json"); code != 0 ||
+		!strings.Contains(so, `"order": 0`) || !strings.Contains(so, `"index": 0`) ||
+		!strings.Contains(so, `"index": 1`) {
+		t.Fatalf("first execute should emit full order/index, code=%d so=%s", code, so)
+	}
+	// 正常查询保持不变：文本与 JSON 都输出明确保存的序号。
+	if so, _, code := runCLI(t, binary, state, "receipts"); code != 0 ||
+		!strings.Contains(so, "order=0") || !strings.Contains(so, "action 0:") ||
+		!strings.Contains(so, "action 1:") {
+		t.Fatalf("text receipts query changed: %s", so)
+	}
+
+	raw, err := os.ReadFile(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cases := []struct {
+		name    string
+		edit    func(string) string
+		wantMsg []string
+	}{
+		{
+			name:    "order-missing",
+			edit:    func(s string) string { return strings.Replace(s, `"order": 0,`, ``, 1) },
+			wantMsg: []string{"corrupt", "gip-1", `receipt 0`, `"order"`, "missing"},
+		},
+		{
+			name:    "index-missing",
+			edit:    func(s string) string { return strings.Replace(s, `"index": 0,`, ``, 1) },
+			wantMsg: []string{"corrupt", "gip-1", "action 0", `"index"`, "missing"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			corrupt := tc.edit(string(raw))
+			if corrupt == string(raw) {
+				t.Fatalf("setup: target field not found")
+			}
+			bad := filepath.Join(dir, tc.name+".json")
+			if err := os.WriteFile(bad, []byte(corrupt), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			for _, args := range [][]string{
+				{"receipt", "--id", "gip-1"},
+				{"receipt", "--id", "gip-1", "--json"},
+				{"receipts"},
+				{"receipts", "--json"},
+				{"balances", "--json"},
+				{"proposals", "--json"},
+			} {
+				so, se, code := runCLI(t, binary, bad, args...)
+				if code != 1 {
+					t.Fatalf("%v exit=%d want 1, stdout=%q stderr=%q", args, code, so, se)
+				}
+				if so != "" {
+					t.Fatalf("%v stdout must stay empty on corruption, got %q", args, so)
+				}
+				for _, want := range tc.wantMsg {
+					if !strings.Contains(se, want) {
+						t.Fatalf("%v stderr %q missing %q", args, se, want)
+					}
+				}
+			}
+			// 不整理、补齐或覆盖缺损文件。
+			if got, err := os.ReadFile(bad); err != nil || string(got) != corrupt {
+				t.Fatalf("corrupt file was modified or rewritten")
+			}
+		})
+	}
+}

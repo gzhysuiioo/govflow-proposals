@@ -1,6 +1,9 @@
 package govflow
 
-import "fmt"
+import (
+	"encoding/json"
+	"fmt"
+)
 
 // 本文件是本地资金库唯一的转账规则实现。
 //
@@ -157,14 +160,17 @@ func planTransfers(actions []string, treasury int64, balances map[string]int64) 
 // actionReceipt 按统一转账规则的计算结果构造凭据中的逐笔留痕。
 // 资金库侧账户名固定为 "treasury"，收款侧为动作解析出的账户；
 // 逐笔前后余额直接取自规则结果，凭据记载的变动与实际提交的变动同源。
-// mustBalanceUpdate 同步填上各字段的原始 JSON 片段，使提交前的 validateState
-// 与打开时的重放校验走同一份判定，不把本进程新建的凭据误判为字段缺失。
+// mustBalanceUpdate 同步填上各余额字段的原始 JSON 片段；index 同样是必填的
+// 顺序留痕，这里同步填上其原始片段，使提交前的 validateState 与打开时的
+// 重放校验走同一份判定，不把本进程新建的凭据误判为字段缺失。
 func (s transferStep) actionReceipt(index int, raw string) ActionReceipt {
+	indexRaw, _ := json.Marshal(int64(index))
 	return ActionReceipt{
-		Index:     index,
+		Index:     int64(index),
 		Action:    raw,
 		Treasury:  mustBalanceUpdate("treasury", s.treasuryBefore, s.treasuryAfter),
 		Recipient: mustBalanceUpdate(s.account, s.recipientBefore, s.recipientAfter),
+		indexRaw:  indexRaw,
 	}
 }
 
@@ -186,7 +192,9 @@ func verifyReceiptTransfers(rcpt *Receipt, ownerActions []string, simTreasury in
 			id, len(rcpt.Actions), len(ownerActions))
 	}
 	for i, ar := range rcpt.Actions {
-		if ar.Index != i {
+		// index 的“缺失/空值/类型不符/位置不符”由 validateReceiptActionIndex
+		// 在重放前统一判定；这里保留一道数值核对，防御绕过校验的内存调用。
+		if ar.Index != int64(i) {
 			return simTreasury, fmt.Errorf("receipt %q action %d has index %d", id, i, ar.Index)
 		}
 		if ar.Action != ownerActions[i] {

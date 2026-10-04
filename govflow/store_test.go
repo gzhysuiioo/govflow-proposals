@@ -1192,3 +1192,371 @@ func TestFixedFieldNamesMustMatchExactly(t *testing.T) {
 		}
 	})
 }
+
+// buildOrderIndexFixture 构造含两份成功凭据的状态文件：gip-a（登记来源，两项
+// 动作连续转给同一账户，order=0、index=0/1）与 gip-v（投票通过后执行，order=1、
+// index=0）。返回原始文件内容，供结构化或文本改写构造缺损变体。
+func buildOrderIndexFixture(t *testing.T) (dir, path string, good []byte) {
+	t.Helper()
+	dir = t.TempDir()
+	path = filepath.Join(dir, "treasury.json")
+	store, err := InitTreasury(path, 1000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustRegister(t, store, "gip-a", 0, "transfer:acct:100", "transfer:acct:50")
+	if _, err := store.Execute("gip-a", 0); err != nil {
+		t.Fatal(err)
+	}
+	in := baseVoteInput("gip-v")
+	in.Actions = []string{"transfer:b:25"}
+	in.StartAt, in.Deadline, in.TimelockEnd = 0, 1, 1
+	mustCreateVote(t, store, in)
+	if _, err := store.CastVote("gip-v", "alice", true, 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.TallyVote("gip-v", 1); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Execute("gip-v", 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	good, err = os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return dir, path, good
+}
+
+// mutateReceipts 以结构化改写构造缺损变体：fn 直接操作 receipts 数组。
+func mutateReceipts(t *testing.T, good []byte, fn func(receipts []any)) []byte {
+	t.Helper()
+	var root map[string]any
+	if err := json.Unmarshal(good, &root); err != nil {
+		t.Fatal(err)
+	}
+	receipts := root["receipts"].([]any)
+	fn(receipts)
+	raw, err := json.MarshalIndent(root, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return append(raw, '\n')
+}
+
+// TestReceiptOrderAndIndexStrictlyValidated：每份执行凭据的 order 与每项动作的
+// index 都必须明确保存为 int64 范围内的非负整数，且分别等于凭据位置、动作位置。
+// 缺失、null、字符串、布尔、小数、指数写法、超界或位置不符都判整份状态损坏；
+// 排在第一项不能把缺失补成 0，资金变动与原文可重放一致也不宽免。
+func TestReceiptOrderAndIndexStrictlyValidated(t *testing.T) {
+	dir, _, good := buildOrderIndexFixture(t)
+
+	// 基线完整可读：显式写出的 0 是有效序号；同一账户连续两项动作分别保留。
+	t.Run("baseline explicit zero readable", func(t *testing.T) {
+		base := filepath.Join(dir, "base.json")
+		if err := os.WriteFile(base, good, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		s, err := Open(base)
+		if err != nil {
+			t.Fatalf("reopen baseline: %v", err)
+		}
+		defer s.Close()
+		receipts, err := s.Receipts()
+		if err != nil || len(receipts) != 2 {
+			t.Fatalf("receipts=%v err=%v", receipts, err)
+		}
+		r0, r1 := receipts[0], receipts[1]
+		if r0.ProposalID != "gip-a" || r0.Order != 0 ||
+			r1.ProposalID != "gip-v" || r1.Order != 1 {
+			t.Fatalf("receipt order not read as saved: %s=%d %s=%d",
+				r0.ProposalID, r0.Order, r1.ProposalID, r1.Order)
+		}
+		if len(r0.Actions) != 2 || r0.Actions[0].Index != 0 || r0.Actions[1].Index != 1 {
+			t.Fatalf("action indexes not read as saved: %+v", r0.Actions)
+		}
+		// 同一收款账户连续出现：仍是两条独立动作记录，顺序不变、不合并。
+		if r0.Actions[0].Action != "transfer:acct:100" || r0.Actions[1].Action != "transfer:acct:50" {
+			t.Fatalf("consecutive same-recipient actions altered: %+v", r0.Actions)
+		}
+		if bal, _ := s.Balance("acct"); bal != 150 {
+			t.Fatalf("acct balance=%d, want 150", bal)
+		}
+		one, ok, err := s.Receipt("gip-a")
+		if err != nil || !ok || one.Order != 0 || one.Actions[0].Index != 0 {
+			t.Fatalf("Receipt(gip-a)=%+v ok=%v err=%v", one, ok, err)
+		}
+		// 查询 JSON 仍输出明确保存的 0。
+		out, err := json.Marshal(one)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(string(out), `"order":0`) || !strings.Contains(string(out), `"index":0`) {
+			t.Fatalf("json query lost explicit zero: %s", out)
+		}
+	})
+
+	type corruptCase struct {
+		name    string
+		raw     []byte
+		wantMsg []string
+	}
+	del := func(m map[string]any, key string) { delete(m, key) }
+	setField := func(m map[string]any, key string, v any) { m[key] = v }
+
+	var cases []corruptCase
+	// ---- order：第一份凭据（位置 0）缺 order 也不能补成 0 ----
+	cases = append(cases,
+		corruptCase{"order missing on first receipt",
+			mutateReceipts(t, good, func(rs []any) { del(rs[0].(map[string]any), "order") }),
+			[]string{"receipt 0", `"gip-a"`, `"order"`, "missing"}},
+		corruptCase{"order null on first receipt",
+			mutateReceipts(t, good, func(rs []any) { setField(rs[0].(map[string]any), "order", nil) }),
+			[]string{"receipt 0", `"gip-a"`, `"order"`, "null"}},
+		corruptCase{"order string not integer",
+			mutateReceipts(t, good, func(rs []any) { setField(rs[0].(map[string]any), "order", "0") }),
+			[]string{"receipt 0", `"gip-a"`, `"order"`, "wrong type"}},
+		corruptCase{"order boolean not integer",
+			mutateReceipts(t, good, func(rs []any) { setField(rs[0].(map[string]any), "order", false) }),
+			[]string{"receipt 0", `"gip-a"`, `"order"`, "wrong type"}},
+		corruptCase{"order decimal not integer",
+			mutateReceipts(t, good, func(rs []any) { setField(rs[0].(map[string]any), "order", 0.5) }),
+			[]string{"receipt 0", `"gip-a"`, `"order"`, "wrong type"}},
+		corruptCase{"order missing on second receipt",
+			mutateReceipts(t, good, func(rs []any) { del(rs[1].(map[string]any), "order") }),
+			[]string{"receipt 1", `"gip-v"`, `"order"`, "missing"}},
+	)
+	// 超界整数与指数写法以原文注入（通用 map 无法保留这两种词面）。
+	cases = append(cases,
+		corruptCase{"order over int64",
+			[]byte(strings.Replace(string(good), `"order": 0`, `"order": 9223372036854775808`, 1)),
+			[]string{"receipt 0", `"gip-a"`, `"order"`, "wrong type"}},
+		corruptCase{"order exponent notation",
+			[]byte(strings.Replace(string(good), `"order": 0`, `"order": 1e0`, 1)),
+			[]string{"receipt 0", `"gip-a"`, `"order"`, "wrong type"}},
+		corruptCase{"order negative mismatches position",
+			[]byte(strings.Replace(string(good), `"order": 1`, `"order": -1`, 1)),
+			[]string{`"gip-v"`, `"order"`, "is -1, expected 1"}},
+		corruptCase{"order wrong position",
+			[]byte(strings.Replace(string(good), `"order": 0`, `"order": 5`, 1)),
+			[]string{`"gip-a"`, `"order"`, "is 5, expected 0"}},
+		corruptCase{"order duplicated zero mismatches second receipt",
+			[]byte(strings.Replace(string(good), `"order": 1`, `"order": 0`, 1)),
+			[]string{`"gip-v"`, `"order"`, "is 0, expected 1"}},
+	)
+
+	// ---- index：第一项动作（位置 0）缺 index 也不能补成 0 ----
+	firstAction := func(rs []any) map[string]any {
+		return rs[0].(map[string]any)["actions"].([]any)[0].(map[string]any)
+	}
+	secondAction := func(rs []any) map[string]any {
+		return rs[0].(map[string]any)["actions"].([]any)[1].(map[string]any)
+	}
+	voteAction := func(rs []any) map[string]any {
+		return rs[1].(map[string]any)["actions"].([]any)[0].(map[string]any)
+	}
+	cases = append(cases,
+		corruptCase{"index missing on first action",
+			mutateReceipts(t, good, func(rs []any) { del(firstAction(rs), "index") }),
+			[]string{`"gip-a"`, "action 0", `"index"`, "missing"}},
+		corruptCase{"index null on first action",
+			mutateReceipts(t, good, func(rs []any) { setField(firstAction(rs), "index", nil) }),
+			[]string{`"gip-a"`, "action 0", `"index"`, "null"}},
+		corruptCase{"index string not integer",
+			mutateReceipts(t, good, func(rs []any) { setField(firstAction(rs), "index", "0") }),
+			[]string{`"gip-a"`, "action 0", `"index"`, "wrong type"}},
+		corruptCase{"index boolean not integer",
+			mutateReceipts(t, good, func(rs []any) { setField(firstAction(rs), "index", true) }),
+			[]string{`"gip-a"`, "action 0", `"index"`, "wrong type"}},
+		corruptCase{"index decimal on second action",
+			mutateReceipts(t, good, func(rs []any) { setField(secondAction(rs), "index", 1.5) }),
+			[]string{`"gip-a"`, "action 1", `"index"`, "wrong type"}},
+		corruptCase{"index missing on vote-proposal receipt action",
+			mutateReceipts(t, good, func(rs []any) { del(voteAction(rs), "index") }),
+			[]string{`"gip-v"`, "action 0", `"index"`, "missing"}},
+	)
+	// "index": 0 在文件中出现两次（两份凭据各一项/首项）；Replace count=1
+	// 命中第一份凭据的第一项动作。"index": 1 只出现一次（gip-a 第二项）。
+	cases = append(cases,
+		corruptCase{"index over int64",
+			[]byte(strings.Replace(string(good), `"index": 1`, `"index": 9223372036854775808`, 1)),
+			[]string{`"gip-a"`, "action 1", `"index"`, "wrong type"}},
+		corruptCase{"index exponent notation",
+			[]byte(strings.Replace(string(good), `"index": 0`, `"index": 1e0`, 1)),
+			[]string{`"gip-a"`, "action 0", `"index"`, "wrong type"}},
+		corruptCase{"index negative mismatches position",
+			[]byte(strings.Replace(string(good), `"index": 0`, `"index": -1`, 1)),
+			[]string{`"gip-a"`, "action 0", `"index"`, "is -1, expected 0"}},
+		corruptCase{"index wrong position",
+			[]byte(strings.Replace(string(good), `"index": 1`, `"index": 0`, 1)),
+			[]string{`"gip-a"`, "action 1", `"index"`, "is 0, expected 1"}},
+	)
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			bad := filepath.Join(dir, "bad-"+strings.ReplaceAll(tc.name, " ", "-")+".json")
+			if err := os.WriteFile(bad, tc.raw, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			// 其余凭据与全部资金变动都一致，仍必须拒绝整份文件，且错误能定位到
+			// 提案编号、字段与具体原因（index 还带动作位置）。
+			s, err := Open(bad)
+			if !errors.Is(err, ErrStateCorrupt) {
+				if s != nil {
+					s.Close()
+				}
+				t.Fatalf("Open err=%v, want ErrStateCorrupt", err)
+			}
+			for _, want := range tc.wantMsg {
+				if !strings.Contains(err.Error(), want) {
+					t.Fatalf("error %q missing %q", err.Error(), want)
+				}
+			}
+			// 不整理、补齐或覆盖原文件。
+			if got, rerr := os.ReadFile(bad); rerr != nil || string(got) != string(tc.raw) {
+				t.Fatalf("corrupt file was modified on rejected Open")
+			}
+			// 再次打开仍拒绝。
+			if s2, e := Open(bad); !errors.Is(e, ErrStateCorrupt) {
+				if s2 != nil {
+					s2.Close()
+				}
+				t.Fatalf("reopen err=%v, want ErrStateCorrupt", e)
+			}
+		})
+	}
+
+	// 已打开资金库在后续读取中发现缺损：作出相同判断，不继续返回之前的正常结果。
+	t.Run("detected after open", func(t *testing.T) {
+		p := filepath.Join(dir, "swap.json")
+		if err := os.WriteFile(p, good, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		s, err := Open(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer s.Close()
+		// 打开时一切正常，先取到一次正常结果。
+		if receipts, err := s.Receipts(); err != nil || len(receipts) != 2 {
+			t.Fatalf("initial read receipts=%v err=%v", receipts, err)
+		}
+		corrupt := mutateReceipts(t, good, func(rs []any) {
+			delete(rs[0].(map[string]any)["actions"].([]any)[0].(map[string]any), "index")
+		})
+		if err := os.WriteFile(p, corrupt, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.Receipts(); !errors.Is(err, ErrStateCorrupt) {
+			t.Fatalf("Receipts err=%v, want ErrStateCorrupt", err)
+		}
+		if _, _, err := s.Receipt("gip-a"); !errors.Is(err, ErrStateCorrupt) {
+			t.Fatalf("Receipt err=%v, want ErrStateCorrupt", err)
+		}
+		if _, err := s.BalanceSnapshot(); !errors.Is(err, ErrStateCorrupt) {
+			t.Fatalf("BalanceSnapshot err=%v, want ErrStateCorrupt", err)
+		}
+		if _, err := s.Execute("gip-a", 9); !errors.Is(err, ErrStateCorrupt) {
+			t.Fatalf("Execute err=%v, want ErrStateCorrupt", err)
+		}
+		if got, _ := os.ReadFile(p); string(got) != string(corrupt) {
+			t.Fatalf("state file was modified by rejected operations")
+		}
+	})
+}
+
+// TestOldStateWithoutVoteProposalsReadable：旧版本不含 vote_proposals 表的
+// 合法状态文件继续可读，且其中已保存凭据的 order/index 仍必须显式写出——
+// 旧版本兼容性不宽免执行凭据的序号缺失。
+func TestOldStateWithoutVoteProposalsReadable(t *testing.T) {
+	dir := t.TempDir()
+	legal := `{
+  "magic": "govflow-treasury-state",
+  "version": 1,
+  "initial_treasury": 100,
+  "treasury": 90,
+  "balances": {"a": 10},
+  "proposals": {
+    "gip-old": {
+      "id": "gip-old",
+      "state": "executed",
+      "timelock_end": 0,
+      "actions": ["transfer:a:10"]
+    }
+  },
+  "receipts": [
+    {
+      "proposal_id": "gip-old",
+      "executed_at": 0,
+      "order": 0,
+      "actions": [
+        {
+          "index": 0,
+          "action": "transfer:a:10",
+          "treasury": {"account": "treasury", "before": 100, "after": 90},
+          "recipient": {"account": "a", "before": 0, "after": 10}
+        }
+      ]
+    }
+  ]
+}
+`
+	path := filepath.Join(dir, "old.json")
+	if err := os.WriteFile(path, []byte(legal), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s, err := Open(path)
+	if err != nil {
+		t.Fatalf("old state without vote_proposals should be readable: %v", err)
+	}
+	r, ok, err := s.Receipt("gip-old")
+	if err != nil || !ok || r.Order != 0 || r.Actions[0].Index != 0 {
+		t.Fatalf("old receipt = %+v ok=%v err=%v", r, ok, err)
+	}
+	s.Close()
+
+	// 同一份旧状态删掉第一份凭据的 order：旧版本兼容不宽免序号缺失。
+	for _, tc := range []struct {
+		name string
+		raw  string
+		want []string
+	}{
+		{"old state missing order", removeLineContaining(legal, `"order": 0,`),
+			[]string{`"gip-old"`, `"order"`, "missing"}},
+		{"old state missing index", removeLineContaining(legal, `"index": 0,`),
+			[]string{`"gip-old"`, "action 0", `"index"`, "missing"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			bad := filepath.Join(dir, "old-bad-"+strings.ReplaceAll(tc.name, " ", "-")+".json")
+			if err := os.WriteFile(bad, []byte(tc.raw), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			s2, err := Open(bad)
+			if !errors.Is(err, ErrStateCorrupt) {
+				if s2 != nil {
+					s2.Close()
+				}
+				t.Fatalf("Open err=%v, want ErrStateCorrupt", err)
+			}
+			for _, want := range tc.want {
+				if !strings.Contains(err.Error(), want) {
+					t.Fatalf("error %q missing %q", err.Error(), want)
+				}
+			}
+		})
+	}
+
+	// 没有凭据的新资金库与尚未执行的提案不受新规则影响，继续可读。
+	fresh, _ := openTempStore(t, 1000)
+	defer fresh.Close()
+	mustRegister(t, fresh, "gip-pending", 100, "transfer:a:1")
+	if _, err := fresh.BalanceSnapshot(); err != nil {
+		t.Fatalf("fresh treasury unreadable: %v", err)
+	}
+	if p, ok, _ := fresh.Proposal("gip-pending"); !ok || p.State != "passed" {
+		t.Fatalf("pending proposal = %+v ok=%v", p, ok)
+	}
+}
