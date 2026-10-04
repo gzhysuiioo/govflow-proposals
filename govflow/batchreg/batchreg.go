@@ -413,6 +413,12 @@ func parseRegistryVersion(raw json.RawMessage) (int, error) {
 // exactly the four required lowercase fields, text fields as JSON strings
 // and quantity as a strict JSON integer in 1..MaxQuantity. pos is the
 // record's 1-based position in the batches array.
+//
+// The structural rules (member names, strict string decoding, quantity
+// range) are shared with parseManifestRecord; only this source's reporting
+// differs: problems are surfaced as *FormatError with registry wording, a
+// duplicated member anywhere in the object outranks an unknown one, and
+// text values are read verbatim — validate handles the empty-string case.
 func parseRegistryRecord(raw json.RawMessage, pos int) (Batch, error) {
 	var b Batch
 	fields, err := parseObjectFields(raw)
@@ -424,44 +430,31 @@ func parseRegistryRecord(raw json.RawMessage, pos int) (Batch, error) {
 	// is valid UTF-8. When the "batch" member itself is duplicated, or its
 	// bytes are not valid UTF-8, no id (and never a U+FFFD replacement) is
 	// picked arbitrarily.
-	batchID := ""
-	if countField(fields, "batch") == 1 {
-		if rawID, _ := findField(fields, "batch"); rawID != nil {
-			if id, idErr := unmarshalStringStrict(rawID); idErr == nil {
-				batchID = id
-			}
-		}
-	}
+	batchID := unambiguousBatchID(fields, textVerbatim)
 	fail := func(field, reason string) (Batch, error) {
 		return Batch{}, &FormatError{Position: pos, Batch: batchID, Field: field, Reason: reason}
 	}
 
-	if dup, ok := duplicateField(fields); ok {
-		return fail(dup, "field appears more than once; duplicate fields are not allowed")
-	}
-	for _, f := range fields {
-		if _, ok := batchRecordFields[f.key]; !ok {
-			return fail(f.key, "unknown field; only \"batch\", \"product\", \"quantity\" and \"unit\" are allowed")
-		}
+	switch fault := checkRecordMembers(fields, true); fault.kind {
+	case faultDuplicate:
+		return fail(fault.field, "field appears more than once; duplicate fields are not allowed")
+	case faultUnknown:
+		return fail(fault.field, "unknown field; only \"batch\", \"product\", \"quantity\" and \"unit\" are allowed")
 	}
 
 	text := func(name string) (string, error) {
 		rawValue, ok := findField(fields, name)
-		if !ok {
+		value, problem, _ := decodeRecordText(rawValue, ok, textVerbatim)
+		switch problem {
+		case fieldMissing:
 			return "", &FormatError{Position: pos, Batch: batchID, Field: name, Reason: "required field is missing"}
-		}
-		if trimmed := bytes.TrimSpace(rawValue); len(trimmed) == 0 || trimmed[0] != '"' {
-			return "", &FormatError{Position: pos, Batch: batchID, Field: name, Reason: "must be a JSON string"}
-		}
-		s, err := unmarshalStringStrict(rawValue)
-		if errors.Is(err, errStringEncoding) {
+		case fieldEncoding:
 			return "", &FormatError{Position: pos, Batch: batchID, Field: name,
 				Reason: "must be valid UTF-8 text: malformed bytes or lone surrogate escapes are rejected instead of being replaced with U+FFFD"}
-		}
-		if err != nil {
+		case fieldNotString:
 			return "", &FormatError{Position: pos, Batch: batchID, Field: name, Reason: "must be a JSON string"}
 		}
-		return s, nil
+		return value, nil
 	}
 	if b.Batch, err = text("batch"); err != nil {
 		return Batch{}, err
@@ -476,28 +469,11 @@ func parseRegistryRecord(raw json.RawMessage, pos int) (Batch, error) {
 	if !ok {
 		return fail("quantity", "required field is missing")
 	}
-	b.Quantity, err = parseRegistryQuantity(bytes.TrimSpace(quantityRaw))
+	b.Quantity, err = registryQuantityError(bytes.TrimSpace(quantityRaw))
 	if err != nil {
 		return fail("quantity", err.Error())
 	}
 	return b, nil
-}
-
-// parseRegistryQuantity accepts exactly a strict JSON integer token in the
-// range 1..MaxQuantity. Strings, signs, fractions, exponents, null and
-// out-of-range values are rejected.
-func parseRegistryQuantity(token []byte) (int64, error) {
-	if !isJSONInteger(string(token)) || len(token) == 0 || token[0] == '-' {
-		return 0, fmt.Errorf("must be a JSON integer between 1 and %d", MaxQuantity)
-	}
-	value, err := strconv.ParseInt(string(token), 10, 64)
-	if err != nil {
-		return 0, fmt.Errorf("must be an integer no greater than %d", MaxQuantity)
-	}
-	if value == 0 {
-		return 0, errors.New("must be greater than zero")
-	}
-	return value, nil
 }
 
 // isJSONInteger reports whether token is a JSON number literal without
@@ -741,6 +717,12 @@ var batchRecordFields = map[string]struct{}{
 // returned Input carries the normalized batch id whenever exactly one
 // "batch" member holds valid, non-blank text, so the caller can name the
 // batch in the error; otherwise it stays empty.
+//
+// The structural rules are shared with parseRegistryRecord; this source's
+// own choices are: member-name anomalies are reported in source order
+// (unknown and duplicate carry equal weight), text is trimmed and must stay
+// non-empty, and reasons use manifest wording (including *EncodingError for
+// malformed text).
 func parseManifestRecord(raw json.RawMessage) (Input, error) {
 	var in Input
 	members, err := parseObjectFields(raw)
@@ -756,46 +738,31 @@ func parseManifestRecord(raw json.RawMessage) (Input, error) {
 	// of two duplicate values picked arbitrarily, even when both are equal.
 	// Where the "batch" member sits relative to the offending field does not
 	// matter.
-	if countField(members, "batch") == 1 {
-		if rawID, ok := findField(members, "batch"); ok {
-			if id, idErr := unmarshalStringStrict(rawID); idErr == nil {
-				if normalized, normErr := NormalizeField(id); normErr == nil {
-					in.Batch = normalized
-				}
-			}
-		}
-	}
-	fields := make(map[string]json.RawMessage, len(members))
-	for _, f := range members {
-		if _, ok := batchRecordFields[f.key]; !ok {
-			return in, fmt.Errorf("record has unknown field %q; only batch, product, quantity and unit are allowed", f.key)
-		}
-		if _, dup := fields[f.key]; dup {
-			return in, fmt.Errorf("record lists field %q more than once", f.key)
-		}
-		fields[f.key] = f.value
+	in.Batch = unambiguousBatchID(members, textTrimmed)
+
+	// Manifest member-name problems are reported in source order: the first
+	// unknown name or first repeat fails the record.
+	switch fault := checkRecordMembers(members, false); fault.kind {
+	case faultUnknown:
+		return in, fmt.Errorf("record has unknown field %q; only batch, product, quantity and unit are allowed", fault.field)
+	case faultDuplicate:
+		return in, fmt.Errorf("record lists field %q more than once", fault.field)
 	}
 
 	textField := func(name string) (string, error) {
-		value, ok := fields[name]
-		if !ok {
+		rawValue, found := findField(members, name)
+		value, problem, cause := decodeRecordText(rawValue, found, textTrimmed)
+		switch problem {
+		case fieldMissing:
 			return "", fmt.Errorf("missing required field %q", name)
-		}
-		if trimmed := bytes.TrimSpace(value); len(trimmed) == 0 || trimmed[0] != '"' {
+		case fieldNotString:
 			return "", fmt.Errorf("field %q must be a JSON string", name)
-		}
-		text, decodeErr := unmarshalStringStrict(value)
-		if errors.Is(decodeErr, errStringEncoding) {
+		case fieldEncoding:
 			return "", &EncodingError{Field: name}
+		case fieldBlank:
+			return "", fmt.Errorf("field %q must not be blank: %w", name, cause)
 		}
-		if decodeErr != nil {
-			return "", fmt.Errorf("field %q must be a JSON string", name)
-		}
-		normalized, normErr := NormalizeField(text)
-		if normErr != nil {
-			return "", fmt.Errorf("field %q must not be blank: %w", name, normErr)
-		}
-		return normalized, nil
+		return value, nil
 	}
 
 	in.Batch, err = textField("batch")
@@ -810,40 +777,15 @@ func parseManifestRecord(raw json.RawMessage) (Input, error) {
 	if err != nil {
 		return in, err
 	}
-	quantityRaw, ok := fields["quantity"]
+	quantityRaw, ok := findField(members, "quantity")
 	if !ok {
 		return in, errors.New("missing required field \"quantity\"")
 	}
-	in.Quantity, err = parseManifestQuantity(bytes.TrimSpace(quantityRaw))
+	in.Quantity, err = manifestQuantityError(bytes.TrimSpace(quantityRaw))
 	if err != nil {
 		return in, err
 	}
 	return in, nil
-}
-
-// parseManifestQuantity accepts exactly a strict JSON integer token in the
-// range 1..MaxQuantity. Strings, signs, fractions, exponents, leading zeros
-// and out-of-range values are rejected instead of silently rounded.
-func parseManifestQuantity(token []byte) (int64, error) {
-	if len(token) == 0 || token[0] < '0' || token[0] > '9' {
-		return 0, fmt.Errorf("field %q must be a JSON integer between 1 and %d", "quantity", MaxQuantity)
-	}
-	for _, c := range token {
-		if c < '0' || c > '9' {
-			return 0, fmt.Errorf("field %q must be a JSON integer without sign, fraction or exponent", "quantity")
-		}
-	}
-	if len(token) > 1 && token[0] == '0' {
-		return 0, errors.New("field \"quantity\" must be a JSON integer without leading zeros")
-	}
-	value, err := strconv.ParseInt(string(token), 10, 64)
-	if err != nil {
-		return 0, fmt.Errorf("field %q must be an integer no greater than %d", "quantity", MaxQuantity)
-	}
-	if value == 0 {
-		return 0, errors.New("field \"quantity\" must be greater than zero")
-	}
-	return value, nil
 }
 
 // ImportResult is one entry of an Import outcome: the normalized record in
@@ -866,25 +808,18 @@ type ImportResult struct {
 // non-empty, valid UTF-8 text; it is never invented or substituted when the
 // batch field is empty or malformed.
 func validateManifestInput(in Input, pos int) error {
-	batchID := ""
-	if in.Batch != "" && utf8.ValidString(in.Batch) {
-		batchID = in.Batch
-	}
-	textFields := []struct {
-		field, value string
-	}{
-		{"batch", in.Batch}, {"product", in.Product}, {"unit", in.Unit},
-	}
+	// batchID is "" whenever the batch field itself is empty or malformed, so
+	// it is safe to attach it to whichever error follows.
+	batchID := safeBatchIDForError(in.Batch)
+	textFields := recordTextFields(in.Batch, in.Product, in.Unit)
 	for _, tv := range textFields {
 		if !utf8.ValidString(tv.value) {
-			// batchID is already "" when the batch field itself is the
-			// malformed one, so it is safe to attach it unconditionally.
-			return &ManifestRecordError{Position: pos, Batch: batchID, Reason: (&EncodingError{Field: tv.field}).Error()}
+			return &ManifestRecordError{Position: pos, Batch: batchID, Reason: (&EncodingError{Field: tv.name}).Error()}
 		}
 	}
 	for _, tv := range textFields {
 		if tv.value == "" {
-			return &ManifestRecordError{Position: pos, Batch: batchID, Reason: fmt.Sprintf("field %q must not be empty", tv.field)}
+			return &ManifestRecordError{Position: pos, Batch: batchID, Reason: fmt.Sprintf("field %q must not be empty", tv.name)}
 		}
 	}
 	if in.Quantity <= 0 {
@@ -988,31 +923,19 @@ func Register(reg *Registry, in Input) (Outcome, error) {
 	if in.Batch == "" || in.Product == "" || in.Unit == "" {
 		return Outcome{}, errors.New("batch, product and unit must be non-empty")
 	}
-	for _, tv := range []struct{ field, value string }{
-		{"batch", in.Batch}, {"product", in.Product}, {"unit", in.Unit},
-	} {
+	for _, tv := range recordTextFields(in.Batch, in.Product, in.Unit) {
 		if !utf8.ValidString(tv.value) {
-			return Outcome{}, &EncodingError{Field: tv.field}
+			return Outcome{}, &EncodingError{Field: tv.name}
 		}
 	}
-	if in.Quantity <= 0 || in.Quantity > MaxQuantity {
+	if !quantityInRange(in.Quantity) {
 		return Outcome{}, fmt.Errorf("quantity must be a positive integer no greater than %d", MaxQuantity)
 	}
 	for _, b := range reg.Batches {
 		if b.Batch != in.Batch {
 			continue
 		}
-		var diffs []string
-		if b.Product != in.Product {
-			diffs = append(diffs, "product")
-		}
-		if b.Quantity != in.Quantity {
-			diffs = append(diffs, "quantity")
-		}
-		if b.Unit != in.Unit {
-			diffs = append(diffs, "unit")
-		}
-		if len(diffs) > 0 {
+		if diffs := diffFields(b, in); len(diffs) > 0 {
 			return Outcome{}, &ConflictError{Batch: in.Batch, Fields: diffs}
 		}
 		return Outcome{Batch: b, Created: false}, nil
@@ -1036,22 +959,17 @@ func validateForSave(reg *Registry) error {
 	seen := make(map[string]int, len(reg.Batches))
 	for i, b := range reg.Batches {
 		pos := i + 1
-		batchID := ""
-		if b.Batch != "" && utf8.ValidString(b.Batch) {
-			batchID = b.Batch
-		}
-		for _, tv := range []struct{ field, value string }{
-			{"batch", b.Batch}, {"product", b.Product}, {"unit", b.Unit},
-		} {
+		batchID := safeBatchIDForError(b.Batch)
+		for _, tv := range recordTextFields(b.Batch, b.Product, b.Unit) {
 			if !utf8.ValidString(tv.value) {
-				return &FormatError{Position: pos, Batch: batchID, Field: tv.field,
+				return &FormatError{Position: pos, Batch: batchID, Field: tv.name,
 					Reason: "must be valid UTF-8 text: malformed bytes are rejected instead of being replaced with U+FFFD"}
 			}
 			if tv.value == "" {
-				return &FormatError{Position: pos, Batch: batchID, Field: tv.field, Reason: "must not be empty"}
+				return &FormatError{Position: pos, Batch: batchID, Field: tv.name, Reason: "must not be empty"}
 			}
 		}
-		if b.Quantity < 1 || b.Quantity > MaxQuantity {
+		if !quantityInRange(b.Quantity) {
 			return &FormatError{Position: pos, Batch: batchID, Field: "quantity",
 				Reason: fmt.Sprintf("must be between 1 and %d", MaxQuantity)}
 		}
