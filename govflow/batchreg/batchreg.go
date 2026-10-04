@@ -981,6 +981,11 @@ func validateForSave(reg *Registry) error {
 	return nil
 }
 
+// osRename performs Save's final replacement of the target file once the new
+// content is fully on disk. It is a package-level variable so tests can
+// inject a failure of that last step; in production it is always os.Rename.
+var osRename = os.Rename
+
 // Save atomically writes reg to path, replacing the file only after the new
 // content is fully on disk so an existing registry stays usable on failure.
 // Records are serialized in their current order; the file is created with
@@ -1051,7 +1056,7 @@ func Save(path string, reg *Registry) error {
 		os.Remove(tmpName)
 		return fmt.Errorf("cannot save registry %q: %w", path, err)
 	}
-	if err := os.Rename(tmpName, path); err != nil {
+	if err := osRename(tmpName, path); err != nil {
 		os.Remove(tmpName)
 		return fmt.Errorf("cannot save registry %q: %w", path, err)
 	}
