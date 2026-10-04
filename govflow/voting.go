@@ -5,8 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"sort"
-	"strconv"
-	"strings"
 )
 
 // 投票提案相关错误。
@@ -109,19 +107,23 @@ type storedDelegation struct {
 // 缺失或 null 的 support 不得被当作 false（反对票），缺失或 null 的
 // voted_at 不得被当作 0（首次投票时间）。
 //
-// 标量字段先用 RawMessage 接住，使“字段缺失”与“显式 null/写错类型”在解码后
-// 仍可区分：encoding/json 直接解进 bool/int64/string 时会把这三种情况都
-// 折叠成零值。每个字段的“缺失/空值/类型不符”由 validateStoredBallot 判定。
+// 每个标量字段由一个 strictField 接住其是否出现及原始写法（缺失为 nil、
+// null 为 "null"）：encoding/json 直接解进 bool/int64/string 时会把
+// “字段缺失”“显式 null”“写错类型”三种情况都折叠成零值。四个字段的
+// “缺失/空值/类型不符”由 validateStoredBallot 按票据定位统一判定，
+// 判定规则与计票权重、凭据 executed_at 共用同一份 strictField 机制。
+// 导出的类型字段仍带 json tag：落盘字段名与结构扫描（未知字段/重复键/
+// 大小写）继续由它们表达；strictField 只负责入站完整性与类型判定。
 type storedBallot struct {
 	Representative string `json:"representative"`
 	Weight         int64  `json:"weight"`
 	Support        bool   `json:"support"`
 	VotedAt        int64  `json:"voted_at"`
 
-	representativeRaw json.RawMessage
-	weightRaw         json.RawMessage
-	supportRaw        json.RawMessage
-	votedAtRaw        json.RawMessage
+	representativeSF strictField
+	weightSF         strictField
+	supportSF        strictField
+	votedAtSF        strictField
 }
 
 // ballotJSONShape 只用于解码，按保存格式的字段名逐字接住每个字段的原始 JSON。
@@ -132,7 +134,7 @@ type ballotJSONShape struct {
 	VotedAt        json.RawMessage `json:"voted_at"`
 }
 
-// UnmarshalJSON 保留字段是否出现及其原始写法（缺失为 nil、null 为 "null"），
+// UnmarshalJSON 保留四个字段是否出现及其原始写法（缺失为 nil、null 为 "null"），
 // 供 validateStoredBallot 区分缺失、空值与类型不符。单个字段类型不符时这里
 // 不返回错误（对应治理字段保持零值），以免解码器在不含提案编号/票据下标的
 // 通用错误处提前失败；定位与判定统一交给 validateStoredBallot。
@@ -141,60 +143,32 @@ func (b *storedBallot) UnmarshalJSON(data []byte) error {
 	if err := json.Unmarshal(data, &shape); err != nil {
 		return err
 	}
-	b.representativeRaw, b.weightRaw = shape.Representative, shape.Weight
-	b.supportRaw, b.votedAtRaw = shape.Support, shape.VotedAt
-	// 仅当字段确实是目标类型时才填充治理字段；类型不符留待校验拒绝，
-	// 绝不能让错误类型悄悄落成零值并参与查询或计票。
-	if raw := shape.Representative; jsonValueType(raw) == "string" {
-		_ = json.Unmarshal(raw, &b.Representative)
-	}
-	if raw := shape.Weight; isInt64Number(raw) {
-		_ = json.Unmarshal(raw, &b.Weight)
-	}
-	if raw := shape.Support; jsonValueType(raw) == "boolean" {
-		_ = json.Unmarshal(raw, &b.Support)
-	}
-	if raw := shape.VotedAt; isInt64Number(raw) {
-		_ = json.Unmarshal(raw, &b.VotedAt)
-	}
+	// 仅当字段确实是目标类型时 strictField 才会给出值；类型不符留待校验
+	// 拒绝，绝不能让错误类型悄悄落成零值并参与查询或计票。
+	b.representativeSF = captureStrictField(strictString, shape.Representative)
+	b.weightSF = captureStrictField(strictInteger, shape.Weight)
+	b.supportSF = captureStrictField(strictBoolean, shape.Support)
+	b.votedAtSF = captureStrictField(strictInteger, shape.VotedAt)
+	b.Representative = b.representativeSF.stringValue()
+	b.Weight = b.weightSF.int64Value()
+	b.Support = b.supportSF.boolValue()
+	b.VotedAt = b.votedAtSF.int64Value()
 	return nil
-}
-
-// MarshalJSON 只输出四个治理字段，RawMessage 状态（仅用于入站判定）不落盘。
-func (b storedBallot) MarshalJSON() ([]byte, error) {
-	return json.Marshal(storedBallotOut{
-		Representative: b.Representative,
-		Weight:         b.Weight,
-		Support:        b.Support,
-		VotedAt:        b.VotedAt,
-	})
-}
-
-// storedBallotOut 是票据的保存形状；字段名与保存格式逐字一致。
-type storedBallotOut struct {
-	Representative string `json:"representative"`
-	Weight         int64  `json:"weight"`
-	Support        bool   `json:"support"`
-	VotedAt        int64  `json:"voted_at"`
 }
 
 // mustStoreBallot 构造一张内存中的合法票据（投票成功路径使用）。
 // 同步填上字段原始片段，使“提交前校验”与“打开重放校验”走同一份
 // validateStoredBallot 判定时不会把本进程新建的票据误判为字段缺失。
 func mustStoreBallot(representative string, weight int64, support bool, votedAt int64) storedBallot {
-	repRaw, _ := json.Marshal(representative)
-	wRaw, _ := json.Marshal(weight)
-	supRaw, _ := json.Marshal(support)
-	atRaw, _ := json.Marshal(votedAt)
 	return storedBallot{
-		Representative:    representative,
-		Weight:            weight,
-		Support:           support,
-		VotedAt:           votedAt,
-		representativeRaw: repRaw,
-		weightRaw:         wRaw,
-		supportRaw:        supRaw,
-		votedAtRaw:        atRaw,
+		Representative:   representative,
+		Weight:           weight,
+		Support:          support,
+		VotedAt:          votedAt,
+		representativeSF: presentStrictField(strictString, representative),
+		weightSF:         presentStrictField(strictInteger, weight),
+		supportSF:        presentStrictField(strictBoolean, support),
+		votedAtSF:        presentStrictField(strictInteger, votedAt),
 	}
 }
 
@@ -203,78 +177,16 @@ func mustStoreBallot(representative string, weight int64, support bool, votedAt 
 // weight/voted_at 不接受字符串/小数/指数等非整数）都返回带原因的错误。
 // 明确写出的 false 是有效反对票；窗口允许时明确写出的 0 是有效投票时间，
 // 这两种合法值不得当成缺失。index 是票据在提案中的下标（0 起），用于定位。
+// 字段次序固定为 representative、weight、support、voted_at，多处同时有
+// 问题时报告次序与整理前一致。
 func validateStoredBallot(id string, index int, b *storedBallot) error {
-	check := func(field string, raw json.RawMessage, kind string, decode func() error) error {
-		switch {
-		case raw == nil:
-			return fmt.Errorf("voting proposal %q ballot %d field %q is missing", id, index, field)
-		case string(raw) == "null":
-			return fmt.Errorf("voting proposal %q ballot %d field %q is null", id, index, field)
-		default:
-			if err := decode(); err != nil {
-				return fmt.Errorf("voting proposal %q ballot %d field %q has wrong type: want %s, got %s",
-					id, index, field, kind, jsonValueType(raw))
-			}
-			return nil
-		}
-	}
-	if err := check("representative", b.representativeRaw, "string", func() error {
-		return json.Unmarshal(b.representativeRaw, new(string))
-	}); err != nil {
-		return err
-	}
-	if err := check("weight", b.weightRaw, "integer", func() error {
-		return json.Unmarshal(b.weightRaw, new(int64))
-	}); err != nil {
-		return err
-	}
-	if err := check("support", b.supportRaw, "boolean", func() error {
-		return json.Unmarshal(b.supportRaw, new(bool))
-	}); err != nil {
-		return err
-	}
-	if err := check("voted_at", b.votedAtRaw, "integer", func() error {
-		return json.Unmarshal(b.votedAtRaw, new(int64))
-	}); err != nil {
-		return err
-	}
-	return nil
-}
-
-// jsonValueType 按字段实际写出 JSON 的首字节归类其 JSON 类型。
-// RawMessage 是从合法 JSON 文档中取出的单个值，首字节足以区分
-// 字符串/布尔/null/数字/数组/对象，无需再次解码。
-func jsonValueType(raw json.RawMessage) string {
-	for _, c := range raw {
-		switch c {
-		case ' ', '\t', '\n', '\r':
-			continue
-		case '"':
-			return "string"
-		case 't', 'f':
-			return "boolean"
-		case 'n':
-			return "null"
-		case '[':
-			return "array"
-		case '{':
-			return "object"
-		default:
-			return "number"
-		}
-	}
-	return "invalid json"
-}
-
-// isInt64Number 判断原始 JSON 是否为落在有符号 64 位整数范围内的整数字面量：
-// 必须是 JSON 数字（首字节为数字或 '-'），且能被 ParseInt 以 10 进制精确解析。
-// 小数、指数、超界整数均返回 false。
-func isInt64Number(raw json.RawMessage) bool {
-	if jsonValueType(raw) != "number" {
-		return false
-	}
-	_, err := strconv.ParseInt(strings.TrimSpace(string(raw)), 10, 64)
-	return err == nil
+	location := fmt.Sprintf("voting proposal %q ballot %d", id, index)
+	return validateStrictFields(location, []strictFieldSpec{
+		{name: "representative", field: &b.representativeSF},
+		{name: "weight", field: &b.weightSF},
+		{name: "support", field: &b.supportSF},
+		{name: "voted_at", field: &b.votedAtSF},
+	})
 }
 
 // storedTally 是已保存的首次计票结果。只要提案有计票结果，for_weight 与
@@ -282,17 +194,20 @@ func isInt64Number(raw json.RawMessage) bool {
 // 也不得靠零值/默认值补出治理记录——缺失或 null 的 for_weight 不得被当作 0
 // 赞成，缺失或 null 的 against_weight 不得被当作 0 反对。
 //
-// 两个权重字段先用 RawMessage 接住，使“字段缺失”与“显式 null/写错类型”在解码后
-// 仍可区分：encoding/json 直接解进 int64 时会把这三种情况都折叠成 0，恰好与
-// “该侧没有票”的合法零权重无法区分。每个字段的“缺失/空值/类型不符”由
-// validateStoredTally 判定。
+// 两个权重字段各自用一个 strictField 接住其是否出现及原始写法（缺失为 nil、
+// null 为 "null"）：encoding/json 直接解进 int64 时会把“字段缺失”“显式
+// null”“写错类型”都折叠成 0，恰好与“该侧没有票”的合法零权重无法区分。
+// 两个字段的“缺失/空值/类型不符”由 validateStoredTally 按“提案编号 +
+// 计票记录标识 tally”统一判定，判定规则与票据字段、凭据 executed_at 共用
+// 同一份 strictField 机制。tallied_at 是普通 int64 字段，其“不早于截止”
+// 的既有业务校验保持不变。
 type storedTally struct {
 	ForWeight     int64 `json:"for_weight"`
 	AgainstWeight int64 `json:"against_weight"`
 	TalliedAt     int64 `json:"tallied_at"`
 
-	forWeightRaw     json.RawMessage
-	againstWeightRaw json.RawMessage
+	forWeightSF     strictField
+	againstWeightSF strictField
 }
 
 // tallyJSONShape 只用于解码，按保存格式的字段名逐字接住每个字段的原始 JSON。
@@ -311,16 +226,13 @@ func (t *storedTally) UnmarshalJSON(data []byte) error {
 	if err := json.Unmarshal(data, &shape); err != nil {
 		return err
 	}
-	t.forWeightRaw, t.againstWeightRaw = shape.ForWeight, shape.AgainstWeight
 	t.TalliedAt = shape.TalliedAt
-	// 仅当字段确实是 int64 整数时才填充治理字段；类型不符留待校验拒绝，
-	// 绝不能让错误类型悄悄落成 0 并参与查询或再次计票。
-	if isInt64Number(shape.ForWeight) {
-		_ = json.Unmarshal(shape.ForWeight, &t.ForWeight)
-	}
-	if isInt64Number(shape.AgainstWeight) {
-		_ = json.Unmarshal(shape.AgainstWeight, &t.AgainstWeight)
-	}
+	// 仅当字段确实是 int64 整数时 strictField 才会给出值；类型不符留待校验
+	// 拒绝，绝不能让错误类型悄悄落成 0 并参与查询或再次计票。
+	t.forWeightSF = captureStrictField(strictInteger, shape.ForWeight)
+	t.againstWeightSF = captureStrictField(strictInteger, shape.AgainstWeight)
+	t.ForWeight = t.forWeightSF.int64Value()
+	t.AgainstWeight = t.againstWeightSF.int64Value()
 	return nil
 }
 
@@ -328,41 +240,26 @@ func (t *storedTally) UnmarshalJSON(data []byte) error {
 // 同步填上字段原始片段，使“提交前校验”与“打开重放校验”走同一份
 // validateStoredTally 判定时不会把本进程新建的计票结果误判为字段缺失。
 func mustStoreTally(forWeight, againstWeight, talliedAt int64) *storedTally {
-	forRaw, _ := json.Marshal(forWeight)
-	againstRaw, _ := json.Marshal(againstWeight)
 	return &storedTally{
-		ForWeight:        forWeight,
-		AgainstWeight:    againstWeight,
-		TalliedAt:        talliedAt,
-		forWeightRaw:     forRaw,
-		againstWeightRaw: againstRaw,
+		ForWeight:       forWeight,
+		AgainstWeight:   againstWeight,
+		TalliedAt:       talliedAt,
+		forWeightSF:     presentStrictField(strictInteger, forWeight),
+		againstWeightSF: presentStrictField(strictInteger, againstWeight),
 	}
 }
 
 // validateStoredTally 严格判定一份已保存计票结果的两个权重字段：
 // for_weight 与 against_weight 任一未写出、显式为 null 或不是 int64 整数
-// （字符串/小数/指数/超界）都返回带提案编号、字段名与原因的错误。
-// 明确写出的 0 是合法权重（该侧没有票），不得当成缺失。
+// （字符串/小数/指数/超界）都返回带提案编号、计票记录标识、字段名与原因的
+// 错误。明确写出的 0 是合法权重（该侧没有票），不得当成缺失。字段次序固定
+// 为 for_weight、against_weight，多处同时有问题时报告次序与整理前一致。
 func validateStoredTally(id string, t *storedTally) error {
-	check := func(field string, raw json.RawMessage) error {
-		switch {
-		case raw == nil:
-			return fmt.Errorf("voting proposal %q tally field %q is missing", id, field)
-		case string(raw) == "null":
-			return fmt.Errorf("voting proposal %q tally field %q is null", id, field)
-		case !isInt64Number(raw):
-			return fmt.Errorf("voting proposal %q tally field %q has wrong type: want integer, got %s",
-				id, field, jsonValueType(raw))
-		}
-		return nil
-	}
-	if err := check("for_weight", t.forWeightRaw); err != nil {
-		return err
-	}
-	if err := check("against_weight", t.againstWeightRaw); err != nil {
-		return err
-	}
-	return nil
+	location := fmt.Sprintf("voting proposal %q tally", id)
+	return validateStrictFields(location, []strictFieldSpec{
+		{name: "for_weight", field: &t.forWeightSF},
+		{name: "against_weight", field: &t.againstWeightSF},
+	})
 }
 
 // storedVoteProposal 按成员提交顺序保存成员与委托（顺序不影响相等性），

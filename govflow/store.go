@@ -66,7 +66,7 @@ type Receipt struct {
 	Order      int             `json:"order"`       // 成功提交的先后顺序，0 起
 	Actions    []ActionReceipt `json:"actions"`
 
-	executedAtRaw json.RawMessage
+	executedAtSF strictField
 }
 
 // receiptJSONShape 只用于解码，按保存格式的字段名逐字接住每个字段的原始 JSON。
@@ -89,10 +89,8 @@ func (r *Receipt) UnmarshalJSON(data []byte) error {
 	r.ProposalID = shape.ProposalID
 	r.Order = shape.Order
 	r.Actions = shape.Actions
-	r.executedAtRaw = shape.ExecutedAt
-	if isInt64Number(shape.ExecutedAt) {
-		_ = json.Unmarshal(shape.ExecutedAt, &r.ExecutedAt)
-	}
+	r.executedAtSF = captureStrictField(strictInteger, shape.ExecutedAt)
+	r.ExecutedAt = r.executedAtSF.int64Value()
 	return nil
 }
 
@@ -477,7 +475,7 @@ func (s *Store) Execute(id string, now int64) (*Receipt, error) {
 	}
 	// 同步填上字段原始片段，使“提交前校验”与“打开重放校验”走同一份
 	// executed_at 判定时不会把本进程新建的凭据误判为字段缺失。
-	receipt.executedAtRaw, _ = json.Marshal(now)
+	receipt.executedAtSF = presentStrictField(strictInteger, now)
 	for i, st := range steps {
 		receipt.Actions = append(receipt.Actions, st.actionReceipt(i, target.actions[i]))
 	}
@@ -876,20 +874,17 @@ func validateState(state *storedState) error {
 }
 
 // validateReceiptExecutedAt 严格判定一份已保存凭据的 executed_at：
-// 字段未写出、显式为 null 或不是 int64 整数都返回带定位的错误；
+// 字段未写出、显式为 null 或不是 int64 整数都返回带定位的错误（完整性与
+// 类型判定复用 validateStrictFields，与票据字段、计票权重同一份规则）；
 // 明确写出的值必须不早于所属提案的 timelock_end（恰好等于时间锁有效，
 // 时间锁允许 0 时明确写出的 0 同样有效）。order 是凭据在凭据表中的
 // 位置（0 起），与提案编号一起用于定位。
 func validateReceiptExecutedAt(order int, rcpt *Receipt, timelockEnd int64) error {
-	raw := rcpt.executedAtRaw
-	switch {
-	case raw == nil:
-		return fmt.Errorf("receipt %d for proposal %q field %q is missing", order, rcpt.ProposalID, "executed_at")
-	case string(raw) == "null":
-		return fmt.Errorf("receipt %d for proposal %q field %q is null", order, rcpt.ProposalID, "executed_at")
-	case !isInt64Number(raw):
-		return fmt.Errorf("receipt %d for proposal %q field %q has wrong type: want integer, got %s",
-			order, rcpt.ProposalID, "executed_at", jsonValueType(raw))
+	location := fmt.Sprintf("receipt %d for proposal %q", order, rcpt.ProposalID)
+	if err := validateStrictFields(location, []strictFieldSpec{
+		{name: "executed_at", field: &rcpt.executedAtSF},
+	}); err != nil {
+		return err
 	}
 	if rcpt.ExecutedAt < timelockEnd {
 		return fmt.Errorf("receipt %d for proposal %q executed_at %d is before timelock_end %d",
