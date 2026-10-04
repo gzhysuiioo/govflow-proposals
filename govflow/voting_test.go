@@ -2014,3 +2014,163 @@ func TestExplicitZeroTallyWeightsLegal(t *testing.T) {
 		t.Fatalf("zero against weight misread: %+v", v2.Tally)
 	}
 }
+
+// TestCreateVoteRejectsInvalidUTF8：提案编号、成员编号或动作原文含有非法
+// UTF-8 字节（非法首字节、残缺多字节序列、UTF-8 形式直接编码的代理码位）
+// 时整项创建失败，错误分类为 ErrInvalidProposal，且说明是哪类文本、
+// 成员/动作在提交列表中的位置；状态文件逐字节保持原样。
+func TestCreateVoteRejectsInvalidUTF8(t *testing.T) {
+	store, path := openTempStore(t, 1000)
+	defer store.Close()
+
+	// 状态中先存在一项编号含真实 U+FFFD 的合法提案与一笔登记提案，
+	// 验证失败不重试/覆盖已有内容，已有提案、票据与余额不受影响。
+	fffdIn := baseVoteInput("gip-�")
+	mustCreateVote(t, store, fffdIn)
+	mustRegister(t, store, "gip-reg", 300, "transfer:a:1")
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read state: %v", err)
+	}
+
+	cases := []struct {
+		name      string
+		mutate    func(in *CreateVoteInput)
+		wantInErr []string
+	}{
+		{"proposal id illegal byte", func(in *CreateVoteInput) {
+			in.ID = "gip-\xff"
+		}, []string{"proposal id", "UTF-8"}},
+		{"proposal id truncated rune", func(in *CreateVoteInput) {
+			in.ID = "gip-\xe4\xb8" // “中”缺少最后一个字节
+		}, []string{"proposal id", "UTF-8"}},
+		{"proposal id encoded surrogate", func(in *CreateVoteInput) {
+			in.ID = "gip-\xed\xa0\x80" // UTF-8 形式直接编码的 U+D800
+		}, []string{"proposal id", "UTF-8"}},
+		{"member id illegal byte", func(in *CreateVoteInput) {
+			in.Members[1].ID = "bo\xffb"
+		}, []string{"member 1", "UTF-8"}},
+		{"member id truncated rune", func(in *CreateVoteInput) {
+			in.Members[3].ID = "\xe4\xb8"
+		}, []string{"member 3", "UTF-8"}},
+		{"member id encoded surrogate", func(in *CreateVoteInput) {
+			in.Members[0].ID = "\xed\xb0\x80" // UTF-8 形式直接编码的 U+DC00
+		}, []string{"member 0", "UTF-8"}},
+		{"action text illegal byte", func(in *CreateVoteInput) {
+			in.Actions[0] = "transfer:audits:\xff"
+		}, []string{"action 0", "UTF-8"}},
+		{"action text truncated rune", func(in *CreateVoteInput) {
+			in.Actions = append(in.Actions, "\xf0\x9f\x98") // 表情缺少最后一个字节
+		}, []string{"action 1", "UTF-8"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			in := baseVoteInput("bad-" + strings.ReplaceAll(tc.name, " ", "-"))
+			tc.mutate(in)
+			_, existed, err := store.CreateVoteProposal(in)
+			if err == nil || existed {
+				t.Fatalf("expected rejection, existed=%v err=%v", existed, err)
+			}
+			if !errors.Is(err, ErrInvalidProposal) {
+				t.Fatalf("err=%v, want ErrInvalidProposal", err)
+			}
+			for _, want := range tc.wantInErr {
+				if !strings.Contains(err.Error(), want) {
+					t.Fatalf("err=%q, want substring %q", err.Error(), want)
+				}
+			}
+		})
+	}
+
+	// 非法字节输入落盘时会被改写成真实 U+FFFD，恰好等于已存在的合法编号：
+	// 仍必须整项失败（ErrInvalidProposal），不得当作该编号的相同内容重试，
+	// 更不得覆盖它。
+	retry := baseVoteInput("gip-\xef\xbf") // “�”缺少最后一个字节
+	if _, existed, err := store.CreateVoteProposal(retry); err == nil || existed ||
+		!errors.Is(err, ErrInvalidProposal) {
+		t.Fatalf("invalid-UTF-8 collision with real U+FFFD id: existed=%v err=%v", existed, err)
+	}
+
+	// 状态文件逐字节保持原样；已有合法提案仍可按原编号查询。
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read state: %v", err)
+	}
+	if string(after) != string(before) {
+		t.Fatalf("state file changed after rejected creates")
+	}
+	v, ok, err := store.VoteProposal("gip-�")
+	if err != nil || !ok || v.ID != "gip-�" {
+		t.Fatalf("existing U+FFFD proposal: ok=%v err=%v view=%+v", ok, err, v)
+	}
+	if bal, err := store.TreasuryBalance(); err != nil || bal != 1000 {
+		t.Fatalf("treasury changed: bal=%d err=%v", bal, err)
+	}
+}
+
+// TestCreateVotePreservesValidText：中文、表情、用户明确写出的 U+FFFD 以及
+// 由反斜杠与普通字母组成的字面文本（如 "\uD800"：创建参数不是 JSON 字符串，
+// 不得把其中看似 Unicode 转义的文字重解释成字符）都按原文保存与展示。
+// 编码合法但动作格式错误的文本照常创建，由执行操作按现有规则拒绝。
+func TestCreateVotePreservesValidText(t *testing.T) {
+	store, path := openTempStore(t, 1000)
+	in := &CreateVoteInput{
+		ID: "提案-�-😀",
+		Members: []VoteMember{
+			{ID: "成员甲", Weight: 100},
+			{ID: "smi�le-😀", Weight: 200},
+			{ID: `back\uD800slash`, Weight: 300}, // 反斜杠 + 普通字母的字面文本
+		},
+		Quorum:      400,
+		StartAt:     10,
+		Deadline:    20,
+		TimelockEnd: 30,
+		Actions: []string{
+			"transfer:账户:100",
+			`literal FFFD stays text`,
+			"not-a-transfer-action", // 编码合法但格式错误：创建仍允许
+		},
+	}
+	view := mustCreateVote(t, store, in)
+	if view.ID != in.ID {
+		t.Fatalf("view id = %q, want %q", view.ID, in.ID)
+	}
+	for i, m := range view.Members {
+		if m.ID != in.Members[i].ID {
+			t.Fatalf("member %d id = %q, want %q", i, m.ID, in.Members[i].ID)
+		}
+	}
+	if !sameActions(view.Actions, in.Actions) {
+		t.Fatalf("view actions = %q, want %q", view.Actions, in.Actions)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	// 重新打开后查询仍逐字展示原文。
+	reopened, err := Open(path)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer reopened.Close()
+	got, ok, err := reopened.VoteProposal(in.ID)
+	if err != nil || !ok {
+		t.Fatalf("query after reopen: ok=%v err=%v", ok, err)
+	}
+	if got.ID != in.ID {
+		t.Fatalf("reopened id = %q, want %q", got.ID, in.ID)
+	}
+	for i, m := range got.Members {
+		if m.ID != in.Members[i].ID {
+			t.Fatalf("reopened member %d id = %q, want %q", i, m.ID, in.Members[i].ID)
+		}
+	}
+	if !sameActions(got.Actions, in.Actions) {
+		t.Fatalf("reopened actions = %q, want %q", got.Actions, in.Actions)
+	}
+
+	// 格式错误的动作在执行时才被拒绝，创建入口不提前改变动作资格。
+	if _, err := reopened.Execute(in.ID, 30); err == nil {
+		t.Fatalf("execute with malformed action must fail")
+	}
+}

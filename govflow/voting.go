@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"unicode/utf8"
 )
 
 // 投票提案相关错误。
@@ -309,18 +310,33 @@ type proposalSpec struct {
 
 // validateProposalInput 校验全部创建规则并派生委托路径与代表权重。
 // 任何非法条件都返回错误，调用方必须整项拒绝。
+//
+// 提案编号、成员编号与动作原文还必须是合法 UTF-8：状态文件以 JSON 保存，
+// encoding/json 会把字符串中的非法 UTF-8 字节悄悄改写成替换字符 U+FFFD
+// 且不报错。创建入口若放行，落盘的编号就不再是用户提交的原文——原编号
+// 无法查询，不同成员可能被改写成同一个名字，整份状态文件随之无法读取。
+// 因此这三类文本在一切落盘之前逐字校验，非法输入整项创建失败；
+// 合法文本（含中文、表情、用户明确写出的 U+FFFD，以及 "\uD800" 这类
+// 由反斜杠与普通字母组成的字面文本——创建参数不是 JSON 字符串，不做
+// 转义重解释）原样保留。
 func validateProposalInput(in *CreateVoteInput) (*proposalSpec, error) {
 	if in.ID == "" {
 		return nil, invalidProposal("proposal id must not be empty")
+	}
+	if problem := invalidUTF8(in.ID); problem != "" {
+		return nil, invalidProposal("proposal id is not valid UTF-8: %s", problem)
 	}
 	if len(in.Members) == 0 {
 		return nil, invalidProposal("proposal %s: member list must not be empty", in.ID)
 	}
 	weights := make(map[string]int64, len(in.Members))
 	order := make([]string, 0, len(in.Members))
-	for _, m := range in.Members {
+	for i, m := range in.Members {
 		if m.ID == "" {
 			return nil, invalidProposal("proposal %s: member id must not be empty", in.ID)
+		}
+		if problem := invalidUTF8(m.ID); problem != "" {
+			return nil, invalidProposal("proposal %s: member %d id is not valid UTF-8: %s", in.ID, i, problem)
 		}
 		if _, dup := weights[m.ID]; dup {
 			return nil, invalidProposal("proposal %s: duplicate member %q", in.ID, m.ID)
@@ -348,6 +364,14 @@ func validateProposalInput(in *CreateVoteInput) (*proposalSpec, error) {
 	if !(0 <= in.StartAt && in.StartAt < in.Deadline && in.Deadline <= in.TimelockEnd) {
 		return nil, invalidProposal("proposal %s: times must satisfy 0 <= start < deadline <= timelock, got start=%d deadline=%d timelock=%d",
 			in.ID, in.StartAt, in.Deadline, in.TimelockEnd)
+	}
+
+	// 动作原文逐字校验编码，但不校验动作格式：编码合法而格式错误的动作
+	// 照常创建，由执行操作按现有规则拒绝，创建入口不提前改变动作资格。
+	for i, action := range in.Actions {
+		if problem := invalidUTF8(action); problem != "" {
+			return nil, invalidProposal("proposal %s: action %d text is not valid UTF-8: %s", in.ID, i, problem)
+		}
 	}
 
 	delegate := make(map[string]string, len(in.Delegations))
@@ -441,6 +465,26 @@ func invalidProposal(format string, args ...any) error {
 	return fmt.Errorf("%w: %s", ErrInvalidProposal, fmt.Sprintf(format, args...))
 }
 
+// invalidUTF8 定位文本中第一个非法 UTF-8 字节并给出可读描述；文本合法时
+// 返回空串。残缺的多字节序列、续字节缺失、越界编码以及 WTF-8 形式写出的
+// 代理码位（如 ED A0 80）都会被 DecodeRuneInString 判为单字节 RuneError；
+// 用户明确写出的合法 U+FFFD（EF BF BD）解码长度为 3，照常放行。
+func invalidUTF8(s string) string {
+	for i := 0; i < len(s); {
+		c := s[i]
+		if c < utf8.RuneSelf {
+			i++
+			continue
+		}
+		r, size := utf8.DecodeRuneInString(s[i:])
+		if r == utf8.RuneError && size == 1 {
+			return fmt.Sprintf("illegal byte 0x%02X at byte offset %d", c, i)
+		}
+		i += size
+	}
+	return ""
+}
+
 // proposalsEqual 判断重试内容是否与已存提案逐项相同。
 // 成员与委托的输入次序不影响比较；动作文本与顺序必须一致。
 func proposalsEqual(stored *storedVoteProposal, in *CreateVoteInput, spec *proposalSpec) bool {
@@ -476,7 +520,11 @@ func proposalsEqual(stored *storedVoteProposal, in *CreateVoteInput, spec *propo
 // CreateVoteProposal 创建一项投票提案。
 // 同编号且全部内容相同的重试返回已存在提案（existed=true）且不改变任何状态；
 // 同编号内容不同（或编号已被 register 来源占用）返回 ErrProposalConflict。
-// 非法条件整项拒绝，不落盘任何部分变化。
+// 非法条件整项拒绝，不落盘任何部分变化。提案编号、成员编号与动作原文
+// 含有非法 UTF-8 字节时同样整项拒绝（ErrInvalidProposal）：保存会把这些
+// 字节改写成 U+FFFD，使落盘文本不再是用户提交的原文；因此即使非法输入
+// 改写后恰好等于状态中已存在的合法编号（如含真实 U+FFFD 的编号），
+// 也不被当作该编号的重试或覆盖。合法文本逐字保留，不做任何转义重解释。
 func (s *Store) CreateVoteProposal(in *CreateVoteInput) (view *VoteProposalView, existed bool, err error) {
 	spec, err := validateProposalInput(in)
 	if err != nil {
