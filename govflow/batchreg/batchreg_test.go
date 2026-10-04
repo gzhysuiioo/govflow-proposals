@@ -3,6 +3,7 @@ package batchreg
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -712,5 +713,250 @@ func TestImportConflictNamesAllFields(t *testing.T) {
 func TestImportEmpty(t *testing.T) {
 	if _, err := Import(&Registry{Version: FormatVersion}, nil); err == nil {
 		t.Fatal("empty manifest must be rejected")
+	}
+}
+
+// Directly submitted records (Go callers of Import, as opposed to records
+// normalized by ParseManifest) must satisfy the same value rules as
+// Register: non-empty batch/product/unit and a positive quantity. The
+// rejection is a ManifestRecordError naming the 1-based position, the field
+// and the reason, with the batch id attached only when that id itself is
+// non-empty and valid UTF-8. No result is returned and the registry is left
+// exactly as it was.
+func TestImportRejectsInvalidDirectRecords(t *testing.T) {
+	stored := []Batch{{Batch: "B1", Product: "P-1", Quantity: 3, Unit: "kg"}}
+	cases := []struct {
+		name      string
+		existing  []Batch
+		inputs    []Input
+		wantPos   int
+		wantField string
+		wantBatch string // "" means the error must carry no batch id
+	}{
+		// Records that would be plain creations.
+		{"empty batch on new", nil,
+			[]Input{{Batch: "", Product: "P", Quantity: 1, Unit: "kg"}}, 1, "batch", ""},
+		{"empty product on new", nil,
+			[]Input{{Batch: "B", Product: "", Quantity: 1, Unit: "kg"}}, 1, "product", "B"},
+		{"empty unit on new", nil,
+			[]Input{{Batch: "B", Product: "P", Quantity: 1, Unit: ""}}, 1, "unit", "B"},
+		{"zero quantity on new", nil,
+			[]Input{{Batch: "B", Product: "P", Quantity: 0, Unit: "kg"}}, 1, "quantity", "B"},
+		{"negative quantity", nil,
+			[]Input{{Batch: "B", Product: "P", Quantity: -4, Unit: "kg"}}, 1, "quantity", "B"},
+		{"zero value struct", nil,
+			[]Input{{}}, 1, "batch", ""},
+
+		// Invalid records whose id is already stored: the value check must
+		// win over duplicate confirmation and over conflict classification.
+		{"empty product on stored id", stored,
+			[]Input{{Batch: "B1", Product: "", Quantity: 3, Unit: "kg"}}, 1, "product", "B1"},
+		{"empty unit on stored id", stored,
+			[]Input{{Batch: "B1", Product: "P-1", Quantity: 3, Unit: ""}}, 1, "unit", "B1"},
+		{"zero quantity on stored id", stored,
+			[]Input{{Batch: "B1", Product: "P-1", Quantity: 0, Unit: "kg"}}, 1, "quantity", "B1"},
+		{"negative quantity despite differing product", stored,
+			[]Input{{Batch: "B1", Product: "OTHER", Quantity: -1, Unit: "kg"}}, 1, "quantity", "B1"},
+
+		// An invalid repeat of an id introduced earlier in this manifest is a
+		// record error, not a same-manifest conflict.
+		{"empty product on manifest repeat", nil,
+			[]Input{
+				{Batch: "B1", Product: "P", Quantity: 1, Unit: "kg"},
+				{Batch: "B1", Product: "", Quantity: 1, Unit: "kg"},
+			}, 2, "product", "B1"},
+		{"zero quantity on manifest repeat", nil,
+			[]Input{
+				{Batch: "B1", Product: "P", Quantity: 1, Unit: "kg"},
+				{Batch: "B1", Product: "P", Quantity: 0, Unit: "kg"},
+			}, 2, "quantity", "B1"},
+
+		// A late invalid record fails everything even though earlier records
+		// could already be confirmed or created.
+		{"invalid after duplicate and creation", stored,
+			[]Input{
+				{Batch: "B1", Product: "P-1", Quantity: 3, Unit: "kg"}, // stored duplicate
+				{Batch: "NEW", Product: "P-9", Quantity: 2, Unit: "m"}, // creation
+				{Batch: "LATE", Product: "P-2", Quantity: 0, Unit: "g"},
+			}, 3, "quantity", "LATE"},
+		{"empty unit on later record", nil,
+			[]Input{
+				{Batch: "OK1", Product: "P", Quantity: 1, Unit: "kg"},
+				{Batch: "OK2", Product: "P", Quantity: 1, Unit: ""},
+			}, 2, "unit", "OK2"},
+
+		// Bad batch bytes: the id stays out, while a bad non-batch field can
+		// still name the valid batch.
+		{"invalid utf8 batch names no id", nil,
+			[]Input{{Batch: string([]byte{'B', 0xff}), Product: "P", Quantity: 1, Unit: "kg"}}, 1, "batch", ""},
+		{"invalid utf8 product names batch", nil,
+			[]Input{{Batch: "B7", Product: string([]byte{'P', 0xff}), Quantity: 1, Unit: "kg"}}, 1, "product", "B7"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			reg := &Registry{Version: FormatVersion, Batches: append([]Batch(nil), tc.existing...)}
+			before := append([]Batch(nil), reg.Batches...)
+
+			out, err := Import(reg, tc.inputs)
+			var re *ManifestRecordError
+			if !errors.As(err, &re) {
+				t.Fatalf("expected ManifestRecordError, got %v", err)
+			}
+			var ce *ManifestConflictError
+			if errors.As(err, &ce) {
+				t.Fatalf("invalid record must not be classified as a conflict: %v", err)
+			}
+			if re.Position != tc.wantPos {
+				t.Errorf("position = %d, want %d", re.Position, tc.wantPos)
+			}
+			if re.Field != tc.wantField {
+				t.Errorf("field = %q, want %q", re.Field, tc.wantField)
+			}
+			if re.Reason == "" {
+				t.Error("reason must explain the violation")
+			}
+			if re.Batch != tc.wantBatch {
+				t.Errorf("batch = %q, want %q", re.Batch, tc.wantBatch)
+			}
+			if !strings.Contains(err.Error(), fmt.Sprintf("record %d", tc.wantPos)) {
+				t.Errorf("error text must name the position: %v", err)
+			}
+			if !strings.Contains(err.Error(), strconv.Quote(tc.wantField)) {
+				t.Errorf("error text must name field %q: %v", tc.wantField, err)
+			}
+			if tc.wantBatch == "" && strings.Contains(err.Error(), "(batch ") {
+				t.Errorf("error text must not cite a batch id: %v", err)
+			}
+			if out != nil {
+				t.Errorf("a failed import must return no results, got %+v", out)
+			}
+			if len(reg.Batches) != len(before) {
+				t.Fatalf("registry changed from %d to %d records: %+v", len(before), len(reg.Batches), reg.Batches)
+			}
+			for i := range before {
+				if reg.Batches[i] != before[i] {
+					t.Fatalf("registry record %d changed: %+v", i+1, reg.Batches[i])
+				}
+			}
+		})
+	}
+}
+
+// Fields are checked in batch, product, unit, quantity order, so the first
+// offending field is the one reported even when several are invalid.
+func TestImportInvalidRecordFieldOrder(t *testing.T) {
+	cases := []struct {
+		name string
+		in   Input
+		want string
+	}{
+		{"batch beats product", Input{Batch: "", Product: "", Quantity: 0, Unit: ""}, "batch"},
+		{"product beats unit", Input{Batch: "B", Product: "", Quantity: 0, Unit: ""}, "product"},
+		{"unit beats quantity", Input{Batch: "B", Product: "P", Quantity: 0, Unit: ""}, "unit"},
+		{"quantity alone", Input{Batch: "B", Product: "P", Quantity: 0, Unit: "kg"}, "quantity"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			reg := &Registry{Version: FormatVersion}
+			_, err := Import(reg, []Input{tc.in})
+			var re *ManifestRecordError
+			if !errors.As(err, &re) || re.Field != tc.want {
+				t.Fatalf("got %v, want ManifestRecordError on field %q", err, tc.want)
+			}
+		})
+	}
+}
+
+// Direct callers of Import keep their text verbatim: no trimming, no casing
+// change. Leading/trailing/interior whitespace is legal text there, unlike
+// ParseManifest where flags/manifest strings are normalized.
+func TestImportKeepsDirectTextVerbatim(t *testing.T) {
+	reg := &Registry{Version: FormatVersion, Batches: []Batch{
+		{Batch: "OLD", Product: "P-1", Quantity: 3, Unit: "kg"},
+	}}
+	inputs := []Input{
+		{Batch: " B1 ", Product: " P 7 ", Quantity: 1, Unit: " kg "},
+		{Batch: " B1 ", Product: " P 7 ", Quantity: 1, Unit: " kg "}, // verbatim repeat
+		{Batch: "  ", Product: "whitespace-only", Quantity: 1, Unit: "x"},
+	}
+	out, err := Import(reg, inputs)
+	if err != nil {
+		t.Fatalf("untrimmed direct input is legal: %v", err)
+	}
+	if !out[0].Created || out[1].Created {
+		t.Fatalf("want created then verbatim duplicate, got %+v", out)
+	}
+	want := []Batch{
+		{Batch: "OLD", Product: "P-1", Quantity: 3, Unit: "kg"},
+		{Batch: " B1 ", Product: " P 7 ", Quantity: 1, Unit: " kg "},
+		{Batch: "  ", Product: "whitespace-only", Quantity: 1, Unit: "x"},
+	}
+	if len(reg.Batches) != len(want) {
+		t.Fatalf("got %+v", reg.Batches)
+	}
+	for i, w := range want {
+		if reg.Batches[i] != w {
+			t.Errorf("record %d stored as %+v, want verbatim %+v", i+1, reg.Batches[i], w)
+		}
+	}
+
+	// The trimmed spelling is a different id (no normalization), so it is a
+	// brand-new batch rather than a duplicate of " B1 ".
+	more := []Input{{Batch: "B1", Product: "P 7", Quantity: 1, Unit: "kg"}}
+	out2, err := Import(reg, more)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !out2[0].Created {
+		t.Fatal("trimmed spelling must not collapse onto the untrimmed batch")
+	}
+}
+
+// An invalid later record must fail the whole import even when an earlier
+// record confirms an existing duplicate and an intervening one is a valid
+// new batch: the caller must not see partial registration, and on retry with
+// all records legal the same duplicate/created outcomes are produced.
+func TestImportInvalidLateRecordLeavesNoPartialResult(t *testing.T) {
+	original := []Batch{{Batch: "B1", Product: "P-1", Quantity: 3, Unit: "kg"}}
+	reg := &Registry{Version: FormatVersion, Batches: append([]Batch(nil), original...)}
+
+	out, err := Import(reg, []Input{
+		{Batch: "B1", Product: "P-1", Quantity: 3, Unit: "kg"},
+		{Batch: "NEW", Product: "P-9", Quantity: 2, Unit: "m"},
+		{Batch: "LATE", Product: "P-2", Quantity: 0, Unit: "g"},
+	})
+	if err == nil {
+		t.Fatal("zero quantity must reject the import")
+	}
+	if out != nil {
+		t.Fatalf("failed import returned results: %+v", out)
+	}
+	if len(reg.Batches) != 1 || reg.Batches[0] != original[0] {
+		t.Fatalf("earlier legal records must not remain: %+v", reg.Batches)
+	}
+
+	// Retrying with the late record fixed succeeds with results in order.
+	out, err = Import(reg, []Input{
+		{Batch: "B1", Product: "P-1", Quantity: 3, Unit: "kg"},
+		{Batch: "NEW", Product: "P-9", Quantity: 2, Unit: "m"},
+		{Batch: "LATE", Product: "P-2", Quantity: 5, Unit: "g"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantCreated := []bool{false, true, true}
+	for i, want := range wantCreated {
+		if out[i].Created != want {
+			t.Errorf("record %d created=%v, want %v", i+1, out[i].Created, want)
+		}
+	}
+	if got := []string{"B1", "NEW", "LATE"}; len(reg.Batches) != len(got) {
+		t.Fatalf("got %+v", reg.Batches)
+	} else {
+		for i, name := range got {
+			if reg.Batches[i].Batch != name {
+				t.Errorf("stored record %d = %q, want %q", i+1, reg.Batches[i].Batch, name)
+			}
+		}
 	}
 }

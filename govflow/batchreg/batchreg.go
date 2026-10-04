@@ -646,18 +646,27 @@ func validate(reg *Registry) error {
 
 // ManifestRecordError reports a manifest record that is structurally invalid
 // or carries a quantity outside the accepted range. Position is the record's
-// 1-based position in the manifest.
+// 1-based position in the manifest. Field names the offending member among
+// "batch", "product", "quantity" and "unit" when the failure is specific to
+// one field; it stays empty for whole-record problems.
 type ManifestRecordError struct {
 	Position int
 	Batch    string // normalized batch id when available, otherwise ""
+	Field    string // offending field name, or "" for a whole-record problem
 	Reason   string
 }
 
 func (e *ManifestRecordError) Error() string {
+	var head string
 	if e.Batch != "" {
-		return fmt.Sprintf("manifest record %d (batch %q): %s", e.Position, e.Batch, e.Reason)
+		head = fmt.Sprintf("manifest record %d (batch %q)", e.Position, e.Batch)
+	} else {
+		head = fmt.Sprintf("manifest record %d", e.Position)
 	}
-	return fmt.Sprintf("manifest record %d: %s", e.Position, e.Reason)
+	if e.Field != "" {
+		return fmt.Sprintf("%s: field %q: %s", head, e.Field, e.Reason)
+	}
+	return fmt.Sprintf("%s: %s", head, e.Reason)
 }
 
 // ManifestConflictError reports that a manifest record disagrees with the
@@ -854,12 +863,20 @@ type ImportResult struct {
 }
 
 // Import validates every record of inputs before appending anything: the
-// whole manifest fails if any record conflicts with a stored record or with
-// an earlier manifest record, and reg is left untouched on error. New batch
-// ids are appended in first-occurrence order; an id already stored or
-// introduced earlier in the same manifest is confirmed as a duplicate only
-// when product, quantity and unit all match. Results come back in manifest
-// order; Created is false for duplicates.
+// whole manifest fails if any record carries an invalid value, conflicts
+// with a stored record or conflicts with an earlier manifest record, and reg
+// is left untouched on error. Directly submitted records are held to the
+// same value rules as Register: batch, product and unit must be non-empty
+// valid UTF-8 and quantity must be in 1..MaxQuantity. Text is taken
+// verbatim here — no trimming or casing change; the CLI entry point
+// normalizes flags itself, while direct callers keep their own values.
+// Validation runs for every record before any record is classified as new,
+// duplicate or conflicting, so a late invalid record fails the import even
+// when earlier records could already be confirmed as duplicates or
+// creations. New batch ids are appended in first-occurrence order; an id
+// already stored or introduced earlier in the same manifest is confirmed as
+// a duplicate only when product, quantity and unit all match. Results come
+// back in manifest order; Created is false for duplicates.
 func Import(reg *Registry, inputs []Input) (results []ImportResult, err error) {
 	if reg.Version != FormatVersion {
 		return nil, fmt.Errorf("unsupported registry version %d", reg.Version)
@@ -867,20 +884,35 @@ func Import(reg *Registry, inputs []Input) (results []ImportResult, err error) {
 	if len(inputs) == 0 {
 		return nil, errors.New("manifest must contain at least one record")
 	}
-	// Reject malformed text before touching anything; every input must be
-	// valid UTF-8 so stored ids can never silently collapse onto U+FFFD.
+	// Reject every invalid record before touching anything. The text fields
+	// must be non-empty valid UTF-8 (so stored ids can never silently collapse
+	// onto U+FFFD) and the quantity a positive integer, regardless of whether
+	// the record would otherwise be a creation, a duplicate confirmation or a
+	// conflict.
 	for i, in := range inputs {
-		batchValid := utf8.ValidString(in.Batch)
+		pos := i + 1
+		// The batch id accompanies the error only when it is itself usable:
+		// non-empty and valid UTF-8. An empty id and malformed id bytes both
+		// leave it out — never an invented value or a U+FFFD substitution.
+		batchID := ""
+		if in.Batch != "" && utf8.ValidString(in.Batch) {
+			batchID = in.Batch
+		}
+		bad := func(field, reason string) error {
+			return &ManifestRecordError{Position: pos, Batch: batchID, Field: field, Reason: reason}
+		}
 		for _, tv := range []struct{ field, value string }{
 			{"batch", in.Batch}, {"product", in.Product}, {"unit", in.Unit},
 		} {
 			if !utf8.ValidString(tv.value) {
-				err := &ManifestRecordError{Position: i + 1, Reason: (&EncodingError{Field: tv.field}).Error()}
-				if tv.field != "batch" && batchValid && in.Batch != "" {
-					err.Batch = in.Batch
-				}
-				return nil, err
+				return nil, bad(tv.field, "contains bytes that are not valid UTF-8; the value is rejected instead of being replaced with U+FFFD")
 			}
+			if tv.value == "" {
+				return nil, bad(tv.field, "must not be empty")
+			}
+		}
+		if in.Quantity <= 0 || in.Quantity > MaxQuantity {
+			return nil, bad("quantity", fmt.Sprintf("must be a positive integer no greater than %d", MaxQuantity))
 		}
 	}
 
