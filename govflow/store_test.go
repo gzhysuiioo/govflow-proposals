@@ -1560,3 +1560,233 @@ func TestOldStateWithoutVoteProposalsReadable(t *testing.T) {
 		t.Fatalf("pending proposal = %+v ok=%v", p, ok)
 	}
 }
+
+// TestBalanceTableMustMatchReceipts：余额表中的账户必须与成功执行凭据涉及的
+// 收款账户完全对应。把 legal:50 换成 ghost:0（账户数量不变）、额外加入无凭据
+// 支持的账户、或已记录余额与凭据累计不符，都判整份状态损坏，错误指出涉及的
+// 账户名称；合法累计余额与空余额表不受影响。
+func TestBalanceTableMustMatchReceipts(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "treasury.json")
+	store, err := InitTreasury(path, 1000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustRegister(t, store, "gip-1", 0, "transfer:audits:100", "transfer:legal:50")
+	// 同一账户跨提案多次收款：合法累计余额必须被认可。
+	mustRegister(t, store, "gip-2", 0, "transfer:audits:25")
+	if _, err := store.Execute("gip-1", 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Execute("gip-2", 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	good, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 基线：treasury=825，audits=125（100+25 累计），legal=50。
+	t.Run("baseline readable", func(t *testing.T) {
+		s, err := Open(path)
+		if err != nil {
+			t.Fatalf("reopen: %v", err)
+		}
+		defer s.Close()
+		snap, err := s.BalanceSnapshot()
+		if err != nil {
+			t.Fatalf("BalanceSnapshot: %v", err)
+		}
+		if snap.Treasury != 825 || snap.Balances["audits"] != 125 || snap.Balances["legal"] != 50 ||
+			len(snap.Balances) != 2 {
+			t.Fatalf("baseline snapshot = %+v, want treasury=825 audits=125 legal=50", snap)
+		}
+		// 从未收款的账户仍返回 0，且不向余额表新增条目。
+		if bal, _ := s.Balance("ghost"); bal != 0 {
+			t.Fatalf("ghost balance = %d, want 0", bal)
+		}
+		again, _ := s.BalanceSnapshot()
+		if _, ok := again.Balances["ghost"]; ok {
+			t.Fatal("query must not create account entries")
+		}
+	})
+
+	mutateBalances := func(fn func(balances map[string]any)) []byte {
+		var root map[string]any
+		if err := json.Unmarshal(good, &root); err != nil {
+			t.Fatal(err)
+		}
+		fn(root["balances"].(map[string]any))
+		raw, err := json.MarshalIndent(root, "", "  ")
+		if err != nil {
+			t.Fatal(err)
+		}
+		return append(raw, '\n')
+	}
+
+	corruptions := []struct {
+		name    string
+		raw     []byte
+		wantMsg []string
+	}{
+		{
+			// 任务场景：legal:50 换成 ghost:0，账户数量保持相同。
+			name: "recipient swapped for zero-balance ghost",
+			raw: mutateBalances(func(b map[string]any) {
+				delete(b, "legal")
+				b["ghost"] = float64(0)
+			}),
+			wantMsg: []string{`"legal"`, "receipt"},
+		},
+		{
+			// 只删除收款账户，不补任何账户。
+			name: "recipient record dropped",
+			raw: mutateBalances(func(b map[string]any) {
+				delete(b, "legal")
+			}),
+			wantMsg: []string{`"legal"`, "receipt"},
+		},
+		{
+			// 额外加入无凭据支持的账户，即使写成 0 也不能接受。
+			name: "unsupported zero-balance ghost added",
+			raw: mutateBalances(func(b map[string]any) {
+				b["ghost"] = float64(0)
+			}),
+			wantMsg: []string{`"ghost"`, "receipt"},
+		},
+		{
+			// 无凭据支持的非零账户同样拒绝。
+			name: "unsupported non-zero ghost added",
+			raw: mutateBalances(func(b map[string]any) {
+				b["ghost"] = float64(7)
+			}),
+			wantMsg: []string{`"ghost"`, "receipt"},
+		},
+		{
+			// 已记录余额与凭据累计不一致。
+			name: "recorded balance mismatches receipts",
+			raw: mutateBalances(func(b map[string]any) {
+				b["audits"] = float64(100)
+			}),
+			wantMsg: []string{`"audits"`, "100", "125"},
+		},
+	}
+	for _, tc := range corruptions {
+		t.Run(tc.name, func(t *testing.T) {
+			bad := filepath.Join(dir, "corrupt-"+strings.ReplaceAll(tc.name, " ", "-")+".json")
+			if err := os.WriteFile(bad, tc.raw, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			s, err := Open(bad)
+			if !errors.Is(err, ErrStateCorrupt) {
+				if s != nil {
+					s.Close()
+				}
+				t.Fatalf("Open err=%v, want ErrStateCorrupt", err)
+			}
+			for _, want := range tc.wantMsg {
+				if !strings.Contains(err.Error(), want) {
+					t.Fatalf("error %q does not mention %q", err.Error(), want)
+				}
+			}
+			// 原状态文件保持原样：不补回缺失账户、不删除陌生账户。
+			if got, rerr := os.ReadFile(bad); rerr != nil || string(got) != string(tc.raw) {
+				t.Fatalf("corrupt file was modified")
+			}
+		})
+	}
+
+	// 已打开资金库之后文件被换成损坏版本：查询与执行都报损坏，不返回部分余额。
+	t.Run("detected after open", func(t *testing.T) {
+		p := filepath.Join(dir, "swap.json")
+		if err := os.WriteFile(p, good, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		s, err := Open(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer s.Close()
+		corrupt := mutateBalances(func(b map[string]any) {
+			delete(b, "legal")
+			b["ghost"] = float64(0)
+		})
+		if err := os.WriteFile(p, corrupt, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.BalanceSnapshot(); !errors.Is(err, ErrStateCorrupt) {
+			t.Fatalf("BalanceSnapshot err=%v, want ErrStateCorrupt", err)
+		}
+		if _, err := s.Balance("audits"); !errors.Is(err, ErrStateCorrupt) {
+			t.Fatalf("Balance err=%v, want ErrStateCorrupt", err)
+		}
+		if _, err := s.TreasuryBalance(); !errors.Is(err, ErrStateCorrupt) {
+			t.Fatalf("TreasuryBalance err=%v, want ErrStateCorrupt", err)
+		}
+		if _, err := s.Execute("gip-1", 9); !errors.Is(err, ErrStateCorrupt) {
+			t.Fatalf("Execute err=%v, want ErrStateCorrupt", err)
+		}
+		if got, _ := os.ReadFile(p); string(got) != string(corrupt) {
+			t.Fatalf("state file was modified by rejected operations")
+		}
+	})
+
+	// 余额表排列顺序不影响结论：同一份合法余额表按不同键序写出仍可读。
+	t.Run("balance order irrelevant", func(t *testing.T) {
+		raw := strings.Replace(string(good), `"balances": {`, `"balances": {
+    "zz-last": 0,`, 1)
+		// 先确认注入的陌生账户会被拒绝，再验证纯重排合法。
+		rejected := filepath.Join(dir, "order-injected.json")
+		if err := os.WriteFile(rejected, []byte(raw), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if s, err := Open(rejected); !errors.Is(err, ErrStateCorrupt) {
+			if s != nil {
+				s.Close()
+			}
+			t.Fatalf("injected account err=%v, want ErrStateCorrupt", err)
+		}
+		var root map[string]any
+		if err := json.Unmarshal(good, &root); err != nil {
+			t.Fatal(err)
+		}
+		reordered := map[string]any{
+			"legal":  root["balances"].(map[string]any)["legal"],
+			"audits": root["balances"].(map[string]any)["audits"],
+		}
+		root["balances"] = reordered
+		rawOK, err := json.MarshalIndent(root, "", "  ")
+		if err != nil {
+			t.Fatal(err)
+		}
+		p := filepath.Join(dir, "reordered.json")
+		if err := os.WriteFile(p, append(rawOK, '\n'), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		s, err := Open(p)
+		if err != nil {
+			t.Fatalf("reordered balances rejected: %v", err)
+		}
+		defer s.Close()
+		if bal, _ := s.Balance("audits"); bal != 125 {
+			t.Fatalf("audits after reorder = %d, want 125", bal)
+		}
+	})
+
+	// 尚未执行任何提案、收款账户表为空（含初始余额为 0）的资金库继续可用。
+	t.Run("empty balances remain usable", func(t *testing.T) {
+		zero, _ := openTempStore(t, 0)
+		defer zero.Close()
+		snap, err := zero.BalanceSnapshot()
+		if err != nil || snap.Treasury != 0 || len(snap.Balances) != 0 {
+			t.Fatalf("zero treasury snapshot = %+v err=%v", snap, err)
+		}
+		if bal, _ := zero.Balance("nobody"); bal != 0 {
+			t.Fatalf("unknown account on empty table = %d, want 0", bal)
+		}
+	})
+}

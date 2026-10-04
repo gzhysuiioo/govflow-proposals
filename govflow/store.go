@@ -948,8 +948,20 @@ func validateState(state *storedState) error {
 	if simTreasury != state.Treasury {
 		return fmt.Errorf("treasury balance %d does not match receipt replay %d", state.Treasury, simTreasury)
 	}
-	if len(simBalances) != len(state.Balances) {
-		return fmt.Errorf("balance table has %d accounts, receipt replay yields %d", len(state.Balances), len(simBalances))
+	// 余额表中的账户集合必须与成功凭据涉及的收款账户完全一致，逐账户双向
+	// 核对：凭据重放出的收款账户在余额表中缺失、或余额表出现没有任何凭据
+	// 支持的账户（即使余额写成 0，map 查找的零值也不能把它伪装成合法记录），
+	// 都按账户名报损坏。账户数量相同不能替代逐账户核对——把 legal:50 换成
+	// ghost:0 这类改写保持数量不变，只有集合与数值双重一致才能通过。
+	for _, account := range sortedAccounts(simBalances) {
+		if _, ok := state.Balances[account]; !ok {
+			return fmt.Errorf("balance record for account %q is missing, but execution receipts yield balance %d", account, simBalances[account])
+		}
+	}
+	for _, account := range sortedAccounts(state.Balances) {
+		if _, ok := simBalances[account]; !ok {
+			return fmt.Errorf("balance record for account %q has no supporting execution receipt", account)
+		}
 	}
 	for account, balance := range state.Balances {
 		if simBalances[account] != balance {
@@ -970,6 +982,17 @@ func validateState(state *storedState) error {
 		}
 	}
 	return nil
+}
+
+// sortedAccounts 返回余额表账户名的排序副本，使余额表与凭据重放结果不一致时
+// 报出的账户顺序确定，与 map 迭代顺序无关。
+func sortedAccounts(balances map[string]int64) []string {
+	accounts := make([]string, 0, len(balances))
+	for account := range balances {
+		accounts = append(accounts, account)
+	}
+	sort.Strings(accounts)
+	return accounts
 }
 
 // validateReceiptExecutedAt 严格判定一份已保存凭据的 executed_at：
