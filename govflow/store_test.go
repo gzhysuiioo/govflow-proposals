@@ -365,6 +365,260 @@ func TestCorruptStateRejected(t *testing.T) {
 	}
 }
 
+// mutateBalanceDoc 解析一份合法状态文件，按 fn 修改后重新序列化；
+// 用于构造余额表与执行凭据不一致的损坏文件。
+func mutateBalanceDoc(t *testing.T, good []byte, fn func(balances map[string]any)) []byte {
+	t.Helper()
+	var doc map[string]any
+	if err := json.Unmarshal(good, &doc); err != nil {
+		t.Fatal(err)
+	}
+	fn(doc["balances"].(map[string]any))
+	raw, err := json.MarshalIndent(doc, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return append(raw, '\n')
+}
+
+// TestBalanceTableMustMatchReceiptRecipients：余额表的账户集合与各账户余额
+// 必须与成功执行凭据重放出的真实资金变动完全一致。把已收款账户换成数量
+// 相同、余额写成 0 的陌生账户（历史漏洞：数量相等且缺失键读到零值，整份
+// 状态曾被误接受）必须判整份损坏：缺少收款账户、出现无凭据支持的账户
+// （即使写成 0）或余额不符都点名拒绝；错误同时给出缺失与多出的账户名。
+func TestBalanceTableMustMatchReceiptRecipients(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "treasury.json")
+	store, err := InitTreasury(path, 1000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustRegister(t, store, "gip-1", 0, "transfer:audits:100", "transfer:legal:50")
+	if _, err := store.Execute("gip-1", 0); err != nil {
+		t.Fatal(err)
+	}
+	store.Close()
+
+	good, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cases := []struct {
+		name    string
+		mutate  func(balances map[string]any)
+		wantAll []string // 错误中必须同时出现的片段
+	}{
+		{
+			name: "recipient replaced by zero-balance ghost (same count)",
+			mutate: func(b map[string]any) {
+				delete(b, "legal")
+				b["ghost"] = float64(0)
+			},
+			wantAll: []string{
+				"balance table is inconsistent with execution receipts",
+				`"legal"`, `"ghost"`, "missing", "no successful receipt",
+			},
+		},
+		{
+			name: "recipient dropped without replacement",
+			mutate: func(b map[string]any) {
+				delete(b, "legal")
+			},
+			wantAll: []string{
+				"balance table is inconsistent with execution receipts",
+				`"legal"`, "missing",
+			},
+		},
+		{
+			name: "unsupported zero-balance account added",
+			mutate: func(b map[string]any) {
+				b["ghost"] = float64(0)
+			},
+			wantAll: []string{
+				"balance table is inconsistent with execution receipts",
+				`"ghost"`, "no successful receipt",
+			},
+		},
+		{
+			name: "unsupported nonzero account added",
+			mutate: func(b map[string]any) {
+				b["ghost"] = float64(7)
+			},
+			wantAll: []string{
+				"balance table is inconsistent with execution receipts",
+				`"ghost"`, "no successful receipt",
+			},
+		},
+		{
+			name: "recorded cumulative balance wrong",
+			mutate: func(b map[string]any) {
+				b["audits"] = float64(99)
+			},
+			wantAll: []string{`balance of "audits" is 99 but receipt replay yields 100`},
+		},
+		{
+			name: "legitimately-paid account zeroed out",
+			mutate: func(b map[string]any) {
+				b["audits"] = float64(0)
+			},
+			wantAll: []string{`balance of "audits" is 0 but receipt replay yields 100`},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			raw := mutateBalanceDoc(t, good, tc.mutate)
+			bad := filepath.Join(dir, "bad-balance.json")
+			if err := os.WriteFile(bad, raw, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			s, err := Open(bad)
+			if !errors.Is(err, ErrStateCorrupt) {
+				if s != nil {
+					s.Close()
+				}
+				t.Fatalf("Open err=%v, want ErrStateCorrupt", err)
+			}
+			for _, want := range tc.wantAll {
+				if !strings.Contains(err.Error(), want) {
+					t.Fatalf("error %q does not contain %q", err.Error(), want)
+				}
+			}
+			// 原文件保持原样：不补回缺失账户、不删除陌生账户、不改余额。
+			if got, rerr := os.ReadFile(bad); rerr != nil || string(got) != string(raw) {
+				t.Fatalf("corrupt file was modified")
+			}
+
+			// 打开后文件被换成损坏版本：所有查询与执行都按损坏状态失败，
+			// 不返回任何部分余额。
+			if err := os.WriteFile(bad, good, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			opened, err := Open(bad)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(bad, raw, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if snap, qerr := opened.BalanceSnapshot(); !errors.Is(qerr, ErrStateCorrupt) {
+				t.Fatalf("BalanceSnapshot err=%v snap=%+v, want ErrStateCorrupt and no partial balances", qerr, snap)
+			}
+			if bal, qerr := opened.Balance("audits"); !errors.Is(qerr, ErrStateCorrupt) || bal != 0 {
+				t.Fatalf("Balance(audits) bal=%d err=%v, want 0 + ErrStateCorrupt", bal, qerr)
+			}
+			if bal, qerr := opened.Balances(); !errors.Is(qerr, ErrStateCorrupt) || bal != nil {
+				t.Fatalf("Balances bal=%v err=%v, want nil + ErrStateCorrupt", bal, qerr)
+			}
+			if _, qerr := opened.TreasuryBalance(); !errors.Is(qerr, ErrStateCorrupt) {
+				t.Fatalf("TreasuryBalance err=%v, want ErrStateCorrupt", qerr)
+			}
+			if _, qerr := opened.Receipts(); !errors.Is(qerr, ErrStateCorrupt) {
+				t.Fatalf("Receipts err=%v, want ErrStateCorrupt", qerr)
+			}
+			if _, _, qerr := opened.Receipt("gip-1"); !errors.Is(qerr, ErrStateCorrupt) {
+				t.Fatalf("Receipt err=%v, want ErrStateCorrupt", qerr)
+			}
+			if _, qerr := opened.Execute("gip-1", 0); !errors.Is(qerr, ErrStateCorrupt) {
+				t.Fatalf("Execute err=%v, want ErrStateCorrupt", qerr)
+			}
+			opened.Close()
+			if got, _ := os.ReadFile(bad); string(got) != string(raw) {
+				t.Fatalf("corrupt file was modified by rejected operations")
+			}
+		})
+	}
+}
+
+// TestBalanceTableAcceptsReplayEquivalentTables：与凭据重放一致的合法余额表
+// 必须继续被接受：同一账户多次收款的累计余额合法；JSON 中余额表条目排列
+// 顺序不影响判定；从未执行任何提案、收款账户表为空（含初始余额为 0）的
+// 资金库正常可用；查询从未收款的账户返回 0 且不新增条目。
+func TestBalanceTableAcceptsReplayEquivalentTables(t *testing.T) {
+	// 尚未执行任何提案、收款表为空（含初始余额 0）正常打开与查询。
+	for _, initial := range []int64{0, 1000} {
+		store, path := openTempStore(t, initial)
+		if snap, err := store.BalanceSnapshot(); err != nil || snap.Treasury != initial || len(snap.Balances) != 0 {
+			t.Fatalf("initial=%d empty snapshot=%+v err=%v", initial, snap, err)
+		}
+		if bal, err := store.Balance("never-paid"); err != nil || bal != 0 {
+			t.Fatalf("initial=%d Balance(never-paid)=%d err=%v", initial, bal, err)
+		}
+		snap, _ := store.BalanceSnapshot()
+		if _, ok := snap.Balances["never-paid"]; ok {
+			t.Fatal("querying an unknown account must not add a balance entry")
+		}
+		store.Close()
+		// 重新落盘打开仍合法。
+		reopened, err := Open(path)
+		if err != nil {
+			t.Fatalf("initial=%d reopen: %v", initial, err)
+		}
+		if bal, _ := reopened.TreasuryBalance(); bal != initial {
+			t.Fatalf("initial=%d treasury=%d", initial, bal)
+		}
+		reopened.Close()
+	}
+
+	// 同一账户多次收款的累计余额合法，且余额表键顺序不影响判定。
+	dir := t.TempDir()
+	path := filepath.Join(dir, "treasury.json")
+	store, err := InitTreasury(path, 1000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustRegister(t, store, "gip-1", 0, "transfer:audits:100", "transfer:legal:50")
+	if _, err := store.Execute("gip-1", 0); err != nil {
+		t.Fatal(err)
+	}
+	mustRegister(t, store, "gip-2", 0, "transfer:audits:25")
+	if _, err := store.Execute("gip-2", 0); err != nil {
+		t.Fatal(err)
+	}
+	store.Close()
+
+	good, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var doc map[string]any
+	if err := json.Unmarshal(good, &doc); err != nil {
+		t.Fatal(err)
+	}
+	balances := doc["balances"].(map[string]any)
+	if balances["audits"] != float64(125) || balances["legal"] != float64(50) || len(balances) != 2 {
+		t.Fatalf("balances=%+v, want audits=125 legal=50", balances)
+	}
+	reordered, err := json.Marshal(map[string]any{
+		"magic":            doc["magic"],
+		"version":          doc["version"],
+		"initial_treasury": doc["initial_treasury"],
+		"treasury":         doc["treasury"],
+		"balances":         map[string]any{"legal": float64(50), "audits": float64(125)},
+		"proposals":        doc["proposals"],
+		"receipts":         doc["receipts"],
+		"vote_proposals":   doc["vote_proposals"],
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	reordered = append(reordered, '\n')
+	reorderedPath := filepath.Join(dir, "reordered.json")
+	if err := os.WriteFile(reorderedPath, reordered, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := Open(reorderedPath)
+	if err != nil {
+		t.Fatalf("reordered balance table rejected: %v", err)
+	}
+	defer reopened.Close()
+	snap, err := reopened.BalanceSnapshot()
+	if err != nil || snap.Treasury != 825 || snap.Balances["audits"] != 125 || snap.Balances["legal"] != 50 || len(snap.Balances) != 2 {
+		t.Fatalf("reordered snapshot=%+v err=%v", snap, err)
+	}
+}
+
 // removeLineContaining 删除文本中包含子串的整行（含行尾换行）。
 func removeLineContaining(s, substr string) string {
 	idx := strings.Index(s, substr)

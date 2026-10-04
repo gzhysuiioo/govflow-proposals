@@ -948,11 +948,54 @@ func validateState(state *storedState) error {
 	if simTreasury != state.Treasury {
 		return fmt.Errorf("treasury balance %d does not match receipt replay %d", state.Treasury, simTreasury)
 	}
-	if len(simBalances) != len(state.Balances) {
-		return fmt.Errorf("balance table has %d accounts, receipt replay yields %d", len(state.Balances), len(simBalances))
+	// 余额表的账户集合必须与成功凭据涉及的收款账户完全一致：缺少收款账户、
+	// 出现无凭据支持的账户（即使写成 0）或已记录余额不符都判整份状态损坏。
+	// 不能只按账户数量或仅遍历文件自身的键：把一个已收款账户换成数量相同、
+	// 余额写成 0 的陌生账户时，数量相等且缺失键在 map 中读到零值，会被误判
+	// 为合法。账户名排序后报告，使错误信息确定且可读；余额表的排列顺序本身
+	// 不影响判定。
+	savedAccounts := make([]string, 0, len(state.Balances))
+	for account := range state.Balances {
+		savedAccounts = append(savedAccounts, account)
 	}
-	for account, balance := range state.Balances {
-		if simBalances[account] != balance {
+	replayAccounts := make([]string, 0, len(simBalances))
+	for account := range simBalances {
+		replayAccounts = append(replayAccounts, account)
+	}
+	sort.Strings(savedAccounts)
+	sort.Strings(replayAccounts)
+	var missing, unexpected []string
+	si, ri := 0, 0
+	for si < len(savedAccounts) || ri < len(replayAccounts) {
+		switch {
+		case ri == len(replayAccounts) || (si < len(savedAccounts) && savedAccounts[si] < replayAccounts[ri]):
+			unexpected = append(unexpected, savedAccounts[si])
+			si++
+		case si == len(savedAccounts) || savedAccounts[si] > replayAccounts[ri]:
+			missing = append(missing, replayAccounts[ri])
+			ri++
+		default:
+			si++
+			ri++
+		}
+	}
+	if len(missing) > 0 || len(unexpected) > 0 {
+		problems := ""
+		if len(missing) > 0 {
+			problems = fmt.Sprintf("missing recipient account(s) %s with no balance record for funds actually received",
+				strings.Join(quoteAccounts(missing), ", "))
+		}
+		if len(unexpected) > 0 {
+			if problems != "" {
+				problems += "; "
+			}
+			problems += fmt.Sprintf("account(s) %s have balance records but no successful receipt supports them (a zero balance does not make an unsupported account legal)",
+				strings.Join(quoteAccounts(unexpected), ", "))
+		}
+		return fmt.Errorf("balance table is inconsistent with execution receipts: %s", problems)
+	}
+	for _, account := range replayAccounts {
+		if balance := state.Balances[account]; balance != simBalances[account] {
 			return fmt.Errorf("balance of %q is %d but receipt replay yields %d", account, balance, simBalances[account])
 		}
 	}
@@ -970,6 +1013,15 @@ func validateState(state *storedState) error {
 		}
 	}
 	return nil
+}
+
+// quoteAccounts 给账户名列表逐个加上 Go 风格引号，便于在损坏原因中逐字定位。
+func quoteAccounts(accounts []string) []string {
+	quoted := make([]string, len(accounts))
+	for i, account := range accounts {
+		quoted[i] = strconv.Quote(account)
+	}
+	return quoted
 }
 
 // validateReceiptExecutedAt 严格判定一份已保存凭据的 executed_at：
