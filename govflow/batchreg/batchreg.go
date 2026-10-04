@@ -329,6 +329,17 @@ func Load(path string) (reg *Registry, existed bool, err error) {
 	return reg, true, nil
 }
 
+// rootFields are the only members the registry root object may carry.
+var rootFields = map[string]struct{}{
+	"version": {}, "batches": {},
+}
+
+// batchRecordFields are the only members a batch record may carry, in the
+// registry file and in an import manifest alike.
+var batchRecordFields = map[string]struct{}{
+	"batch": {}, "product": {}, "quantity": {}, "unit": {},
+}
+
 // decode parses data as the public registry format. The root must be a JSON
 // object holding exactly "version" (the integer 1) and "batches" (an array,
 // possibly empty); every record must be an object holding exactly "batch",
@@ -357,19 +368,19 @@ func decode(data []byte) (*Registry, error) {
 	if err != nil {
 		return nil, &FormatError{Reason: "root must be a JSON object holding exactly \"version\" and \"batches\""}
 	}
-	if dup, ok := duplicateField(fields); ok {
-		return nil, &FormatError{Field: dup, Reason: "field appears more than once; duplicate fields are not allowed"}
+	// The registry reports a duplicated field before any unknown one.
+	values, dup, problem := scanMembers(fields, rootFields)
+	if dup.ok {
+		return nil, &FormatError{Field: dup.field, Reason: "field appears more than once; duplicate fields are not allowed"}
 	}
-	for _, f := range fields {
-		if f.key != "version" && f.key != "batches" {
-			return nil, &FormatError{Field: f.key, Reason: "unknown field; only \"version\" and \"batches\" are allowed"}
-		}
+	if problem.ok { // no duplicates remain, so this is an unknown field
+		return nil, &FormatError{Field: problem.field, Reason: "unknown field; only \"version\" and \"batches\" are allowed"}
 	}
-	versionRaw, ok := findField(fields, "version")
+	versionRaw, ok := values["version"]
 	if !ok {
 		return nil, &FormatError{Field: "version", Reason: "required field is missing"}
 	}
-	batchesRaw, ok := findField(fields, "batches")
+	batchesRaw, ok := values["batches"]
 	if !ok {
 		return nil, &FormatError{Field: "batches", Reason: "required field is missing"}
 	}
@@ -412,7 +423,10 @@ func parseRegistryVersion(raw json.RawMessage) (int, error) {
 // parseRegistryRecord validates one batches element: a JSON object with
 // exactly the four required lowercase fields, text fields as JSON strings
 // and quantity as a strict JSON integer in 1..MaxQuantity. pos is the
-// record's 1-based position in the batches array.
+// record's 1-based position in the batches array. Field-set scanning, text
+// decoding and quantity judgment are shared with the manifest parser; the
+// registry-specific parts are the *FormatError wording and the verbatim
+// text handling — stored text is read as it is, never trimmed or folded.
 func parseRegistryRecord(raw json.RawMessage, pos int) (Batch, error) {
 	var b Batch
 	fields, err := parseObjectFields(raw)
@@ -424,44 +438,33 @@ func parseRegistryRecord(raw json.RawMessage, pos int) (Batch, error) {
 	// is valid UTF-8. When the "batch" member itself is duplicated, or its
 	// bytes are not valid UTF-8, no id (and never a U+FFFD replacement) is
 	// picked arbitrarily.
-	batchID := ""
-	if countField(fields, "batch") == 1 {
-		if rawID, _ := findField(fields, "batch"); rawID != nil {
-			if id, idErr := unmarshalStringStrict(rawID); idErr == nil {
-				batchID = id
-			}
-		}
-	}
+	batchID := unambiguousBatchID(fields, false)
 	fail := func(field, reason string) (Batch, error) {
 		return Batch{}, &FormatError{Position: pos, Batch: batchID, Field: field, Reason: reason}
 	}
 
-	if dup, ok := duplicateField(fields); ok {
-		return fail(dup, "field appears more than once; duplicate fields are not allowed")
+	// The registry reports a duplicated field before any unknown one.
+	values, dup, problem := scanMembers(fields, batchRecordFields)
+	if dup.ok {
+		return fail(dup.field, "field appears more than once; duplicate fields are not allowed")
 	}
-	for _, f := range fields {
-		if _, ok := batchRecordFields[f.key]; !ok {
-			return fail(f.key, "unknown field; only \"batch\", \"product\", \"quantity\" and \"unit\" are allowed")
-		}
+	if problem.ok { // no duplicates remain, so this is an unknown field
+		return fail(problem.field, "unknown field; only \"batch\", \"product\", \"quantity\" and \"unit\" are allowed")
 	}
 
 	text := func(name string) (string, error) {
-		rawValue, ok := findField(fields, name)
-		if !ok {
+		s, flaw := decodeTextMember(values, name)
+		switch flaw {
+		case textOK:
+			return s, nil
+		case textMissing:
 			return "", &FormatError{Position: pos, Batch: batchID, Field: name, Reason: "required field is missing"}
-		}
-		if trimmed := bytes.TrimSpace(rawValue); len(trimmed) == 0 || trimmed[0] != '"' {
-			return "", &FormatError{Position: pos, Batch: batchID, Field: name, Reason: "must be a JSON string"}
-		}
-		s, err := unmarshalStringStrict(rawValue)
-		if errors.Is(err, errStringEncoding) {
+		case textBadEncoding:
 			return "", &FormatError{Position: pos, Batch: batchID, Field: name,
 				Reason: "must be valid UTF-8 text: malformed bytes or lone surrogate escapes are rejected instead of being replaced with U+FFFD"}
-		}
-		if err != nil {
+		default:
 			return "", &FormatError{Position: pos, Batch: batchID, Field: name, Reason: "must be a JSON string"}
 		}
-		return s, nil
 	}
 	if b.Batch, err = text("batch"); err != nil {
 		return Batch{}, err
@@ -472,32 +475,99 @@ func parseRegistryRecord(raw json.RawMessage, pos int) (Batch, error) {
 	if b.Unit, err = text("unit"); err != nil {
 		return Batch{}, err
 	}
-	quantityRaw, ok := findField(fields, "quantity")
+	quantityRaw, ok := values["quantity"]
 	if !ok {
 		return fail("quantity", "required field is missing")
 	}
-	b.Quantity, err = parseRegistryQuantity(bytes.TrimSpace(quantityRaw))
+	b.Quantity, err = registryQuantity(bytes.TrimSpace(quantityRaw))
 	if err != nil {
 		return fail("quantity", err.Error())
 	}
 	return b, nil
 }
 
-// parseRegistryQuantity accepts exactly a strict JSON integer token in the
-// range 1..MaxQuantity. Strings, signs, fractions, exponents, null and
-// out-of-range values are rejected.
-func parseRegistryQuantity(token []byte) (int64, error) {
-	if !isJSONInteger(string(token)) || len(token) == 0 || token[0] == '-' {
-		return 0, fmt.Errorf("must be a JSON integer between 1 and %d", MaxQuantity)
+// quantityFlaw identifies why a raw JSON token cannot be a batch quantity.
+type quantityFlaw int
+
+const (
+	quantityOK          quantityFlaw = iota
+	quantityNotDigitLed              // empty, or the first byte is not an ASCII digit
+	quantityNonDigit                 // digit-led, but a later byte is not an ASCII digit
+	quantityLeadingZero              // "0" followed by more digits
+	quantityOverflow                 // digits only, but above the signed 64-bit maximum
+	quantityZero                     // the integer 0
+)
+
+// classifyQuantityToken examines a raw JSON token as a candidate quantity —
+// the shared quantity judgment of registry and manifest records. The parsed
+// value is meaningful only together with quantityOK or quantityLeadingZero:
+// leading zeros are legal in the registry file but not in a manifest, so
+// both callers get the number and decide for themselves.
+func classifyQuantityToken(token []byte) (int64, quantityFlaw) {
+	if len(token) == 0 || token[0] < '0' || token[0] > '9' {
+		return 0, quantityNotDigitLed
+	}
+	for _, c := range token {
+		if c < '0' || c > '9' {
+			return 0, quantityNonDigit
+		}
+	}
+	if len(token) > 1 && token[0] == '0' {
+		value, err := strconv.ParseInt(string(token), 10, 64)
+		if err != nil {
+			return 0, quantityOverflow
+		}
+		return value, quantityLeadingZero
 	}
 	value, err := strconv.ParseInt(string(token), 10, 64)
 	if err != nil {
-		return 0, fmt.Errorf("must be an integer no greater than %d", MaxQuantity)
+		return 0, quantityOverflow
 	}
 	if value == 0 {
-		return 0, errors.New("must be greater than zero")
+		return 0, quantityZero
 	}
-	return value, nil
+	return value, quantityOK
+}
+
+// registryQuantity validates a raw JSON token as a registry-file quantity: a
+// strict JSON integer in 1..MaxQuantity. Strings, signs, fractions,
+// exponents, null and out-of-range values are rejected, with the wording the
+// registry format errors use.
+func registryQuantity(token []byte) (int64, error) {
+	value, flaw := classifyQuantityToken(token)
+	switch flaw {
+	case quantityOK, quantityLeadingZero:
+		return value, nil
+	case quantityOverflow:
+		return 0, fmt.Errorf("must be an integer no greater than %d", MaxQuantity)
+	case quantityZero:
+		return 0, errors.New("must be greater than zero")
+	default:
+		return 0, fmt.Errorf("must be a JSON integer between 1 and %d", MaxQuantity)
+	}
+}
+
+// manifestQuantity validates a raw JSON token as a manifest quantity: a
+// strict JSON integer in 1..MaxQuantity, additionally refusing leading
+// zeros. Strings, signs, fractions, exponents and out-of-range values are
+// rejected instead of silently rounded, with the wording the manifest
+// record errors use.
+func manifestQuantity(token []byte) (int64, error) {
+	value, flaw := classifyQuantityToken(token)
+	switch flaw {
+	case quantityOK:
+		return value, nil
+	case quantityNonDigit:
+		return 0, fmt.Errorf("field %q must be a JSON integer without sign, fraction or exponent", "quantity")
+	case quantityLeadingZero:
+		return 0, errors.New("field \"quantity\" must be a JSON integer without leading zeros")
+	case quantityOverflow:
+		return 0, fmt.Errorf("field %q must be an integer no greater than %d", "quantity", MaxQuantity)
+	case quantityZero:
+		return 0, errors.New("field \"quantity\" must be greater than zero")
+	default:
+		return 0, fmt.Errorf("field %q must be a JSON integer between 1 and %d", "quantity", MaxQuantity)
+	}
 }
 
 // isJSONInteger reports whether token is a JSON number literal without
@@ -593,16 +663,115 @@ func keyTokenBytes(trimmed []byte, start, end int) []byte {
 	return bytes.TrimLeft(trimmed[start:end], " \t\r\n,")
 }
 
-// duplicateField returns the first field name appearing more than once.
-func duplicateField(fields []objectField) (string, bool) {
+// memberFlaw identifies how a record member violates the allowed field set.
+type memberFlaw int
+
+const (
+	flawUnknownField   memberFlaw = iota // member name is not in the allowed set
+	flawDuplicateField                   // member name appears more than once
+)
+
+// memberProblem describes one field-set violation found while scanning a
+// JSON object's members; ok is false when there is no violation.
+type memberProblem struct {
+	field string
+	kind  memberFlaw
+	ok    bool
+}
+
+// scanMembers validates the decoded member names of one JSON object against
+// allowed and collects the first raw value of every member name. It reports
+// two views of the same scan, because the two sources order these checks
+// differently: firstDuplicate is the first repeated name anywhere (any name,
+// known or not — the registry root and records report a duplicate before
+// unknown names), while first is the first problem in member order, judging
+// each member unknown-then-duplicate (the manifest's per-member order).
+func scanMembers(fields []objectField, allowed map[string]struct{}) (values map[string]json.RawMessage, firstDuplicate, first memberProblem) {
+	values = make(map[string]json.RawMessage, len(fields))
 	seen := make(map[string]struct{}, len(fields))
 	for _, f := range fields {
-		if _, dup := seen[f.key]; dup {
-			return f.key, true
+		if _, ok := values[f.key]; !ok {
+			values[f.key] = f.value
+		}
+		_, known := allowed[f.key]
+		_, dup := seen[f.key]
+		if dup && !firstDuplicate.ok {
+			firstDuplicate = memberProblem{field: f.key, kind: flawDuplicateField, ok: true}
+		}
+		if !first.ok {
+			switch {
+			case !known:
+				first = memberProblem{field: f.key, kind: flawUnknownField, ok: true}
+			case dup:
+				first = memberProblem{field: f.key, kind: flawDuplicateField, ok: true}
+			}
 		}
 		seen[f.key] = struct{}{}
 	}
-	return "", false
+	return values, firstDuplicate, first
+}
+
+// unambiguousBatchID extracts a record's batch id for error messages, but
+// only when it is uniquely determined: exactly one "batch" member (compared
+// after JSON key decoding, so an escaped respelling counts as the same
+// field) carrying a JSON string whose decoded text is valid UTF-8. When
+// normalize is true (import manifests) the id is also trimmed and must not
+// be blank; the registry file keeps the stored id verbatim. A missing,
+// duplicated, mistyped, blank or malformed "batch" member yields "" — no id
+// is ever invented, and never a U+FFFD substitution, wherever the "batch"
+// member sits in the object.
+func unambiguousBatchID(fields []objectField, normalize bool) string {
+	if countField(fields, "batch") != 1 {
+		return ""
+	}
+	rawID, ok := findField(fields, "batch")
+	if !ok {
+		return ""
+	}
+	id, err := unmarshalStringStrict(rawID)
+	if err != nil {
+		return ""
+	}
+	if normalize {
+		id, err = NormalizeField(id)
+		if err != nil {
+			return ""
+		}
+	}
+	return id
+}
+
+// textFlaw identifies why a record member cannot serve as a text field.
+type textFlaw int
+
+const (
+	textOK          textFlaw = iota
+	textMissing              // no member with this name
+	textNotString            // the value is not a JSON string literal
+	textBadEncoding          // the string holds malformed UTF-8 or a lone surrogate escape
+)
+
+// decodeTextMember strictly decodes the JSON string of the member named
+// name — the shared text-decoding step of registry and manifest records.
+// The flaw is reported instead of an error so each source can word the
+// failure its own way; the decoded text is never substituted, trimmed or
+// folded here.
+func decodeTextMember(values map[string]json.RawMessage, name string) (string, textFlaw) {
+	rawValue, ok := values[name]
+	if !ok {
+		return "", textMissing
+	}
+	if trimmed := bytes.TrimSpace(rawValue); len(trimmed) == 0 || trimmed[0] != '"' {
+		return "", textNotString
+	}
+	s, err := unmarshalStringStrict(rawValue)
+	if errors.Is(err, errStringEncoding) {
+		return "", textBadEncoding
+	}
+	if err != nil {
+		return "", textNotString
+	}
+	return s, textOK
 }
 
 // findField returns the raw value of the first member named name.
@@ -725,77 +894,51 @@ func ParseManifest(data []byte) ([]Input, error) {
 	return inputs, nil
 }
 
-// batchRecordFields are the only members a batch record may carry, in the
-// registry file and in an import manifest alike.
-var batchRecordFields = map[string]struct{}{
-	"batch": {}, "product": {}, "quantity": {}, "unit": {},
-}
-
 // parseManifestRecord validates one manifest element: it must be a JSON
 // object with exactly the four required keys, text fields as non-blank,
-// valid UTF-8 strings and quantity as a strict JSON integer. The members
-// are scanned with parseObjectFields (strict key decoding, duplicates kept
-// visible) rather than a lenient map unmarshal, so malformed key or value
-// bytes cannot be silently replaced with U+FFFD. Whatever makes the record
-// fail — an unknown, duplicated or case-mismatched field included — the
-// returned Input carries the normalized batch id whenever exactly one
-// "batch" member holds valid, non-blank text, so the caller can name the
-// batch in the error; otherwise it stays empty.
+// valid UTF-8 strings and quantity as a strict JSON integer. Field-set
+// scanning, strict text decoding and quantity judgment are shared with the
+// registry parser; the manifest-specific parts are the reason wording, the
+// per-member problem order, and the normalization — manifest text is
+// trimmed and must not be blank, while the registry reads text verbatim.
+// Whatever makes the record fail — an unknown, duplicated or
+// case-mismatched field included — the returned Input carries the
+// normalized batch id whenever exactly one "batch" member holds valid,
+// non-blank text, so the caller can name the batch in the error; otherwise
+// it stays empty.
 func parseManifestRecord(raw json.RawMessage) (Input, error) {
 	var in Input
 	members, err := parseObjectFields(raw)
 	if err != nil {
 		return in, errors.New("record must be a JSON object with batch, product, quantity and unit")
 	}
-	// Attach the batch id to whatever error this record raises, but only when
-	// it is unambiguous: exactly one "batch" member (compared after JSON key
-	// decoding, so an escaped respelling counts as the same field) carrying a
-	// JSON string whose decoded text is valid UTF-8 and non-blank once
-	// trimmed. A missing, duplicated, mistyped, blank or malformed "batch"
-	// member leaves the id out — never a U+FFFD substitution, and never one
-	// of two duplicate values picked arbitrarily, even when both are equal.
-	// Where the "batch" member sits relative to the offending field does not
-	// matter.
-	if countField(members, "batch") == 1 {
-		if rawID, ok := findField(members, "batch"); ok {
-			if id, idErr := unmarshalStringStrict(rawID); idErr == nil {
-				if normalized, normErr := NormalizeField(id); normErr == nil {
-					in.Batch = normalized
-				}
-			}
+	in.Batch = unambiguousBatchID(members, true)
+	// A manifest reports whichever field problem comes first in member
+	// order, unknown before duplicate at each position.
+	values, _, problem := scanMembers(members, batchRecordFields)
+	if problem.ok {
+		if problem.kind == flawUnknownField {
+			return in, fmt.Errorf("record has unknown field %q; only batch, product, quantity and unit are allowed", problem.field)
 		}
-	}
-	fields := make(map[string]json.RawMessage, len(members))
-	for _, f := range members {
-		if _, ok := batchRecordFields[f.key]; !ok {
-			return in, fmt.Errorf("record has unknown field %q; only batch, product, quantity and unit are allowed", f.key)
-		}
-		if _, dup := fields[f.key]; dup {
-			return in, fmt.Errorf("record lists field %q more than once", f.key)
-		}
-		fields[f.key] = f.value
+		return in, fmt.Errorf("record lists field %q more than once", problem.field)
 	}
 
 	textField := func(name string) (string, error) {
-		value, ok := fields[name]
-		if !ok {
+		s, flaw := decodeTextMember(values, name)
+		switch flaw {
+		case textOK:
+			normalized, normErr := NormalizeField(s)
+			if normErr != nil {
+				return "", fmt.Errorf("field %q must not be blank: %w", name, normErr)
+			}
+			return normalized, nil
+		case textMissing:
 			return "", fmt.Errorf("missing required field %q", name)
-		}
-		if trimmed := bytes.TrimSpace(value); len(trimmed) == 0 || trimmed[0] != '"' {
-			return "", fmt.Errorf("field %q must be a JSON string", name)
-		}
-		text, decodeErr := unmarshalStringStrict(value)
-		if errors.Is(decodeErr, errStringEncoding) {
+		case textBadEncoding:
 			return "", &EncodingError{Field: name}
-		}
-		if decodeErr != nil {
+		default:
 			return "", fmt.Errorf("field %q must be a JSON string", name)
 		}
-		normalized, normErr := NormalizeField(text)
-		if normErr != nil {
-			return "", fmt.Errorf("field %q must not be blank: %w", name, normErr)
-		}
-		return normalized, nil
 	}
 
 	in.Batch, err = textField("batch")
@@ -810,40 +953,15 @@ func parseManifestRecord(raw json.RawMessage) (Input, error) {
 	if err != nil {
 		return in, err
 	}
-	quantityRaw, ok := fields["quantity"]
+	quantityRaw, ok := values["quantity"]
 	if !ok {
 		return in, errors.New("missing required field \"quantity\"")
 	}
-	in.Quantity, err = parseManifestQuantity(bytes.TrimSpace(quantityRaw))
+	in.Quantity, err = manifestQuantity(bytes.TrimSpace(quantityRaw))
 	if err != nil {
 		return in, err
 	}
 	return in, nil
-}
-
-// parseManifestQuantity accepts exactly a strict JSON integer token in the
-// range 1..MaxQuantity. Strings, signs, fractions, exponents, leading zeros
-// and out-of-range values are rejected instead of silently rounded.
-func parseManifestQuantity(token []byte) (int64, error) {
-	if len(token) == 0 || token[0] < '0' || token[0] > '9' {
-		return 0, fmt.Errorf("field %q must be a JSON integer between 1 and %d", "quantity", MaxQuantity)
-	}
-	for _, c := range token {
-		if c < '0' || c > '9' {
-			return 0, fmt.Errorf("field %q must be a JSON integer without sign, fraction or exponent", "quantity")
-		}
-	}
-	if len(token) > 1 && token[0] == '0' {
-		return 0, errors.New("field \"quantity\" must be a JSON integer without leading zeros")
-	}
-	value, err := strconv.ParseInt(string(token), 10, 64)
-	if err != nil {
-		return 0, fmt.Errorf("field %q must be an integer no greater than %d", "quantity", MaxQuantity)
-	}
-	if value == 0 {
-		return 0, errors.New("field \"quantity\" must be greater than zero")
-	}
-	return value, nil
 }
 
 // ImportResult is one entry of an Import outcome: the normalized record in
