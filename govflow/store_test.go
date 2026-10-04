@@ -577,6 +577,228 @@ func TestReceiptExecutedAtValidated(t *testing.T) {
 	})
 }
 
+// TestReceiptOrderAndIndexValidated：保存凭据的 order 与逐笔动作的 index 都必须
+// 明确写出且等于各自的位置（0 起）——缺失、null、类型不符（字符串/布尔/小数/
+// 指数/超出 int64）或与实际位置不符都判整份状态损坏；不能按数组位置重新编号，
+// 也不能因为余额与动作原文能够重放一致而接受缺损记录。明确写出的 0 是合法序号。
+func TestReceiptOrderAndIndexValidated(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "treasury.json")
+	store, err := InitTreasury(path, 1000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 同一收款账户连续两项动作：逐笔留痕按原顺序分别保留，不合并。
+	mustRegister(t, store, "gip-1", 0, "transfer:a:10", "transfer:a:5")
+	mustRegister(t, store, "gip-2", 0, "transfer:b:20")
+	if _, err := store.Execute("gip-1", 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Execute("gip-2", 0); err != nil {
+		t.Fatal(err)
+	}
+	// 投票通过的提案走到 executed：与登记提案适用同一条序号规则。
+	mustCreateVote(t, store, baseVoteInput("gip-vote"))
+	if _, err := store.CastVote("gip-vote", "alice", true, 150); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.CastVote("gip-vote", "dave", true, 150); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.TallyVote("gip-vote", 200); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Execute("gip-vote", 300); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	good, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 基线可读：明确写出的 0 是合法序号——第一份凭据的 order 与每份凭据
+	// 第一项动作的 index 都正常读出；同一账户的连续动作按原顺序逐笔保留。
+	t.Run("baseline readable", func(t *testing.T) {
+		s, err := Open(path)
+		if err != nil {
+			t.Fatalf("reopen: %v", err)
+		}
+		defer s.Close()
+		receipts, err := s.Receipts()
+		if err != nil || len(receipts) != 3 {
+			t.Fatalf("Receipts len=%d err=%v", len(receipts), err)
+		}
+		for i, want := range []string{"gip-1", "gip-2", "gip-vote"} {
+			if receipts[i].ProposalID != want || receipts[i].Order != i {
+				t.Fatalf("receipt %d = %+v, want proposal %s order %d", i, receipts[i], want, i)
+			}
+		}
+		first := receipts[0]
+		if len(first.Actions) != 2 || first.Actions[0].Index != 0 || first.Actions[1].Index != 1 {
+			t.Fatalf("first receipt actions = %+v", first.Actions)
+		}
+		if first.Actions[0].Recipient.Before != 0 || first.Actions[0].Recipient.After != 10 ||
+			first.Actions[1].Recipient.Before != 10 || first.Actions[1].Recipient.After != 15 {
+			t.Fatalf("consecutive same-account actions not kept in order: %+v", first.Actions)
+		}
+		if bal, _ := s.Balance("a"); bal != 15 {
+			t.Fatalf("balance of a = %d, want 15", bal)
+		}
+	})
+
+	corruptions := []struct {
+		name    string
+		raw     string
+		wantMsg []string
+	}{
+		{
+			name:    "order missing on first receipt",
+			raw:     removeLineContaining(string(good), `"order": 0`),
+			wantMsg: []string{`receipt 0`, `"gip-1"`, "order", "missing"},
+		},
+		{
+			name:    "order null",
+			raw:     strings.Replace(string(good), `"order": 0`, `"order": null`, 1),
+			wantMsg: []string{`receipt 0`, `"gip-1"`, "order", "null"},
+		},
+		{
+			name:    "order string",
+			raw:     strings.Replace(string(good), `"order": 0`, `"order": "0"`, 1),
+			wantMsg: []string{`receipt 0`, `"gip-1"`, "order", "wrong type"},
+		},
+		{
+			name:    "order boolean",
+			raw:     strings.Replace(string(good), `"order": 0`, `"order": false`, 1),
+			wantMsg: []string{`receipt 0`, `"gip-1"`, "order", "wrong type"},
+		},
+		{
+			name:    "order decimal",
+			raw:     strings.Replace(string(good), `"order": 0`, `"order": 0.0`, 1),
+			wantMsg: []string{`receipt 0`, `"gip-1"`, "order", "wrong type"},
+		},
+		{
+			name:    "order exponent",
+			raw:     strings.Replace(string(good), `"order": 0`, `"order": 0e0`, 1),
+			wantMsg: []string{`receipt 0`, `"gip-1"`, "order", "wrong type"},
+		},
+		{
+			name:    "order beyond int64",
+			raw:     strings.Replace(string(good), `"order": 0`, `"order": 9223372036854775808`, 1),
+			wantMsg: []string{`receipt 0`, `"gip-1"`, "order", "wrong type"},
+		},
+		{
+			name:    "order negative",
+			raw:     strings.Replace(string(good), `"order": 0`, `"order": -1`, 1),
+			wantMsg: []string{`receipt 0`, `"gip-1"`, "order", "-1", "position 0"},
+		},
+		{
+			name:    "order renumbered",
+			raw:     strings.Replace(string(good), `"order": 1`, `"order": 5`, 1),
+			wantMsg: []string{`receipt 1`, `"gip-2"`, "order", "5", "position 1"},
+		},
+		{
+			// 投票通过的提案与登记提案使用一致的判断。
+			name:    "vote proposal order renumbered",
+			raw:     strings.Replace(string(good), `"order": 2`, `"order": 0`, 1),
+			wantMsg: []string{`receipt 2`, `"gip-vote"`, "order", "position 2"},
+		},
+		{
+			name:    "index missing on first action",
+			raw:     removeLineContaining(string(good), `"index": 0`),
+			wantMsg: []string{`"gip-1"`, "action 0", "index", "missing"},
+		},
+		{
+			name:    "index null",
+			raw:     strings.Replace(string(good), `"index": 0`, `"index": null`, 1),
+			wantMsg: []string{`"gip-1"`, "action 0", "index", "null"},
+		},
+		{
+			name:    "index string",
+			raw:     strings.Replace(string(good), `"index": 1`, `"index": "1"`, 1),
+			wantMsg: []string{`"gip-1"`, "action 1", "index", "wrong type"},
+		},
+		{
+			name:    "index decimal",
+			raw:     strings.Replace(string(good), `"index": 1`, `"index": 1.0`, 1),
+			wantMsg: []string{`"gip-1"`, "action 1", "index", "wrong type"},
+		},
+		{
+			name:    "index negative",
+			raw:     strings.Replace(string(good), `"index": 0`, `"index": -1`, 1),
+			wantMsg: []string{`"gip-1"`, "action 0", "index", "-1", "position 0"},
+		},
+		{
+			name:    "index renumbered",
+			raw:     strings.Replace(string(good), `"index": 1`, `"index": 7`, 1),
+			wantMsg: []string{`"gip-1"`, "action 1", "index", "7", "position 1"},
+		},
+	}
+	for _, tc := range corruptions {
+		t.Run(tc.name, func(t *testing.T) {
+			bad := filepath.Join(dir, "corrupt-"+strings.ReplaceAll(tc.name, " ", "-")+".json")
+			if err := os.WriteFile(bad, []byte(tc.raw), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			// 文件中其余凭据与余额重放均正常，也不能掩盖一条缺损序号。
+			s, err := Open(bad)
+			if !errors.Is(err, ErrStateCorrupt) {
+				if s != nil {
+					s.Close()
+				}
+				t.Fatalf("Open err=%v, want ErrStateCorrupt", err)
+			}
+			for _, want := range tc.wantMsg {
+				if !strings.Contains(err.Error(), want) {
+					t.Fatalf("error %q does not locate %q", err.Error(), want)
+				}
+			}
+			// 原状态文件保持原样，不被整理、补齐或覆盖。
+			got, rerr := os.ReadFile(bad)
+			if rerr != nil || string(got) != tc.raw {
+				t.Fatalf("corrupt file was modified")
+			}
+		})
+	}
+
+	// 已打开资金库之后的查询与执行同样识别该问题：文件在打开后被替换成
+	// 缺 order 的版本，后续每个操作都必须报损坏，不得继续返回之前的正常结果。
+	t.Run("detected after open", func(t *testing.T) {
+		p := filepath.Join(dir, "swap.json")
+		if err := os.WriteFile(p, good, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		s, err := Open(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer s.Close()
+		corrupt := removeLineContaining(string(good), `"order": 0`)
+		if err := os.WriteFile(p, []byte(corrupt), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.Receipts(); !errors.Is(err, ErrStateCorrupt) {
+			t.Fatalf("Receipts err=%v, want ErrStateCorrupt", err)
+		}
+		if _, _, err := s.Receipt("gip-2"); !errors.Is(err, ErrStateCorrupt) {
+			t.Fatalf("Receipt err=%v, want ErrStateCorrupt", err)
+		}
+		if _, err := s.BalanceSnapshot(); !errors.Is(err, ErrStateCorrupt) {
+			t.Fatalf("BalanceSnapshot err=%v, want ErrStateCorrupt", err)
+		}
+		if _, err := s.Execute("gip-2", 0); !errors.Is(err, ErrStateCorrupt) {
+			t.Fatalf("Execute err=%v, want ErrStateCorrupt", err)
+		}
+		got, _ := os.ReadFile(p)
+		if string(got) != corrupt {
+			t.Fatalf("state file was modified by rejected operations")
+		}
+	})
+}
+
 func equalBytes(a, b []byte) bool {
 	if len(a) != len(b) {
 		return false

@@ -1,6 +1,9 @@
 package govflow
 
-import "fmt"
+import (
+	"encoding/json"
+	"fmt"
+)
 
 // 本文件是本地资金库唯一的转账规则实现。
 //
@@ -158,14 +161,17 @@ func planTransfers(actions []string, treasury int64, balances map[string]int64) 
 // 资金库侧账户名固定为 "treasury"，收款侧为动作解析出的账户；
 // 逐笔前后余额直接取自规则结果，凭据记载的变动与实际提交的变动同源。
 // mustBalanceUpdate 同步填上各字段的原始 JSON 片段，使提交前的 validateState
-// 与打开时的重放校验走同一份判定，不把本进程新建的凭据误判为字段缺失。
+// 与打开时的重放校验走同一份判定，不把本进程新建的凭据误判为字段缺失；
+// index 的原始片段同样在此填上。
 func (s transferStep) actionReceipt(index int, raw string) ActionReceipt {
-	return ActionReceipt{
+	ar := ActionReceipt{
 		Index:     index,
 		Action:    raw,
 		Treasury:  mustBalanceUpdate("treasury", s.treasuryBefore, s.treasuryAfter),
 		Recipient: mustBalanceUpdate(s.account, s.recipientBefore, s.recipientAfter),
 	}
+	ar.indexRaw, _ = json.Marshal(index)
+	return ar
 }
 
 // verifyReceiptTransfers 按成功提交次序核对一张已保存凭据声明的全部转账：

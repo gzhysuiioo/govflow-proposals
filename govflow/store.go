@@ -91,11 +91,44 @@ func mustBalanceUpdate(account string, before, after int64) BalanceUpdate {
 // 以及该动作引发的资金库与收款账户余额变动。两侧的 before/after 四个余额字段
 // 都必须明确写出；任何一个缺失、为 null 或类型不符，整份状态文件即判损坏，
 // 不能根据转账金额、账户余额或其它凭据补出（见 validateReceiptActionBalances）。
+//
+// index 同样必须明确写出且等于该动作在所属凭据中的位置（0 起）：字段缺失、
+// 为 null 或类型不符都不得被折叠成 0 再当作合法留痕读出——第一项动作的位置
+// 本来应为 0 时，缺失字段与明确写出的 0 在解码后必须仍可区分。因此解码时保留
+// 字段的原始 JSON，由 validateReceiptActionIndex 区分“缺失/空值/类型不符/
+// 与位置不符”。
 type ActionReceipt struct {
 	Index     int           `json:"index"`
 	Action    string        `json:"action"`
 	Treasury  BalanceUpdate `json:"treasury"`
 	Recipient BalanceUpdate `json:"recipient"`
+
+	indexRaw json.RawMessage
+}
+
+// actionReceiptJSONShape 只用于解码，按保存格式的字段名逐字接住每个字段的原始 JSON。
+type actionReceiptJSONShape struct {
+	Index     json.RawMessage `json:"index"`
+	Action    string          `json:"action"`
+	Treasury  BalanceUpdate   `json:"treasury"`
+	Recipient BalanceUpdate   `json:"recipient"`
+}
+
+// UnmarshalJSON 保留 index 是否出现及其原始写法（缺失为 nil、null 为 "null"），
+// 使“字段缺失”与“显式写出 0”在解码后仍可区分：encoding/json 直接解进 int
+// 会把缺失/null/类型不符都折叠成 0。判定统一交给 validateReceiptActionIndex，
+// 此处只在字段确实是 int64 整数时填充 Index。
+func (ar *ActionReceipt) UnmarshalJSON(data []byte) error {
+	var shape actionReceiptJSONShape
+	if err := json.Unmarshal(data, &shape); err != nil {
+		return err
+	}
+	ar.Action = shape.Action
+	ar.Treasury = shape.Treasury
+	ar.Recipient = shape.Recipient
+	ar.indexRaw = shape.Index
+	fillInt(shape.Index, &ar.Index)
+	return nil
 }
 
 // Receipt 是一项提案首次成功执行后生成的执行凭据。
@@ -105,6 +138,11 @@ type ActionReceipt struct {
 // now 达到时间锁后发生，保存的凭据必须满足同一条执行资格规则。字段缺失、
 // 为 null 或类型不符都不得被折叠成 0 再当作合法凭据读出，因此解码时保留
 // 字段的原始 JSON，由 validateState 区分“缺失/空值/类型不符/早于时间锁”。
+//
+// order 同样必须明确写出且等于该凭据在成功执行记录中的位置（0 起）：第一份
+// 凭据的位置本来应为 0 时，缺失字段与明确写出的 0 在解码后必须仍可区分，
+// 不能因为它恰好排在第一项就补出一个合法序号。判定统一交给
+// validateReceiptOrder。
 type Receipt struct {
 	ProposalID string          `json:"proposal_id"`
 	ExecutedAt int64           `json:"executed_at"` // 首次成功执行时调用方提供的时间
@@ -112,30 +150,32 @@ type Receipt struct {
 	Actions    []ActionReceipt `json:"actions"`
 
 	executedAtRaw json.RawMessage
+	orderRaw      json.RawMessage
 }
 
 // receiptJSONShape 只用于解码，按保存格式的字段名逐字接住每个字段的原始 JSON。
 type receiptJSONShape struct {
 	ProposalID string          `json:"proposal_id"`
 	ExecutedAt json.RawMessage `json:"executed_at"`
-	Order      int             `json:"order"`
+	Order      json.RawMessage `json:"order"`
 	Actions    []ActionReceipt `json:"actions"`
 }
 
-// UnmarshalJSON 保留 executed_at 是否出现及其原始写法（缺失为 nil、null 为
-// "null"），使“字段缺失”与“显式写出 0”在解码后仍可区分：encoding/json 直接
-// 解进 int64 会把缺失/null/类型不符都折叠成 0。判定统一交给 validateState，
-// 此处只在字段确实是 int64 整数时填充 ExecutedAt。
+// UnmarshalJSON 保留 executed_at 与 order 是否出现及其原始写法（缺失为 nil、
+// null 为 "null"），使“字段缺失”与“显式写出 0”在解码后仍可区分：
+// encoding/json 直接解进 int64/int 会把缺失/null/类型不符都折叠成 0。判定统一
+// 交给 validateState，此处只在字段确实是 int64 整数时填充 ExecutedAt 与 Order。
 func (r *Receipt) UnmarshalJSON(data []byte) error {
 	var shape receiptJSONShape
 	if err := json.Unmarshal(data, &shape); err != nil {
 		return err
 	}
 	r.ProposalID = shape.ProposalID
-	r.Order = shape.Order
 	r.Actions = shape.Actions
 	r.executedAtRaw = shape.ExecutedAt
+	r.orderRaw = shape.Order
 	fillInt64(shape.ExecutedAt, &r.ExecutedAt)
+	fillInt(shape.Order, &r.Order)
 	return nil
 }
 
@@ -519,8 +559,9 @@ func (s *Store) Execute(id string, now int64) (*Receipt, error) {
 		Actions:    make([]ActionReceipt, 0, len(steps)),
 	}
 	// 同步填上字段原始片段，使“提交前校验”与“打开重放校验”走同一份
-	// executed_at 判定时不会把本进程新建的凭据误判为字段缺失。
+	// executed_at/order 判定时不会把本进程新建的凭据误判为字段缺失。
 	receipt.executedAtRaw, _ = json.Marshal(now)
+	receipt.orderRaw, _ = json.Marshal(receipt.Order)
 	for i, st := range steps {
 		receipt.Actions = append(receipt.Actions, st.actionReceipt(i, target.actions[i]))
 	}
@@ -862,8 +903,11 @@ func validateState(state *storedState) error {
 		if rcpt == nil {
 			return fmt.Errorf("receipt %d is empty", order)
 		}
-		if rcpt.Order != order {
-			return fmt.Errorf("receipt %q order field is %d, expected %d", rcpt.ProposalID, rcpt.Order, order)
+		// 凭据的 order 必须明确写出且等于它在成功执行记录中的位置（0 起）：
+		// 缺失、null、类型不符或与位置不符都判整份状态损坏，不能按数组位置
+		// 重新编号，也不能因为余额与动作原文能够重放一致而接受缺损记录。
+		if err := validateReceiptOrder(order, rcpt); err != nil {
+			return err
 		}
 		if prev, dup := seenReceipts[rcpt.ProposalID]; dup {
 			return fmt.Errorf("duplicate receipt for %q at positions %d and %d", rcpt.ProposalID, prev, order)
@@ -881,10 +925,15 @@ func validateState(state *storedState) error {
 		if err := validateReceiptExecutedAt(order, rcpt, ownerTimelock); err != nil {
 			return err
 		}
-		// 每项动作的四个余额字段（资金库/收款账户 × before/after）必须各自
-		// 明确写出：任何一个缺失、为 null 或类型不符都判整份状态损坏，不能
-		// 按转账金额、账户余额或其它凭据补出；明确写出的 0 是合法记录。
+		// 每项动作的 index 与四个余额字段（资金库/收款账户 × before/after）
+		// 都必须各自明确写出：任何一个缺失、为 null 或类型不符都判整份状态
+		// 损坏，不能按动作在数组中的位置重新编号，也不能根据转账金额、账户
+		// 余额或其它凭据补出；明确写出的 0 是合法记录（每份凭据的第一项
+		// 动作位置本来就是 0）。
 		for i := range rcpt.Actions {
+			if err := validateReceiptActionIndex(rcpt.ProposalID, i, &rcpt.Actions[i]); err != nil {
+				return err
+			}
 			if err := validateReceiptActionBalances(rcpt.ProposalID, i, &rcpt.Actions[i]); err != nil {
 				return err
 			}
@@ -940,6 +989,42 @@ func validateReceiptExecutedAt(order int, rcpt *Receipt, timelockEnd int64) erro
 	if rcpt.ExecutedAt < timelockEnd {
 		return fmt.Errorf("receipt %d for proposal %q executed_at %d is before timelock_end %d",
 			order, rcpt.ProposalID, rcpt.ExecutedAt, timelockEnd)
+	}
+	return nil
+}
+
+// validateReceiptOrder 严格判定一份已保存凭据的 order：
+// 字段未写出、显式为 null 或不是 int64 整数都返回带定位的错误；
+// 明确写出的值必须是非负整数且等于该凭据在成功执行记录中的位置
+// （order 参数，0 起）——明确写出的 0 是合法序号（第一份凭据的位置本来
+// 就是 0），负数或与位置不符的值一律拒绝，不按数组位置重新编号。
+// “缺失/空值/类型不符”的判定与逐票明细、计票结果、executed_at 共用同一份
+// 规则（requiredScalarProblem），此处只补充凭据的业务位置与序号一致性检查。
+func validateReceiptOrder(order int, rcpt *Receipt) error {
+	if problem := requiredScalarProblem(rcpt.orderRaw, scalarInteger); problem != "" {
+		return fmt.Errorf("receipt %d for proposal %q field %q %s", order, rcpt.ProposalID, "order", problem)
+	}
+	if rcpt.Order != order {
+		return fmt.Errorf("receipt %d for proposal %q field %q is %d, does not match its position %d",
+			order, rcpt.ProposalID, "order", rcpt.Order, order)
+	}
+	return nil
+}
+
+// validateReceiptActionIndex 严格判定一条动作留痕的 index：
+// 字段未写出、显式为 null 或不是 int64 整数都返回带定位的错误；
+// 明确写出的值必须是非负整数且等于该动作在所属凭据中的位置
+// （index 参数，0 起）——明确写出的 0 是合法序号（每份凭据的第一项动作
+// 位置本来就是 0），负数或与位置不符的值一律拒绝，不按数组位置重新编号。
+// 错误定位带提案编号与动作在凭据中的下标，与余额字段的判定
+// （validateReceiptActionBalances）共用同一份标量规则。
+func validateReceiptActionIndex(id string, index int, ar *ActionReceipt) error {
+	if problem := requiredScalarProblem(ar.indexRaw, scalarInteger); problem != "" {
+		return fmt.Errorf("receipt for proposal %q action %d field %q %s", id, index, "index", problem)
+	}
+	if ar.Index != index {
+		return fmt.Errorf("receipt for proposal %q action %d field %q is %d, does not match its position %d",
+			id, index, "index", ar.Index, index)
 	}
 	return nil
 }
@@ -1063,10 +1148,16 @@ func init() {
 	// 提案编号与凭据位置，统一由 validateReceiptExecutedAt 报错，结构扫描在此
 	// 叶子位置保持宽松。
 	storedStateSchema.fields["receipts"].elem.fields["executed_at"].kind = kindAny
-	// 凭据逐笔留痕的四个余额字段（treasury/recipient 的 before/after）同理：
-	// 缺失/空值/类型不符的判定需要带上提案编号、动作下标与所在侧，统一由
-	// validateReceiptActionBalances 报错，结构扫描在这些叶子位置保持宽松。
+	// 凭据的 order 同理：缺失/空值/类型不符/与位置不符的判定需要带上提案编号
+	// 与凭据位置，统一由 validateReceiptOrder 报错，结构扫描在此叶子位置保持
+	// 宽松。
+	storedStateSchema.fields["receipts"].elem.fields["order"].kind = kindAny
+	// 凭据逐笔留痕的 index 与四个余额字段（treasury/recipient 的 before/after）
+	// 同理：缺失/空值/类型不符/与位置不符的判定需要带上提案编号、动作下标与
+	// 所在侧，统一由 validateReceiptActionIndex 与 validateReceiptActionBalances
+	// 报错，结构扫描在这些叶子位置保持宽松。
 	actionFields := storedStateSchema.fields["receipts"].elem.fields["actions"].elem.fields
+	actionFields["index"].kind = kindAny
 	for _, side := range []string{"treasury", "recipient"} {
 		balanceFields := actionFields[side].fields
 		balanceFields["before"].kind = kindAny

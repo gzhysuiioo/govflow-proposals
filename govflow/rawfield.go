@@ -10,10 +10,11 @@ import (
 // 本文件是状态文件中“必填标量字段”的统一读取与判定。
 //
 // 逐票明细（representative/weight/support/voted_at）、首次计票结果
-// （for_weight/against_weight）与执行凭据（executed_at）遵循同一条字段规则：
-// 字段必须明确写出、不得为 null、JSON 类型必须与声明一致（整数另要求 int64
-// 范围内的整数字面量，小数/指数/超界同样拒绝）。缺失或 null 绝不补成零值：
-// 明确写出的 false 是有效反对票，窗口允许时明确写出的 0 是有效时间或权重。
+// （for_weight/against_weight）与执行凭据（executed_at、order、逐笔动作的
+// index）遵循同一条字段规则：字段必须明确写出、不得为 null、JSON 类型必须与
+// 声明一致（整数另要求 int64 范围内的整数字面量，小数/指数/超界同样拒绝）。
+// 缺失或 null 绝不补成零值：明确写出的 false 是有效反对票，窗口允许时明确
+// 写出的 0 是有效时间、权重或序号。
 //
 // 各类记录共用这里的判定，又各自把字段名与原因短语格式化为带业务位置
 // （提案编号、票据下标、计票记录标识）的错误，不会退化成没有记录位置的
@@ -96,6 +97,17 @@ func fillBool(raw json.RawMessage, dst *bool) {
 func fillInt64(raw json.RawMessage, dst *int64) {
 	if isInt64Number(raw) {
 		_ = json.Unmarshal(raw, dst)
+	}
+}
+
+// fillInt 与 fillInt64 同理，目标类型为 int（本平台 int 与 int64 同宽，
+// isInt64Number 已保证值在有符号 64 位整数范围内，转换不丢精度）。
+func fillInt(raw json.RawMessage, dst *int) {
+	if isInt64Number(raw) {
+		var v int64
+		if err := json.Unmarshal(raw, &v); err == nil {
+			*dst = int(v)
+		}
 	}
 }
 
