@@ -761,6 +761,11 @@ func (s *Store) loadLocked() (*storedState, error) {
 	if len(bytes.TrimSpace(raw)) == 0 {
 		return nil, fmt.Errorf("%w: %s: file is empty", ErrStateCorrupt, s.path)
 	}
+	// 先按原文校验全部 JSON 字符串：非法 UTF-8 字节与未配对代理项转义在
+	// 解码时会被静默改写成 U+FFFD，必须在结构扫描与解码之前整份拒绝。
+	if err := checkStateStrings(raw); err != nil {
+		return nil, fmt.Errorf("%w: %s: %v", ErrStateCorrupt, s.path, err)
+	}
 	if err := checkStateStructure(raw); err != nil {
 		return nil, fmt.Errorf("%w: %s: %v", ErrStateCorrupt, s.path, err)
 	}
