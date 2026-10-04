@@ -6,6 +6,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -2173,4 +2174,318 @@ func TestCreateVotePreservesValidText(t *testing.T) {
 	if _, err := reopened.Execute(in.ID, 30); err == nil {
 		t.Fatalf("execute with malformed action must fail")
 	}
+}
+
+// executedRetryInput 构造一项已执行提案的完整创建内容：多人连续委托
+// （erin->carol->bob，bob 为最终代表）加上两笔发给同一收款账户、金额不同、
+// 顺序敏感的转账动作。成员与委托的提交顺序刻意与路径推演顺序不同。
+func executedRetryInput(id string) *CreateVoteInput {
+	return &CreateVoteInput{
+		ID: id,
+		Members: []VoteMember{
+			{ID: "alice", Weight: 300},
+			{ID: "bob", Weight: 100},
+			{ID: "carol", Weight: 50},
+			{ID: "dave", Weight: 400},
+			{ID: "erin", Weight: 25},
+		},
+		Delegations: []Delegation{
+			{From: "erin", To: "carol"},
+			{From: "carol", To: "bob"},
+		},
+		Quorum:      600,
+		StartAt:     100,
+		Deadline:    200,
+		TimelockEnd: 300,
+		Actions: []string{
+			"transfer:audits:100",
+			"transfer:audits:50",
+		},
+	}
+}
+
+// assertExecutedProposalUntouched 断言提案查询视图仍为首次创建、投票、计票、
+// 执行后的原样：已执行状态、投票明细、首次计票结论、成员顺序与完整委托路径、
+// 动作原文与顺序都不得被创建重试改动。
+func assertExecutedProposalUntouched(t *testing.T, v *VoteProposalView, in *CreateVoteInput) {
+	t.Helper()
+	if v.State != "executed" {
+		t.Fatalf("state=%s, want executed", v.State)
+	}
+	if v.Source != "vote" {
+		t.Fatalf("source=%s, want vote", v.Source)
+	}
+	if !sameActions(v.Actions, in.Actions) {
+		t.Fatalf("actions=%v, want %v", v.Actions, in.Actions)
+	}
+	// 成员展示次序来自原提案的提交顺序，不被换序重试重排。
+	if ids := memberIDs(v.Members); !equalStrings(ids, memberIDsFromInput(in.Members)) {
+		t.Fatalf("member order=%v, want original %v", ids, memberIDsFromInput(in.Members))
+	}
+	// 经多人连续委托给最终代表时必须保留完整路径，不得省略中间成员 carol。
+	want := map[string]MemberView{
+		"alice": {ID: "alice", Weight: 300, Path: []string{"alice"}, Delegate: "alice"},
+		"bob":   {ID: "bob", Weight: 100, Path: []string{"bob"}, Delegate: "bob"},
+		"carol": {ID: "carol", Weight: 50, Path: []string{"carol", "bob"}, Delegate: "bob", Direct: "bob"},
+		"dave":  {ID: "dave", Weight: 400, Path: []string{"dave"}, Delegate: "dave"},
+		"erin":  {ID: "erin", Weight: 25, Path: []string{"erin", "carol", "bob"}, Delegate: "bob", Direct: "carol"},
+	}
+	assertMemberViews(t, "post-retry", memberPaths(v), want)
+
+	// 投票明细：原有代表、归集票重、赞成/反对选择、首次投票时间全部保留，
+	// 创建重试不得清空或追加票据。
+	if len(v.Ballots) != 3 {
+		t.Fatalf("ballot count=%d, want 3: %+v", len(v.Ballots), v.Ballots)
+	}
+	ballots := map[string]BallotView{}
+	for _, b := range v.Ballots {
+		ballots[b.Representative] = b
+	}
+	// bob 归集 bob+carol+erin = 100+50+25 = 175；alice 代表自己 300。
+	if b := ballots["bob"]; b.Weight != 175 || !b.Support || b.VotedAt != 150 {
+		t.Fatalf("bob ballot=%+v, want weight=175 support=true voted_at=150", b)
+	}
+	if b := ballots["alice"]; b.Weight != 300 || !b.Support || b.VotedAt != 150 {
+		t.Fatalf("alice ballot=%+v, want weight=300 support=true voted_at=150", b)
+	}
+	if b := ballots["dave"]; b.Weight != 400 || b.Support || b.VotedAt != 160 {
+		t.Fatalf("dave ballot=%+v, want weight=400 support=false voted_at=160", b)
+	}
+
+	// 首次计票结论与首次计票时间保留：赞成 300+175=475，反对 400，
+	// 参与 875 >= 600 且赞成严格多于反对。
+	if v.Tally == nil {
+		t.Fatal("tally conclusion missing after create retry")
+	}
+	if v.Tally.ForWeight != 475 || v.Tally.AgainstWeight != 400 ||
+		v.Tally.Turnout != 875 || v.Tally.Quorum != 600 || !v.Tally.Passed ||
+		v.Tally.TalliedAt != 200 {
+		t.Fatalf("tally=%+v, want for=475 against=400 turnout=875 quorum=600 passed=true tallied_at=200", v.Tally)
+	}
+}
+
+func memberIDsFromInput(ms []VoteMember) []string {
+	ids := make([]string, len(ms))
+	for i, m := range ms {
+		ids[i] = m.ID
+	}
+	return ids
+}
+
+// assertFirstReceiptUntouched 断言成功执行记录仍只有原来的一份，且凭据的
+// 首次执行时间、提交序号、各笔动作原文、动作位置与前后余额均保持原样；
+// 同一账户的多笔收款继续分别留痕。
+func assertFirstReceiptUntouched(t *testing.T, store *Store, id string, treasuryAfter int64) *Receipt {
+	t.Helper()
+	all, err := store.Receipts()
+	if err != nil {
+		t.Fatalf("Receipts: %v", err)
+	}
+	if len(all) != 1 {
+		t.Fatalf("receipt count=%d, want 1 (retry must not append a successful execution)", len(all))
+	}
+	r, ok, err := store.Receipt(id)
+	if err != nil || !ok {
+		t.Fatalf("Receipt(%s): ok=%v err=%v", id, ok, err)
+	}
+	if r.ProposalID != id || r.ExecutedAt != 300 || r.Order != 0 {
+		t.Fatalf("receipt header=%+v, want id=%s executed_at=300 order=0", r, id)
+	}
+	if len(r.Actions) != 2 {
+		t.Fatalf("receipt actions=%d, want 2", len(r.Actions))
+	}
+	// 初始资金库 1000：第一笔 audits 1000->900、0->100；第二笔 900->850、100->150。
+	wantActions := []ActionReceipt{
+		{Index: 0, Action: "transfer:audits:100"},
+		{Index: 1, Action: "transfer:audits:50"},
+	}
+	treasury := []struct{ before, after int64 }{
+		{1000, 900},
+		{900, 850},
+	}
+	recipient := []struct{ before, after int64 }{
+		{0, 100},
+		{100, 150},
+	}
+	for i := range wantActions {
+		got := r.Actions[i]
+		if got.Index != wantActions[i].Index || got.Action != wantActions[i].Action {
+			t.Fatalf("receipt action %d = (index=%d text=%q), want index=%d text=%q",
+				i, got.Index, got.Action, wantActions[i].Index, wantActions[i].Action)
+		}
+		if got.Treasury.Account != "treasury" ||
+			got.Treasury.Before != treasury[i].before || got.Treasury.After != treasury[i].after {
+			t.Fatalf("receipt action %d treasury=%+v, want account=treasury %d->%d",
+				i, got.Treasury, treasury[i].before, treasury[i].after)
+		}
+		if got.Recipient.Account != "audits" ||
+			got.Recipient.Before != recipient[i].before || got.Recipient.After != recipient[i].after {
+			t.Fatalf("receipt action %d recipient=%+v, want audits %d->%d",
+				i, got.Recipient, recipient[i].before, recipient[i].after)
+		}
+	}
+	if bal, err := store.TreasuryBalance(); err != nil || bal != treasuryAfter {
+		t.Fatalf("treasury=%d err=%v, want %d", bal, err, treasuryAfter)
+	}
+	if bal, err := store.Balance("audits"); err != nil || bal != 150 {
+		t.Fatalf("audits=%d err=%v, want 150", bal, err)
+	}
+	return r
+}
+
+// TestCreateVoteRetryAfterExecutionPreservesExecutedProposal 回归保护：
+// 提案已有投票明细、首次计票结论与成功执行凭据（资金库已完成转账）后，
+// 再次提交原创建内容必须按“已存在”成功返回，返回的仍是已执行提案，
+// 而不是新建的 voting 提案；投票、计票、执行留痕与资金余额一律保留。
+func TestCreateVoteRetryAfterExecutionPreservesExecutedProposal(t *testing.T) {
+	store, path := openTempStore(t, 1000)
+	in := executedRetryInput("gip-executed-retry")
+	mustCreateVote(t, store, in)
+
+	if b, err := store.CastVote(in.ID, "bob", true, 150); err != nil {
+		t.Fatalf("bob vote: %v", err)
+	} else if b.Weight != 175 {
+		t.Fatalf("bob delegated weight=%d, want 175", b.Weight)
+	}
+	if _, err := store.CastVote(in.ID, "alice", true, 150); err != nil {
+		t.Fatalf("alice vote: %v", err)
+	}
+	if _, err := store.CastVote(in.ID, "dave", false, 160); err != nil {
+		t.Fatalf("dave vote: %v", err)
+	}
+	if tally, err := store.TallyVote(in.ID, 200); err != nil || !tally.Passed {
+		t.Fatalf("tally=%+v err=%v", tally, err)
+	}
+	if _, err := store.Execute(in.ID, 300); err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+
+	// 首次执行后的余额基线：资金库 850，audits 150；成功记录只有一份。
+	if bal, _ := store.TreasuryBalance(); bal != 850 {
+		t.Fatalf("treasury after execute=%d, want 850", bal)
+	}
+	first := assertFirstReceiptUntouched(t, store, in.ID, 850)
+
+	// 成员名单与委托条目换序提交，编号、权重、委托关系与其它创建内容相同：
+	// 仍属同一次创建，必须 existed=true 成功返回已执行提案。
+	retry := executedRetryInput(in.ID)
+	retry.Members = []VoteMember{
+		{ID: "erin", Weight: 25},
+		{ID: "dave", Weight: 400},
+		{ID: "carol", Weight: 50},
+		{ID: "bob", Weight: 100},
+		{ID: "alice", Weight: 300},
+	}
+	retry.Delegations = []Delegation{{From: "carol", To: "bob"}, {From: "erin", To: "carol"}}
+	view, existed, err := store.CreateVoteProposal(retry)
+	if err != nil || !existed {
+		t.Fatalf("same-content retry after execution: existed=%v err=%v", existed, err)
+	}
+	assertExecutedProposalUntouched(t, view, in)
+
+	// 查询展示与创建重试返回一致，且成员次序仍来自原提案。
+	queried, ok, err := store.VoteProposal(in.ID)
+	if err != nil || !ok {
+		t.Fatalf("VoteProposal: ok=%v err=%v", ok, err)
+	}
+	assertExecutedProposalUntouched(t, queried, in)
+	if !reflect.DeepEqual(view, queried) {
+		t.Fatalf("retry view and query view differ:\nretry=%+v\nquery=%+v", view, queried)
+	}
+
+	// 重试不重新赋予一次转账机会：余额与成功执行记录保持首次执行后的原样。
+	assertFirstReceiptUntouched(t, store, in.ID, 850)
+	// 再次执行同样只返回首次凭据，不产生第二份成功记录或新转账。
+	if again, err := store.Execute(in.ID, 99999); err != nil ||
+		again.ExecutedAt != 300 || again.Order != 0 || len(again.Actions) != 2 {
+		t.Fatalf("execute after create retry: %+v err=%v", again, err)
+	}
+	assertFirstReceiptUntouched(t, store, in.ID, 850)
+	store.Close()
+
+	// 重开状态文件：创建重试没有替换凭据或追加记录，提案查询与凭据查询
+	// 仍对应同一次执行。
+	reopened, err := Open(path)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer reopened.Close()
+	v2, ok, err := reopened.VoteProposal(in.ID)
+	if err != nil || !ok {
+		t.Fatalf("query after reopen: ok=%v err=%v", ok, err)
+	}
+	assertExecutedProposalUntouched(t, v2, in)
+	r2, ok, err := reopened.Receipt(in.ID)
+	if err != nil || !ok {
+		t.Fatalf("receipt after reopen: ok=%v err=%v", ok, err)
+	}
+	if !reflect.DeepEqual(r2, first) {
+		t.Fatalf("receipt changed after create retry/reopen:\nbefore=%+v\nafter =%+v", first, r2)
+	}
+	assertFirstReceiptUntouched(t, reopened, in.ID, 850)
+}
+
+// TestCreateVoteRetryActionSwapAfterExecutionConflicts 回归保护动作次序的含义：
+// 提案已通过并完成转账后，仅交换两笔发给同一收款账户、金额不同的动作顺序，
+// 即使合计金额不变、最终余额相同，也属于不同创建内容，必须返回现有的
+// 提案内容冲突错误；冲突不得改变已执行状态、投票/计票记录、动作列表或余额。
+func TestCreateVoteRetryActionSwapAfterExecutionConflicts(t *testing.T) {
+	store, path := openTempStore(t, 1000)
+	in := executedRetryInput("gip-executed-swap")
+	mustCreateVote(t, store, in)
+	if _, err := store.CastVote(in.ID, "bob", true, 150); err != nil {
+		t.Fatalf("bob vote: %v", err)
+	}
+	if _, err := store.CastVote(in.ID, "alice", true, 150); err != nil {
+		t.Fatalf("alice vote: %v", err)
+	}
+	if _, err := store.CastVote(in.ID, "dave", false, 160); err != nil {
+		t.Fatalf("dave vote: %v", err)
+	}
+	if tally, err := store.TallyVote(in.ID, 200); err != nil || !tally.Passed {
+		t.Fatalf("tally=%+v err=%v", tally, err)
+	}
+	original, err := store.Execute(in.ID, 300)
+	if err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	if bal, _ := store.TreasuryBalance(); bal != 850 {
+		t.Fatalf("treasury after execute=%d, want 850", bal)
+	}
+
+	// 仅交换两笔同收款账户、不同金额动作的顺序：合计仍是 150，
+	// 但动作原文的次序是创建内容的一部分，必须按冲突拒绝，
+	// 不能因为最终余额相同就判为成功重试。
+	swapped := executedRetryInput(in.ID)
+	swapped.Actions = []string{"transfer:audits:50", "transfer:audits:100"}
+	if view, existed, err := store.CreateVoteProposal(swapped); !errors.Is(err, ErrProposalConflict) || existed || view != nil {
+		t.Fatalf("swapped-action retry: view=%+v existed=%v err=%v, want ErrProposalConflict", view, existed, err)
+	}
+
+	// 冲突不得改变提案：仍是 executed，投票/计票明细、动作原文与顺序保留。
+	v, ok, err := store.VoteProposal(in.ID)
+	if err != nil || !ok {
+		t.Fatalf("VoteProposal: ok=%v err=%v", ok, err)
+	}
+	assertExecutedProposalUntouched(t, v, in)
+
+	// 冲突不得改变资金库与收款账户余额，也不得追加或替换成功执行记录。
+	after := assertFirstReceiptUntouched(t, store, in.ID, 850)
+	if !reflect.DeepEqual(after, original) {
+		t.Fatalf("receipt changed after swapped-action conflict:\nbefore=%+v\nafter =%+v", original, after)
+	}
+	store.Close()
+
+	// 重开后冲突尝试同样没有留下任何痕迹。
+	reopened, err := Open(path)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer reopened.Close()
+	v2, ok, err := reopened.VoteProposal(in.ID)
+	if err != nil || !ok {
+		t.Fatalf("query after reopen: ok=%v err=%v", ok, err)
+	}
+	assertExecutedProposalUntouched(t, v2, in)
+	assertFirstReceiptUntouched(t, reopened, in.ID, 850)
 }
