@@ -5,8 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"sort"
-	"strconv"
-	"strings"
 )
 
 // 投票提案相关错误。
@@ -145,18 +143,10 @@ func (b *storedBallot) UnmarshalJSON(data []byte) error {
 	b.supportRaw, b.votedAtRaw = shape.Support, shape.VotedAt
 	// 仅当字段确实是目标类型时才填充治理字段；类型不符留待校验拒绝，
 	// 绝不能让错误类型悄悄落成零值并参与查询或计票。
-	if raw := shape.Representative; jsonValueType(raw) == "string" {
-		_ = json.Unmarshal(raw, &b.Representative)
-	}
-	if raw := shape.Weight; isInt64Number(raw) {
-		_ = json.Unmarshal(raw, &b.Weight)
-	}
-	if raw := shape.Support; jsonValueType(raw) == "boolean" {
-		_ = json.Unmarshal(raw, &b.Support)
-	}
-	if raw := shape.VotedAt; isInt64Number(raw) {
-		_ = json.Unmarshal(raw, &b.VotedAt)
-	}
+	fillString(shape.Representative, &b.Representative)
+	fillInt64(shape.Weight, &b.Weight)
+	fillBool(shape.Support, &b.Support)
+	fillInt64(shape.VotedAt, &b.VotedAt)
 	return nil
 }
 
@@ -203,78 +193,17 @@ func mustStoreBallot(representative string, weight int64, support bool, votedAt 
 // weight/voted_at 不接受字符串/小数/指数等非整数）都返回带原因的错误。
 // 明确写出的 false 是有效反对票；窗口允许时明确写出的 0 是有效投票时间，
 // 这两种合法值不得当成缺失。index 是票据在提案中的下标（0 起），用于定位。
+// “缺失/空值/类型不符”的判定与计票结果、执行凭据共用同一份规则
+// （validateRawFields），此处只补充票据的业务位置：提案编号 + 票据下标。
 func validateStoredBallot(id string, index int, b *storedBallot) error {
-	check := func(field string, raw json.RawMessage, kind string, decode func() error) error {
-		switch {
-		case raw == nil:
-			return fmt.Errorf("voting proposal %q ballot %d field %q is missing", id, index, field)
-		case string(raw) == "null":
-			return fmt.Errorf("voting proposal %q ballot %d field %q is null", id, index, field)
-		default:
-			if err := decode(); err != nil {
-				return fmt.Errorf("voting proposal %q ballot %d field %q has wrong type: want %s, got %s",
-					id, index, field, kind, jsonValueType(raw))
-			}
-			return nil
-		}
-	}
-	if err := check("representative", b.representativeRaw, "string", func() error {
-		return json.Unmarshal(b.representativeRaw, new(string))
-	}); err != nil {
-		return err
-	}
-	if err := check("weight", b.weightRaw, "integer", func() error {
-		return json.Unmarshal(b.weightRaw, new(int64))
-	}); err != nil {
-		return err
-	}
-	if err := check("support", b.supportRaw, "boolean", func() error {
-		return json.Unmarshal(b.supportRaw, new(bool))
-	}); err != nil {
-		return err
-	}
-	if err := check("voted_at", b.votedAtRaw, "integer", func() error {
-		return json.Unmarshal(b.votedAtRaw, new(int64))
-	}); err != nil {
-		return err
-	}
-	return nil
-}
-
-// jsonValueType 按字段实际写出 JSON 的首字节归类其 JSON 类型。
-// RawMessage 是从合法 JSON 文档中取出的单个值，首字节足以区分
-// 字符串/布尔/null/数字/数组/对象，无需再次解码。
-func jsonValueType(raw json.RawMessage) string {
-	for _, c := range raw {
-		switch c {
-		case ' ', '\t', '\n', '\r':
-			continue
-		case '"':
-			return "string"
-		case 't', 'f':
-			return "boolean"
-		case 'n':
-			return "null"
-		case '[':
-			return "array"
-		case '{':
-			return "object"
-		default:
-			return "number"
-		}
-	}
-	return "invalid json"
-}
-
-// isInt64Number 判断原始 JSON 是否为落在有符号 64 位整数范围内的整数字面量：
-// 必须是 JSON 数字（首字节为数字或 '-'），且能被 ParseInt 以 10 进制精确解析。
-// 小数、指数、超界整数均返回 false。
-func isInt64Number(raw json.RawMessage) bool {
-	if jsonValueType(raw) != "number" {
-		return false
-	}
-	_, err := strconv.ParseInt(strings.TrimSpace(string(raw)), 10, 64)
-	return err == nil
+	return validateRawFields([]rawField{
+		{name: "representative", kind: scalarString, raw: b.representativeRaw},
+		{name: "weight", kind: scalarInteger, raw: b.weightRaw},
+		{name: "support", kind: scalarBoolean, raw: b.supportRaw},
+		{name: "voted_at", kind: scalarInteger, raw: b.votedAtRaw},
+	}, func(field, problem string) error {
+		return fmt.Errorf("voting proposal %q ballot %d field %q %s", id, index, field, problem)
+	})
 }
 
 // storedTally 是已保存的首次计票结果。只要提案有计票结果，for_weight 与
@@ -315,12 +244,8 @@ func (t *storedTally) UnmarshalJSON(data []byte) error {
 	t.TalliedAt = shape.TalliedAt
 	// 仅当字段确实是 int64 整数时才填充治理字段；类型不符留待校验拒绝，
 	// 绝不能让错误类型悄悄落成 0 并参与查询或再次计票。
-	if isInt64Number(shape.ForWeight) {
-		_ = json.Unmarshal(shape.ForWeight, &t.ForWeight)
-	}
-	if isInt64Number(shape.AgainstWeight) {
-		_ = json.Unmarshal(shape.AgainstWeight, &t.AgainstWeight)
-	}
+	fillInt64(shape.ForWeight, &t.ForWeight)
+	fillInt64(shape.AgainstWeight, &t.AgainstWeight)
 	return nil
 }
 
@@ -343,26 +268,15 @@ func mustStoreTally(forWeight, againstWeight, talliedAt int64) *storedTally {
 // for_weight 与 against_weight 任一未写出、显式为 null 或不是 int64 整数
 // （字符串/小数/指数/超界）都返回带提案编号、字段名与原因的错误。
 // 明确写出的 0 是合法权重（该侧没有票），不得当成缺失。
+// “缺失/空值/类型不符”的判定与逐票明细、执行凭据共用同一份规则
+// （validateRawFields），此处只补充计票记录的业务位置：提案编号 + tally 标识。
 func validateStoredTally(id string, t *storedTally) error {
-	check := func(field string, raw json.RawMessage) error {
-		switch {
-		case raw == nil:
-			return fmt.Errorf("voting proposal %q tally field %q is missing", id, field)
-		case string(raw) == "null":
-			return fmt.Errorf("voting proposal %q tally field %q is null", id, field)
-		case !isInt64Number(raw):
-			return fmt.Errorf("voting proposal %q tally field %q has wrong type: want integer, got %s",
-				id, field, jsonValueType(raw))
-		}
-		return nil
-	}
-	if err := check("for_weight", t.forWeightRaw); err != nil {
-		return err
-	}
-	if err := check("against_weight", t.againstWeightRaw); err != nil {
-		return err
-	}
-	return nil
+	return validateRawFields([]rawField{
+		{name: "for_weight", kind: scalarInteger, raw: t.forWeightRaw},
+		{name: "against_weight", kind: scalarInteger, raw: t.againstWeightRaw},
+	}, func(field, problem string) error {
+		return fmt.Errorf("voting proposal %q tally field %q %s", id, field, problem)
+	})
 }
 
 // storedVoteProposal 按成员提交顺序保存成员与委托（顺序不影响相等性），

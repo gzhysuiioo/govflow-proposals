@@ -90,9 +90,7 @@ func (r *Receipt) UnmarshalJSON(data []byte) error {
 	r.Order = shape.Order
 	r.Actions = shape.Actions
 	r.executedAtRaw = shape.ExecutedAt
-	if isInt64Number(shape.ExecutedAt) {
-		_ = json.Unmarshal(shape.ExecutedAt, &r.ExecutedAt)
-	}
+	fillInt64(shape.ExecutedAt, &r.ExecutedAt)
 	return nil
 }
 
@@ -880,16 +878,11 @@ func validateState(state *storedState) error {
 // 明确写出的值必须不早于所属提案的 timelock_end（恰好等于时间锁有效，
 // 时间锁允许 0 时明确写出的 0 同样有效）。order 是凭据在凭据表中的
 // 位置（0 起），与提案编号一起用于定位。
+// “缺失/空值/类型不符”的判定与逐票明细、计票结果共用同一份规则
+// （requiredScalarProblem），此处只补充凭据的业务位置与执行资格检查。
 func validateReceiptExecutedAt(order int, rcpt *Receipt, timelockEnd int64) error {
-	raw := rcpt.executedAtRaw
-	switch {
-	case raw == nil:
-		return fmt.Errorf("receipt %d for proposal %q field %q is missing", order, rcpt.ProposalID, "executed_at")
-	case string(raw) == "null":
-		return fmt.Errorf("receipt %d for proposal %q field %q is null", order, rcpt.ProposalID, "executed_at")
-	case !isInt64Number(raw):
-		return fmt.Errorf("receipt %d for proposal %q field %q has wrong type: want integer, got %s",
-			order, rcpt.ProposalID, "executed_at", jsonValueType(raw))
+	if problem := requiredScalarProblem(rcpt.executedAtRaw, scalarInteger); problem != "" {
+		return fmt.Errorf("receipt %d for proposal %q field %q %s", order, rcpt.ProposalID, "executed_at", problem)
 	}
 	if rcpt.ExecutedAt < timelockEnd {
 		return fmt.Errorf("receipt %d for proposal %q executed_at %d is before timelock_end %d",
