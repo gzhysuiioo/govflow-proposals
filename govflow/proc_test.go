@@ -344,6 +344,88 @@ func TestCrossProcessVotingLifecycle(t *testing.T) {
 
 var pathJSONRe = regexp.MustCompile(`"path": \[\s+"bob",\s+"alice"\s+\]`)
 
+// TestCrossProcessColonMemberDelegation：成员编号可含冒号（含开头、结尾与连续
+// 冒号），委托原文按完整名单唯一确定切分；切分有歧义是参数错误（退出码 2），
+// 形状合法但配不上名单是域错误（退出码 1），失败均不留下提案或改动资金库。
+func TestCrossProcessColonMemberDelegation(t *testing.T) {
+	binary := buildCLI(t)
+	state := filepath.Join(t.TempDir(), "treasury.json")
+	if _, _, code := runCLI(t, binary, state, "init", "--balance", "1000"); code != 0 {
+		t.Fatal("init failed")
+	}
+	// 委托人的编号以冒号开头：":alice" 把权重委托给 "team:bob"。
+	create := []string{"create-vote", "--id", "gip-colon",
+		"--member", ":alice:70", "--member", "team:bob:30",
+		"--delegate", ":alice:team:bob",
+		"--quorum", "50", "--start", "100", "--deadline", "200", "--timelock", "300",
+		"--action", "transfer:audits:100"}
+	if _, se, code := runCLI(t, binary, state, create...); code != 0 {
+		t.Fatalf("create-vote with colon-leading member failed: %s", se)
+	}
+	// 查询完整保留两个编号：委托路径与最终代表。
+	so, _, code := runCLI(t, binary, state, "proposal", "--id", "gip-colon")
+	if code != 0 || !strings.Contains(so, "member :alice weight=70 path=:alice->team:bob") ||
+		!strings.Contains(so, "member team:bob weight=30 representative=self") {
+		t.Fatalf("query must preserve colon member ids and path:\n%s", so)
+	}
+	// 窗口内 team:bob 的票重为归集后的 100；:alice 不能直接投票。
+	if so, se, code := runCLI(t, binary, state, "vote", "--id", "gip-colon",
+		"--voter", "team:bob", "--choice", "for", "--now", "150", "--json"); code != 0 ||
+		!strings.Contains(so, `"weight": 100`) {
+		t.Fatalf("team:bob vote code=%d so=%s se=%s", code, so, se)
+	}
+	if _, se, code := runCLI(t, binary, state, "vote", "--id", "gip-colon",
+		"--voter", ":alice", "--choice", "for", "--now", "150"); code != 1 ||
+		!strings.Contains(se, "delegated") {
+		t.Fatalf("delegated :alice vote code=%d: %s", code, se)
+	}
+
+	// 失败分类：格式错误（无冒号或没有两端均非空的切分）退出码 2；
+	// 形状合法但配不上名单退出码 1；多种切分都命中名单是歧义，退出码 2。
+	base := []string{"create-vote", "--id", "gip-x",
+		"--quorum", "1", "--start", "0", "--deadline", "1", "--timelock", "1"}
+	cases := []struct {
+		name    string
+		members []string
+		raw     string
+		code    int
+		want    string
+	}{
+		{"no-colon", []string{"a:1"}, "alice", 2, "malformed"},
+		{"empty-side", []string{"a:1"}, ":alice:", 2, "malformed"},
+		{"no-roster-match", []string{"a:1", "b:2"}, "a:ghost", 1, "does not match"},
+		{"case-variant-no-match", []string{":alice:70", "team:bob:30"}, ":Alice:team:bob", 1, "does not match"},
+		{"ambiguous", []string{"a:1", "b:c:2", "a:b:3", "c:4"}, "a:b:c", 2, "ambiguous"},
+		{"ambiguous-beats-self-rule", []string{"x:1", "x:x:2"}, "x:x:x", 2, "ambiguous"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			args := append([]string{}, base...)
+			for _, m := range tc.members {
+				args = append(args, "--member", m)
+			}
+			args = append(args, "--delegate", tc.raw)
+			_, se, code := runCLI(t, binary, state, args...)
+			if code != tc.code || !strings.Contains(se, tc.want) {
+				t.Fatalf("exit=%d want %d (%q), stderr=%s", code, tc.code, tc.want, se)
+			}
+			// 创建失败不得留下提案。
+			if _, _, qcode := runCLI(t, binary, state, "proposal", "--id", "gip-x"); qcode != 1 {
+				t.Fatalf("failed create left a proposal behind, query exit=%d", qcode)
+			}
+		})
+	}
+	// 唯一确定成员对之后，自委托/重复/循环仍按域规则拒绝（退出码 1）。
+	self := append(append([]string{}, base...), "--member", "y:1", "--member", "z:2", "--delegate", "y:y")
+	if _, se, code := runCLI(t, binary, state, self...); code != 1 || !strings.Contains(se, "itself") {
+		t.Fatalf("self-delegation code=%d: %s", code, se)
+	}
+	// 资金库状态不受任何失败创建影响。
+	if so, _, _ := runCLI(t, binary, state, "balances", "--json"); !strings.Contains(so, `"treasury": 1000`) {
+		t.Fatalf("treasury changed by failed creates:\n%s", so)
+	}
+}
+
 // TestCrossProcessConcurrentTally：多进程同时计票，结论只产生一次且不追加任何记录。
 func TestCrossProcessConcurrentTally(t *testing.T) {
 	binary := buildCLI(t)

@@ -273,18 +273,26 @@ func resolveDelegations(members []govflow.VoteMember, raws []string) ([]govflow.
 	}
 	out := make([]govflow.Delegation, 0, len(raws))
 	for _, raw := range raws {
-		from, to, ok := strings.Cut(raw, ":")
-		if !ok || from == "" || to == "" {
-			return nil, &delegationUsageError{fmt.Sprintf("malformed delegation %q, expected FROM:TO", raw)}
-		}
+		// 成员编号本身可以含冒号，也可能以冒号开头或结尾、含连续冒号，
+		// 因此不能按第一个冒号切分来判定格式：每个冒号位置都是一种候选
+		// 切分，只要存在一个位置让两端均非空，原文就具备 FROM:TO 的形状。
 		var matches []govflow.Delegation
+		hasNonEmptySplit := false
 		for i := 0; i < len(raw); i++ {
 			if raw[i] != ':' {
 				continue
 			}
-			if f, t := raw[:i], raw[i+1:]; roster[f] && roster[t] {
+			f, t := raw[:i], raw[i+1:]
+			if f == "" || t == "" {
+				continue
+			}
+			hasNonEmptySplit = true
+			if roster[f] && roster[t] {
 				matches = append(matches, govflow.Delegation{From: f, To: t})
 			}
+		}
+		if !hasNonEmptySplit {
+			return nil, &delegationUsageError{fmt.Sprintf("malformed delegation %q, expected FROM:TO", raw)}
 		}
 		switch len(matches) {
 		case 0:
