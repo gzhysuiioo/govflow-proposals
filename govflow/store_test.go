@@ -102,6 +102,91 @@ func TestRegisterIdempotentAndConflict(t *testing.T) {
 	}
 }
 
+func TestRegisterRejectsInvalidUTF8(t *testing.T) {
+	store, path := openTempStore(t, 1000)
+	defer store.Close()
+
+	// 已有提案：编号含用户真实写出的 U+FFFD，动作含中文与表情。
+	mustRegister(t, store, "gip-�", 100, "transfer:审计账户✅:50")
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read state: %v", err)
+	}
+
+	badIDs := map[string]string{
+		"lone byte":          "gip-\xff",
+		"truncated sequence": "gip-\xe4\xb8",
+		"encoded surrogate":  "gip-\xed\xa0\x80",
+	}
+	for name, id := range badIDs {
+		if _, err := store.Register(id, 0, []string{"transfer:a:1"}); !errors.Is(err, ErrInvalidRegistration) {
+			t.Fatalf("%s: id err=%v, want ErrInvalidRegistration", name, err)
+		}
+	}
+	// 动作原文非法：错误必须指出动作在提交列表中的位置（0 起）。
+	if _, err := store.Register("gip-new", 0, []string{"transfer:a:1", "transfer:\xff:2"}); !errors.Is(err, ErrInvalidRegistration) {
+		t.Fatalf("bad action err=%v, want ErrInvalidRegistration", err)
+	} else if !strings.Contains(err.Error(), "action 1") {
+		t.Fatalf("bad action err=%q, want position of the action", err)
+	}
+
+	// 已占用的编号同样先报编码错误：坏编号 "\xff" 经替换字符改写后恰好等于
+	// 已有编号 "gip-�"，仍必须返回编码错误，不得当作成功重试或内容冲突。
+	if existed, err := store.Register("gip-\xff", 100, []string{"transfer:审计账户✅:50"}); !errors.Is(err, ErrInvalidRegistration) || existed {
+		t.Fatalf("rewrites-to-existing id existed=%v err=%v, want ErrInvalidRegistration", existed, err)
+	}
+	// 动作与已有登记只有一处非法字节不同，同样是编码错误而非内容冲突。
+	if _, err := store.Register("gip-�", 100, []string{"transfer:审计账户✅:5\xff0"}); !errors.Is(err, ErrInvalidRegistration) {
+		t.Fatalf("one-bad-byte action err=%v, want ErrInvalidRegistration", err)
+	}
+
+	// 失败不得新增提案或保存部分动作：状态文件逐字节不变。
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read state: %v", err)
+	}
+	if string(after) != string(before) {
+		t.Fatalf("state file changed after rejected registrations")
+	}
+	// 已有提案仍能按原编号查询和使用。
+	record, ok, err := store.Proposal("gip-�")
+	if err != nil || !ok {
+		t.Fatalf("existing proposal lookup ok=%v err=%v", ok, err)
+	}
+	if record.TimelockEnd != 100 || len(record.Actions) != 1 || record.Actions[0] != "transfer:审计账户✅:50" {
+		t.Fatalf("existing proposal content rewritten: %+v", record)
+	}
+}
+
+func TestRegisterPreservesValidText(t *testing.T) {
+	store, _ := openTempStore(t, 1000)
+	defer store.Close()
+
+	// 中文、表情、真实的 U+FFFD 与字面反斜杠文本 "\uD800" 都逐字保留：
+	// 后者只是反斜杠加字母的普通文字，不得重新解释成 Unicode 转义。
+	literal := `backslash\D800 text`
+	mustRegister(t, store, "gip-文本-�", 7, "transfer:账户✅:1", "real-�-char", literal)
+
+	record, ok, err := store.Proposal("gip-文本-�")
+	if err != nil || !ok {
+		t.Fatalf("lookup ok=%v err=%v", ok, err)
+	}
+	want := []string{"transfer:账户✅:1", "real-�-char", literal}
+	if len(record.Actions) != len(want) {
+		t.Fatalf("actions=%v", record.Actions)
+	}
+	for i := range want {
+		if record.Actions[i] != want[i] {
+			t.Fatalf("action %d = %q, want %q", i, record.Actions[i], want[i])
+		}
+	}
+	// 编码合法但转账格式错误的动作仍可登记，由执行按原规则拒绝。
+	mustRegister(t, store, "gip-badformat", 0, "withdraw:a:1")
+	if _, err := store.Execute("gip-badformat", 0); err == nil {
+		t.Fatalf("execute of malformed action unexpectedly succeeded")
+	}
+}
+
 func TestExecuteHappyPathAndReceiptShape(t *testing.T) {
 	store, _ := openTempStore(t, 1000)
 	defer store.Close()

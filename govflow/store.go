@@ -15,6 +15,7 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"unicode/utf8"
 )
 
 // 资金库状态文件相关错误。
@@ -27,7 +28,7 @@ var (
 	ErrProposalNotFound = errors.New("proposal not found")
 	// ErrProposalConflict：同编号提案再次登记但时间锁或动作原文与首次不同。
 	ErrProposalConflict = errors.New("proposal already registered with different timelock or actions")
-	// ErrInvalidRegistration：登记参数非法（编号为空、初始余额越界等）。
+	// ErrInvalidRegistration：登记参数非法（编号为空、编号或动作原文编码非法、初始余额越界等）。
 	ErrInvalidRegistration = errors.New("invalid registration")
 )
 
@@ -404,9 +405,28 @@ func newStoredState(treasury int64) *storedState {
 // 编号必须非空；动作列表可为空（执行时会因动作为空被拒绝），动作原文不做改写。
 // 同编号且时间锁、动作原文与首次登记完全相同的重试返回 existed=true；
 // 内容不同则返回 ErrProposalConflict。
+//
+// 编号与每一项动作原文都必须是合法 UTF-8：非法单字节、截断的多字节字符、
+// WTF-8 形式直接编码的代理码位（如 ED A0 80）都会使整项登记以
+// ErrInvalidRegistration 失败，错误指明是编号还是哪个位置（0 起）的动作。
+// 校验先于编号占用与内容冲突判断：即使坏编号经替换字符改写后恰好等于已有
+// 编号，或动作与已有登记只有一处非法字节不同，也返回编码错误而非成功重试或
+// 内容冲突。失败不新增提案、不保存部分动作，已有状态保持原样。
+// 合法文本（含中文、表情与用户真实写出的 U+FFFD）逐字保留。
 func (s *Store) Register(id string, timelockEnd int64, actions []string) (existed bool, err error) {
 	if id == "" {
 		return false, fmt.Errorf("%w: proposal id must not be empty", ErrInvalidRegistration)
+	}
+	// 编码校验必须先于一切状态读写：json.Marshal 会把字符串中的非法 UTF-8
+	// 悄悄改写成 U+FFFD，一旦落盘，按提交编号就再也查不到这项提案，收款账户
+	// 名称也会与原文不同。Go 字符串可持有任意字节，因此必须显式判定。
+	if !utf8.ValidString(id) {
+		return false, fmt.Errorf("%w: proposal id is not valid UTF-8", ErrInvalidRegistration)
+	}
+	for i, action := range actions {
+		if !utf8.ValidString(action) {
+			return false, fmt.Errorf("%w: action %d is not valid UTF-8", ErrInvalidRegistration, i)
+		}
 	}
 	commit, err := s.begin()
 	if err != nil {
