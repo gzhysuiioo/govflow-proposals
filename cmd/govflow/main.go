@@ -3,6 +3,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -240,17 +241,74 @@ func splitMember(raw string) (string, int64, error) {
 	return id, weight, nil
 }
 
-// delegationList 收集重复的 --delegate FROM:TO 参数，保持提交顺序。
-type delegationList []govflow.Delegation
+// rawDelegationList 收集重复的 --delegate FROM:TO 参数原文，保持提交顺序。
+// FROM 与 TO 都可能含冒号，单条参数自身无法确定切分点，必须等全部成员
+// 解析完后结合完整名单一起理解，因此这里只保留原文，不在逐个参数处切分。
+type rawDelegationList []string
 
-func (d *delegationList) String() string { return fmt.Sprint([]govflow.Delegation(*d)) }
-func (d *delegationList) Set(v string) error {
-	from, to, ok := strings.Cut(v, ":")
-	if !ok || from == "" || to == "" {
-		return fmt.Errorf("malformed delegation %q, expected FROM:TO", v)
-	}
-	*d = append(*d, govflow.Delegation{From: from, To: to})
+func (d *rawDelegationList) String() string { return fmt.Sprint([]string(*d)) }
+func (d *rawDelegationList) Set(v string) error {
+	*d = append(*d, v)
 	return nil
+}
+
+// delegationUsageError 是 --delegate 的参数错误（格式错误或有歧义），退出码 2。
+type delegationUsageError struct{ msg string }
+
+func (e *delegationUsageError) Error() string { return e.msg }
+
+// resolveDelegations 结合本次提交的完整成员名单，把每条 FROM:TO 原文解析成
+// 确定的一对成员。解析只依赖完整名单，与 --member/--delegate 的排列先后无关。
+func resolveDelegations(raw []string, members []govflow.VoteMember) ([]govflow.Delegation, error) {
+	roster := make(map[string]bool, len(members))
+	for _, m := range members {
+		roster[m.ID] = true
+	}
+	delegations := make([]govflow.Delegation, 0, len(raw))
+	for _, arg := range raw {
+		from, to, err := resolveDelegation(arg, roster)
+		if err != nil {
+			return nil, err
+		}
+		delegations = append(delegations, govflow.Delegation{From: from, To: to})
+	}
+	return delegations, nil
+}
+
+// resolveDelegation 沿参数原文的每个冒号尝试切分，两端都逐字（区分大小写）
+// 等于名单中完整编号的切分才成立。恰好一种切分成立时按该对成员创建委托；
+// 多种切分都成立时该委托有歧义，返回参数错误，绝不默认选择任意一对；
+// 任何切分都无法同时命中名单双方时返回域错误并指出无法匹配的参数。
+// 无冒号或首末为冒号（FROM/TO 为空）仍按原有格式错误处理。
+func resolveDelegation(arg string, roster map[string]bool) (string, string, error) {
+	if !strings.Contains(arg, ":") || strings.HasPrefix(arg, ":") || strings.HasSuffix(arg, ":") {
+		return "", "", &delegationUsageError{fmt.Sprintf("malformed delegation %q, expected FROM:TO", arg)}
+	}
+	type split struct{ from, to string }
+	var matches []split
+	for i := 0; i < len(arg); i++ {
+		if arg[i] != ':' {
+			continue
+		}
+		from, to := arg[:i], arg[i+1:]
+		if roster[from] && roster[to] {
+			matches = append(matches, split{from, to})
+		}
+	}
+	switch len(matches) {
+	case 1:
+		return matches[0].from, matches[0].to, nil
+	case 0:
+		return "", "", fmt.Errorf("%w: delegation %q does not match any pair of roster members",
+			govflow.ErrInvalidProposal, arg)
+	default:
+		pairs := make([]string, len(matches))
+		for i, m := range matches {
+			pairs[i] = fmt.Sprintf("%s -> %s", m.from, m.to)
+		}
+		return "", "", &delegationUsageError{fmt.Sprintf("delegation %q is ambiguous: matches more than one pair of roster members (%s)",
+			arg, strings.Join(pairs, "; "))}
+	}
 }
 
 func runCreateVote(args []string) {
@@ -258,8 +316,8 @@ func runCreateVote(args []string) {
 	id := cf.fs.String("id", "", "proposal id (non-empty)")
 	var members memberList
 	cf.fs.Var(&members, "member", "member ID:WEIGHT with positive int64 weight (repeatable, order irrelevant to equality)")
-	var delegations delegationList
-	cf.fs.Var(&delegations, "delegate", "delegation FROM:TO (repeatable, order irrelevant to equality)")
+	var delegations rawDelegationList
+	cf.fs.Var(&delegations, "delegate", "delegation FROM:TO (repeatable, order irrelevant to equality; FROM/TO may contain colons and are resolved against the full member roster)")
 	quorumRaw := cf.fs.String("quorum", "", "required turnout weight between 1 and total member weight")
 	startRaw := cf.fs.String("start", "", "voting start timestamp (int64, >= 0)")
 	deadlineRaw := cf.fs.String("deadline", "", "voting deadline timestamp (int64, > start)")
@@ -279,6 +337,17 @@ func runCreateVote(args []string) {
 		fmt.Fprintf(os.Stderr, "usage error: at least one --member ID:WEIGHT is required\n")
 		os.Exit(2)
 	}
+	// 委托必须结合完整成员名单解析，且失败时不触碰状态文件：
+	// 格式错误或有歧义是参数错误（退出码 2），找不到名单内双方是域错误（退出码 1）。
+	resolved, err := resolveDelegations(delegations, members)
+	if err != nil {
+		var usageErr *delegationUsageError
+		if errors.As(err, &usageErr) {
+			fmt.Fprintf(os.Stderr, "usage error: %v\n", err)
+			os.Exit(2)
+		}
+		fail(err)
+	}
 
 	store, err := govflow.Open(cf.state)
 	if err != nil {
@@ -288,7 +357,7 @@ func runCreateVote(args []string) {
 	in := &govflow.CreateVoteInput{
 		ID:          *id,
 		Members:     []govflow.VoteMember(members),
-		Delegations: []govflow.Delegation(delegations),
+		Delegations: resolved,
 		Quorum:      quorum,
 		StartAt:     start,
 		Deadline:    deadline,
