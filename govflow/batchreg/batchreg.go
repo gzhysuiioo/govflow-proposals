@@ -853,10 +853,57 @@ type ImportResult struct {
 	Created bool
 }
 
+// validateManifestInput applies the same effective-value rules to one
+// directly submitted record that Register enforces for single entries and
+// parseManifestRecord enforces for file records: the three text fields must
+// be valid UTF-8 and must not be empty strings, and quantity must lie in
+// 1..MaxQuantity. Text is checked verbatim — direct submissions get no
+// whitespace trimming or case folding (the command-line entry normalizes
+// before constructing the Input), so whitespace-only text is accepted as
+// ordinary non-empty text. pos is the record's 1-based position in this
+// submission. The returned *ManifestRecordError names the offending field
+// in its reason and cites the batch id only when that id is itself
+// non-empty, valid UTF-8 text; it is never invented or substituted when the
+// batch field is empty or malformed.
+func validateManifestInput(in Input, pos int) error {
+	batchID := ""
+	if in.Batch != "" && utf8.ValidString(in.Batch) {
+		batchID = in.Batch
+	}
+	textFields := []struct {
+		field, value string
+	}{
+		{"batch", in.Batch}, {"product", in.Product}, {"unit", in.Unit},
+	}
+	for _, tv := range textFields {
+		if !utf8.ValidString(tv.value) {
+			// batchID is already "" when the batch field itself is the
+			// malformed one, so it is safe to attach it unconditionally.
+			return &ManifestRecordError{Position: pos, Batch: batchID, Reason: (&EncodingError{Field: tv.field}).Error()}
+		}
+	}
+	for _, tv := range textFields {
+		if tv.value == "" {
+			return &ManifestRecordError{Position: pos, Batch: batchID, Reason: fmt.Sprintf("field %q must not be empty", tv.field)}
+		}
+	}
+	if in.Quantity <= 0 {
+		return &ManifestRecordError{Position: pos, Batch: batchID, Reason: `field "quantity" must be greater than zero`}
+	}
+	if in.Quantity > MaxQuantity {
+		return &ManifestRecordError{Position: pos, Batch: batchID,
+			Reason: fmt.Sprintf("field %q must be an integer no greater than %d", "quantity", MaxQuantity)}
+	}
+	return nil
+}
+
 // Import validates every record of inputs before appending anything: the
-// whole manifest fails if any record conflicts with a stored record or with
-// an earlier manifest record, and reg is left untouched on error. New batch
-// ids are appended in first-occurrence order; an id already stored or
+// whole manifest fails if any record carries invalid UTF-8, an empty text
+// field or a quantity outside 1..MaxQuantity — whether its batch id is new,
+// already stored or seen earlier in this submission — or if any record
+// conflicts with a stored record or with an earlier manifest record, and reg
+// is left untouched on error. Directly submitted text is kept verbatim. New
+// batch ids are appended in first-occurrence order; an id already stored or
 // introduced earlier in the same manifest is confirmed as a duplicate only
 // when product, quantity and unit all match. Results come back in manifest
 // order; Created is false for duplicates.
@@ -867,20 +914,16 @@ func Import(reg *Registry, inputs []Input) (results []ImportResult, err error) {
 	if len(inputs) == 0 {
 		return nil, errors.New("manifest must contain at least one record")
 	}
-	// Reject malformed text before touching anything; every input must be
-	// valid UTF-8 so stored ids can never silently collapse onto U+FFFD.
+	// Reject malformed text and non-effective values before touching
+	// anything; this covers records handed in directly by Go callers the
+	// same way ParseManifest covers file records, so a blank text field or a
+	// non-positive quantity can never reach the new/duplicate/conflict logic
+	// below and end up in a file the reader would refuse. Text is checked
+	// verbatim: direct submissions get no trimming or case folding (only the
+	// command-line entry normalizes, before building the Input).
 	for i, in := range inputs {
-		batchValid := utf8.ValidString(in.Batch)
-		for _, tv := range []struct{ field, value string }{
-			{"batch", in.Batch}, {"product", in.Product}, {"unit", in.Unit},
-		} {
-			if !utf8.ValidString(tv.value) {
-				err := &ManifestRecordError{Position: i + 1, Reason: (&EncodingError{Field: tv.field}).Error()}
-				if tv.field != "batch" && batchValid && in.Batch != "" {
-					err.Batch = in.Batch
-				}
-				return nil, err
-			}
+		if err := validateManifestInput(in, i+1); err != nil {
+			return nil, err
 		}
 	}
 
