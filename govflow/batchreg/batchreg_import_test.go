@@ -113,6 +113,78 @@ func TestImportRejectsInvalidDirectRecords(t *testing.T) {
 	}
 }
 
+// Validity is settled for every record before any conflict is weighed: an
+// invalid record is the reported failure even when an earlier record already
+// clashes with a stored record or with a record earlier in the same
+// submission. Swapping the invalid record and the conflicting one only moves
+// the reported position — the precedence never changes.
+func TestImportInvalidRecordOutranksConflict(t *testing.T) {
+	stored := Batch{Batch: "B1", Product: "P1", Quantity: 10, Unit: "kg"}
+	cases := []struct {
+		name    string
+		inputs  []Input
+		wantPos int
+	}{
+		{
+			name: "registry conflict before invalid record",
+			inputs: []Input{
+				{Batch: "B1", Product: "P1", Quantity: 11, Unit: "kg"}, // conflicts with the stored record
+				{Batch: "B2", Product: "P2", Quantity: 1, Unit: ""},    // invalid
+			},
+			wantPos: 2,
+		},
+		{
+			name: "invalid record before registry conflict",
+			inputs: []Input{
+				{Batch: "B2", Product: "P2", Quantity: 1, Unit: ""},    // invalid
+				{Batch: "B1", Product: "P1", Quantity: 11, Unit: "kg"}, // would conflict with the stored record
+			},
+			wantPos: 1,
+		},
+		{
+			name: "same-submission conflict before invalid record",
+			inputs: []Input{
+				{Batch: "BX", Product: "P1", Quantity: 10, Unit: "kg"}, // would create
+				{Batch: "BX", Product: "P1", Quantity: 99, Unit: "kg"}, // conflicts with record 1
+				{Batch: "B2", Product: "P2", Quantity: 0, Unit: "kg"},  // invalid
+			},
+			wantPos: 3,
+		},
+		{
+			name: "first of several invalid records wins over earlier conflict",
+			inputs: []Input{
+				{Batch: "B1", Product: "P1", Quantity: 11, Unit: "kg"}, // conflicts with the stored record
+				{Batch: "B2", Product: "", Quantity: 1, Unit: "kg"},    // invalid
+				{Batch: "B3", Product: "P3", Quantity: -1, Unit: "kg"}, // invalid
+			},
+			wantPos: 2,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			reg := &Registry{Version: FormatVersion, Batches: []Batch{stored}}
+			results, err := Import(reg, tc.inputs)
+			var re *ManifestRecordError
+			if !errors.As(err, &re) {
+				t.Fatalf("got %v, want ManifestRecordError", err)
+			}
+			var ce *ManifestConflictError
+			if errors.As(err, &ce) {
+				t.Fatalf("an invalid record must never be reported as a conflict: %v", err)
+			}
+			if re.Position != tc.wantPos {
+				t.Errorf("position=%d, want %d", re.Position, tc.wantPos)
+			}
+			if results != nil {
+				t.Errorf("failed import must report no results, got %+v", results)
+			}
+			if len(reg.Batches) != 1 || reg.Batches[0] != stored {
+				t.Errorf("rejected import mutated the registry: %+v", reg.Batches)
+			}
+		})
+	}
+}
+
 // A late invalid record fails the whole submission even when the earlier
 // records have already resolved as creates, same-submission duplicates and
 // stored duplicates: nothing new may remain and the caller gets no partial
