@@ -48,7 +48,10 @@ import (
 // process contract (exit code, stdout, stderr) rather than an in-process
 // error return, while staying fully offline: the child is this same binary.
 
-var wrapBatchImport = flag.Bool("wrap.batch-import", false, "internal: run one batch-import invocation and exit")
+var (
+	wrapBatchImport   = flag.Bool("wrap.batch-import", false, "internal: run one batch-import invocation and exit")
+	wrapBatchRegister = flag.Bool("wrap.batch-register", false, "internal: run one batch-register invocation and exit")
+)
 
 // TestMain runs the wrapped single-command mode when requested by the parent
 // test, and the normal test suite otherwise.
@@ -56,6 +59,9 @@ func TestMain(m *testing.M) {
 	flag.Parse()
 	if *wrapBatchImport {
 		os.Exit(runWrappedBatchImport())
+	}
+	if *wrapBatchRegister {
+		os.Exit(runWrappedBatchRegister())
 	}
 	os.Exit(m.Run())
 }
