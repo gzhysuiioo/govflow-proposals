@@ -2225,3 +2225,190 @@ func TestRegisterRetryVersusExecuteRace(t *testing.T) {
 		t.Fatalf("receipts = %d, want 1", len(receipts))
 	}
 }
+
+// TestReceiptMustContainActions：成功执行必须包含实际动作。状态文件把无动作
+// 提案写成 executed、再配一份动作同样为空的执行凭据时，即使提案与凭据的动作
+// 数量相等（同为 0）、余额又能核对一致，读取也必须判整份状态损坏——空动作
+// 列表不能构成成功执行记录。凭据的 actions 缺失、为 null 或解出后为空同样
+// 拒绝；登记来源与投票通过来源的提案适用同一要求。
+func TestReceiptMustContainActions(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "treasury.json")
+	store, err := InitTreasury(path, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 无动作提案保持 passed；正常提案先执行成功，使其凭据排在空凭据之前。
+	mustRegister(t, store, "gip-empty", 0)
+	mustRegister(t, store, "gip-ok", 0, "transfer:a:60")
+	if _, err := store.Execute("gip-ok", 0); err != nil {
+		t.Fatal(err)
+	}
+	// 投票来源的无动作提案：投票明细与通过结论完全合法。
+	voteIn := baseVoteInput("gip-vote-empty")
+	voteIn.Actions = nil
+	mustCreateVote(t, store, voteIn)
+	if _, err := store.CastVote("gip-vote-empty", "alice", true, 150); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.CastVote("gip-vote-empty", "dave", true, 150); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.TallyVote("gip-vote-empty", 200); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	good, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// forge 在合法状态上把指定提案伪造成 executed 并追加一份凭据（编号、
+	// 执行时间与成功序号都合法），凭据的动作列表由调用方决定：
+	// 空列表、null 或整个字段缺失。正常凭据（order 0）排在空凭据之前。
+	forge := func(t *testing.T, id string, dropActions bool, nullActions bool) []byte {
+		t.Helper()
+		var state storedState
+		if err := json.Unmarshal(good, &state); err != nil {
+			t.Fatal(err)
+		}
+		if p, ok := state.Proposals[id]; ok {
+			p.State = "executed"
+		} else if vp, ok := state.VoteProposals[id]; ok {
+			vp.State = "executed"
+		} else {
+			t.Fatalf("proposal %s not found", id)
+		}
+		rcpt := &Receipt{
+			ProposalID: id,
+			ExecutedAt: 300,
+			Order:      int64(len(state.Receipts)),
+			Actions:    []ActionReceipt{},
+		}
+		if nullActions {
+			rcpt.Actions = nil
+		}
+		state.Receipts = append(state.Receipts, rcpt)
+		raw, err := json.MarshalIndent(&state, "", "  ")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if dropActions {
+			var doc map[string]any
+			if err := json.Unmarshal(raw, &doc); err != nil {
+				t.Fatal(err)
+			}
+			receipts := doc["receipts"].([]any)
+			last := receipts[len(receipts)-1].(map[string]any)
+			delete(last, "actions")
+			raw, err = json.MarshalIndent(doc, "", "  ")
+			if err != nil {
+				t.Fatal(err)
+			}
+		}
+		return raw
+	}
+
+	corruptions := []struct {
+		name string
+		id   string
+		drop bool
+		null bool
+	}{
+		{"empty actions list", "gip-empty", false, false},
+		{"actions null", "gip-empty", false, true},
+		{"actions missing", "gip-empty", true, false},
+		{"vote proposal empty actions", "gip-vote-empty", false, false},
+	}
+	for _, tc := range corruptions {
+		t.Run(tc.name, func(t *testing.T) {
+			raw := forge(t, tc.id, tc.drop, tc.null)
+			bad := filepath.Join(dir, "corrupt-"+strings.ReplaceAll(tc.name, " ", "-")+".json")
+			if err := os.WriteFile(bad, raw, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			// 文件中其余提案、凭据与投票明细均正常，也不能掩盖一份空凭据。
+			s, err := Open(bad)
+			if !errors.Is(err, ErrStateCorrupt) {
+				if s != nil {
+					s.Close()
+				}
+				t.Fatalf("Open err=%v, want ErrStateCorrupt", err)
+			}
+			if !strings.Contains(err.Error(), `"`+tc.id+`"`) ||
+				!strings.Contains(err.Error(), "no actions") {
+				t.Fatalf("error %q does not name proposal %s and the empty receipt", err.Error(), tc.id)
+			}
+			// 原状态文件保持原样：不删除空凭据、不补造转账、不改回 passed。
+			got, rerr := os.ReadFile(bad)
+			if rerr != nil || string(got) != string(raw) {
+				t.Fatalf("corrupt file was modified")
+			}
+		})
+	}
+
+	// 拒绝作用于整份状态文件：已打开的资金库读到这类内容后，余额、提案与
+	// 凭据查询（包括查询另一项正常提案）都不给出部分成功结果；执行空凭据
+	// 对应的提案也不能当作已完成重试返回成功。
+	t.Run("detected after open", func(t *testing.T) {
+		p := filepath.Join(dir, "swap.json")
+		if err := os.WriteFile(p, good, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		s, err := Open(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer s.Close()
+		corrupt := forge(t, "gip-empty", false, false)
+		if err := os.WriteFile(p, corrupt, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.TreasuryBalance(); !errors.Is(err, ErrStateCorrupt) {
+			t.Fatalf("TreasuryBalance err=%v, want ErrStateCorrupt", err)
+		}
+		if _, _, err := s.Proposal("gip-ok"); !errors.Is(err, ErrStateCorrupt) {
+			t.Fatalf("Proposal(gip-ok) err=%v, want ErrStateCorrupt", err)
+		}
+		if _, _, err := s.Receipt("gip-ok"); !errors.Is(err, ErrStateCorrupt) {
+			t.Fatalf("Receipt(gip-ok) err=%v, want ErrStateCorrupt", err)
+		}
+		if _, err := s.Execute("gip-empty", 300); !errors.Is(err, ErrStateCorrupt) {
+			t.Fatalf("Execute(gip-empty) err=%v, want ErrStateCorrupt", err)
+		}
+		got, _ := os.ReadFile(p)
+		if string(got) != string(corrupt) {
+			t.Fatalf("state file was modified by rejected operations")
+		}
+	})
+
+	// 无动作提案尚未执行时的现有用法保持不变：可登记、可查询，执行仍以
+	// 没有动作为由拒绝，状态、余额与凭据记录保持原样。
+	t.Run("unexecuted empty-action proposal unchanged", func(t *testing.T) {
+		s, err := Open(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer s.Close()
+		p, ok, err := s.Proposal("gip-empty")
+		if err != nil || !ok || p.State != "passed" {
+			t.Fatalf("Proposal(gip-empty) = %+v ok=%v err=%v, want passed", p, ok, err)
+		}
+		if _, err := s.Execute("gip-empty", 300); err == nil ||
+			!strings.Contains(err.Error(), "no actions") {
+			t.Fatalf("Execute(gip-empty) err=%v, want no-actions rejection", err)
+		}
+		p, _, _ = s.Proposal("gip-empty")
+		if p.State != "passed" {
+			t.Fatalf("state after rejected execute = %s, want passed", p.State)
+		}
+		if bal, _ := s.TreasuryBalance(); bal != 40 {
+			t.Fatalf("treasury = %d, want 40", bal)
+		}
+		if _, ok, _ := s.Receipt("gip-empty"); ok {
+			t.Fatalf("rejected execute left a receipt")
+		}
+	})
+}

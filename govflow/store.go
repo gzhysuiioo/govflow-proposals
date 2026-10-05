@@ -1013,6 +1013,15 @@ func validateState(state *storedState) error {
 		if ownerState != "executed" {
 			return fmt.Errorf("proposal %q has receipt but state is %q", rcpt.ProposalID, ownerState)
 		}
+		// 成功执行必须包含实际动作：执行路径以“没有动作”拒绝空动作提案，
+		// 保存的凭据同样不得凭空动作列表构成成功执行记录。actions 字段缺失、
+		// 为 null 或解出后为空都判整份状态损坏——不能因提案与凭据的动作数量
+		// 相等（同为 0）、余额又能核对一致就认可这份成功记录。登记提案与投票
+		// 提案共用这一判断，投票明细与通过结论合法也不能使空凭据有效。
+		if len(rcpt.Actions) == 0 {
+			return fmt.Errorf("receipt %d for proposal %q has no actions: an empty action list cannot record a successful execution",
+				order, rcpt.ProposalID)
+		}
 		// 保存的凭据与首次执行受同一条执行资格规则约束：executed_at 必须明确
 		// 写出且不得早于提案时间锁。登记提案与投票提案共用这一判断。
 		if err := validateReceiptExecutedAt(order, rcpt, ownerTimelock); err != nil {
