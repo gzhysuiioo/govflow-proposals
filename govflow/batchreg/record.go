@@ -33,12 +33,14 @@ const (
 
 // unambiguousBatchID returns the record's batch id only when it can be
 // determined uniquely and reliably: exactly one "batch" member (counted after
-// JSON key decoding, so an escaped respelling is the same member) holding one
-// JSON string whose decoded text is valid UTF-8 and, under textTrimmed,
-// non-blank after trimming. A missing, duplicated, mistyped, malformed or
-// blank member yields "" — never a U+FFFD substitution and never one of two
-// repeated values picked arbitrarily. The trimmed policy returns the
-// normalized id; the verbatim policy returns the decoded text untouched.
+// JSON key decoding, so an escaped respelling is the same member; a member
+// whose name itself cannot be decoded is never counted) holding one JSON
+// string whose decoded text is valid UTF-8 and, under textTrimmed,
+// non-blank after trimming. A missing, duplicated, mistyped, malformed,
+// undecodable-name or blank member yields "" — never a U+FFFD substitution
+// and never one of two repeated values picked arbitrarily. The trimmed
+// policy returns the normalized id; the verbatim policy returns the decoded
+// text untouched.
 func unambiguousBatchID(fields []objectField, policy textPolicy) string {
 	if countField(fields, "batch") != 1 {
 		return ""
@@ -88,6 +90,12 @@ func checkRecordMembers(fields []objectField, duplicatesFirst bool) memberFault 
 	seen := make(map[string]struct{}, len(fields))
 	var firstDuplicate, firstUnknown memberFault
 	for _, f := range fields {
+		if f.keyInvalid {
+			// A member whose name could not be decoded is reported as a key
+			// encoding fault by the caller, never as an unknown field under
+			// its U+FFFD-substituted placeholder name.
+			continue
+		}
 		_, known := batchRecordFields[f.key]
 		_, repeated := seen[f.key]
 		seen[f.key] = struct{}{}

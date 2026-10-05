@@ -95,11 +95,14 @@ func (e *DuplicateIDError) Error() string {
 }
 
 // FormatError reports a structural violation of the public registry file
-// format: a missing, duplicated, misspelled, null or mistyped field, either
-// in the root object (Position == 0) or in one batch record (Position is its
-// 1-based index in "batches"). Batch carries the record's batch id only when
-// it is uniquely determined; it stays empty when the "batch" member itself
-// is missing, duplicated or not a string.
+// format: a missing, duplicated, misspelled, null or mistyped field, or a
+// member name that cannot be decoded to valid Unicode, either in the root
+// object (Position == 0) or in one batch record (Position is its 1-based
+// index in "batches"). Batch carries the record's batch id only when it is
+// uniquely determined; it stays empty when the "batch" member itself is
+// missing, duplicated, not a string or not decodable. For an undecodable
+// member name Field is empty — the bad name is never quoted back — and
+// Reason states that the field name encoding is invalid.
 type FormatError struct {
 	Position int
 	Batch    string
@@ -134,6 +137,21 @@ type EncodingError struct {
 
 func (e *EncodingError) Error() string {
 	return fmt.Sprintf("field %q contains bytes that are not valid UTF-8; the value is rejected instead of being replaced with U+FFFD", e.Field)
+}
+
+// keyEncodingError reports that a JSON object member name (a field name,
+// not a field value) cannot be decoded to valid Unicode: malformed source
+// bytes or a lone surrogate escape. It is distinct from EncodingError,
+// which targets a field *value*, so the two causes never share a message.
+// The offending name is never quoted back: decoding would substitute
+// U+FFFD and could collide with a genuinely named field. ParseManifest
+// wraps this in a ManifestRecordError carrying the 1-based record position
+// and the unambiguous batch id; decode surfaces the equivalent fault as a
+// *FormatError.
+type keyEncodingError struct{}
+
+func (e *keyEncodingError) Error() string {
+	return badKeyNameReason
 }
 
 // NormalizeField trims leading and trailing whitespace; the result must stay
@@ -351,7 +369,10 @@ func Load(path string) (reg *Registry, existed bool, err error) {
 // field appearing twice in one object is rejected even when both values are
 // identical; missing fields, nulls, wrong types and unknown fields are
 // rejected just the same. Nothing is patched up by taking the later value,
-// merging or defaulting.
+// merging or defaulting. A member name that cannot be decoded to valid
+// Unicode is its own fault (not a non-object, not an unknown field): a bad
+// root member reports no position, and a bad member name in a batch record
+// reports the record's 1-based position plus its unambiguous batch id.
 func decode(data []byte) (*Registry, error) {
 	dec := json.NewDecoder(bytes.NewReader(data))
 	var root json.RawMessage
@@ -366,8 +387,14 @@ func decode(data []byte) (*Registry, error) {
 		return nil, err
 	}
 
-	fields, err := parseObjectFields(root)
-	if err != nil {
+	fields, perr := parseObjectFields(root)
+	if perr != nil {
+		if perr.kind == objectBadKeyEncoding {
+			// The value is an object; one of its member names cannot be
+			// decoded. This is a root-object problem, so it carries no record
+			// position and never a batch id.
+			return nil, &FormatError{Reason: badKeyNameReason}
+		}
 		return nil, &FormatError{Reason: "root must be a JSON object holding exactly \"version\" and \"batches\""}
 	}
 	if dup, ok := duplicateField(fields); ok {
@@ -429,21 +456,30 @@ func parseRegistryVersion(raw json.RawMessage) (int, error) {
 //
 // The structural rules (member names, strict string decoding, quantity
 // range) are shared with parseManifestRecord; only this source's reporting
-// differs: problems are surfaced as *FormatError with registry wording, a
-// duplicated member anywhere in the object outranks an unknown one, and
-// text values are read verbatim — validate handles the empty-string case.
+// differs: problems are surfaced as *FormatError with registry wording, an
+// undecodable member name outranks everything, then a duplicated member
+// anywhere in the object outranks an unknown one, and text values are read
+// verbatim — validate handles the empty-string case.
 func parseRegistryRecord(raw json.RawMessage, pos int) (Batch, error) {
 	var b Batch
-	fields, err := parseObjectFields(raw)
-	if err != nil {
+	fields, perr := parseObjectFields(raw)
+	if perr != nil && perr.kind != objectBadKeyEncoding {
 		return b, &FormatError{Position: pos, Reason: "record must be a JSON object holding exactly \"batch\", \"product\", \"quantity\" and \"unit\""}
 	}
 	// The batch id is attached to errors only when it is unambiguous:
 	// exactly one "batch" member carrying a JSON string whose decoded text
 	// is valid UTF-8. When the "batch" member itself is duplicated, or its
 	// bytes are not valid UTF-8, no id (and never a U+FFFD replacement) is
-	// picked arbitrarily.
+	// picked arbitrarily. A member with an undecodable name is never
+	// counted as "batch", even when the decoder's substitution happens to
+	// look like a name.
 	batchID := unambiguousBatchID(fields, textVerbatim)
+	if perr != nil {
+		// A member name that cannot be decoded is its own fault, not a
+		// non-object and not an ordinary unknown field; it outranks any other
+		// anomaly the record may also carry. The invalid name is never quoted.
+		return Batch{}, &FormatError{Position: pos, Batch: batchID, Reason: badKeyNameReason}
+	}
 	fail := func(field, reason string) (Batch, error) {
 		return Batch{}, &FormatError{Position: pos, Batch: batchID, Field: field, Reason: reason}
 	}
@@ -469,6 +505,7 @@ func parseRegistryRecord(raw json.RawMessage, pos int) (Batch, error) {
 		}
 		return value, nil
 	}
+	var err error
 	if b.Batch, err = text("batch"); err != nil {
 		return Batch{}, err
 	}
@@ -511,51 +548,115 @@ func isJSONInteger(token string) bool {
 }
 
 // objectField is one member of a JSON object in source order; the key is
-// the decoded JSON string, so escaped spellings compare by meaning.
+// the decoded JSON string, so escaped spellings compare by meaning. When
+// keyInvalid is set the member name itself could not be decoded to valid
+// Unicode (malformed bytes or a lone surrogate escape); key then holds
+// encoding/json's U+FFFD substitution only as an opaque placeholder and is
+// never compared as a name or quoted in an error.
 type objectField struct {
-	key   string
-	value json.RawMessage
+	key        string
+	value      json.RawMessage
+	keyInvalid bool
 }
 
+// objectParseFaultKind tells a caller of parseObjectFields why an object
+// could not be scanned, so structurally different failures stay distinct:
+// notObject means the JSON value is not an object at all; badKeyEncoding
+// means the value is an object but at least one member name cannot be
+// decoded to valid Unicode (malformed UTF-8 bytes or a lone surrogate
+// escape); syntaxFault covers every other malformed token.
+type objectParseFaultKind int
+
+const (
+	objectSyntax objectParseFaultKind = iota
+	objectNotAnObject
+	objectBadKeyEncoding
+)
+
+type objectParseError struct {
+	kind objectParseFaultKind
+}
+
+func (e *objectParseError) Error() string {
+	switch e.kind {
+	case objectNotAnObject:
+		return "value is not a JSON object"
+	case objectBadKeyEncoding:
+		return "object key contains bytes that are not valid UTF-8"
+	default:
+		return "value is not valid JSON"
+	}
+}
+
+// badKeyNameReason is the shared reason for a member name whose bytes cannot
+// be decoded to valid Unicode, in both on-disk sources. It names the field
+// name (not a field value) explicitly and promises no U+FFFD-substituted
+// spelling is treated as the real name or as an ordinary unknown field.
+const badKeyNameReason = "field name is not valid UTF-8: malformed bytes or a lone surrogate escape in a member name are rejected instead of being replaced with U+FFFD"
+
 // parseObjectFields decodes a single JSON object value into its members in
-// source order, keeping duplicates visible for the caller to reject. Keys
-// are re-scanned strictly: encoding/json would otherwise hand back U+FFFD
-// substitutions for malformed key bytes.
-func parseObjectFields(raw []byte) ([]objectField, error) {
+// source order. Keys are re-scanned strictly: encoding/json would otherwise
+// hand back U+FFFD substitutions for malformed key bytes. A member with an
+// undecodable name is kept in the slice flagged keyInvalid rather than
+// dropped, and scanning continues, so the members around it (a "batch"
+// before or after it, including a second "batch" that would make the id
+// ambiguous) are all still visible to the caller. The returned fault is an
+// *objectParseError whose kind separates "not an object" from a bad member
+// name; a bad name seen before a later syntax fault still reports
+// objectBadKeyEncoding.
+func parseObjectFields(raw []byte) ([]objectField, *objectParseError) {
 	trimmed := bytes.TrimSpace(raw)
 	if len(trimmed) == 0 || trimmed[0] != '{' {
-		return nil, errors.New("value is not a JSON object")
+		return nil, &objectParseError{kind: objectNotAnObject}
 	}
 	dec := json.NewDecoder(bytes.NewReader(trimmed))
 	if _, err := dec.Token(); err != nil { // opening brace
-		return nil, err
+		return nil, &objectParseError{kind: objectSyntax}
 	}
 	var fields []objectField
+	sawBadKey := false
 	for dec.More() {
 		keyStart := dec.InputOffset()
 		tok, err := dec.Token()
 		keyEnd := dec.InputOffset()
 		if err != nil {
-			return nil, err
+			if sawBadKey {
+				return fields, &objectParseError{kind: objectBadKeyEncoding}
+			}
+			return nil, &objectParseError{kind: objectSyntax}
 		}
 		key, ok := tok.(string)
 		if !ok {
-			return nil, errors.New("object keys must be JSON strings")
+			return nil, &objectParseError{kind: objectSyntax}
 		}
+		member := objectField{key: key}
 		if _, err := unmarshalStringStrict(keyTokenBytes(trimmed, int(keyStart), int(keyEnd))); err != nil {
 			if errors.Is(err, errStringEncoding) {
-				return nil, errors.New("object key contains bytes that are not valid UTF-8")
+				member.keyInvalid = true
+				sawBadKey = true
+			} else {
+				return nil, &objectParseError{kind: objectSyntax}
 			}
-			return nil, err
 		}
 		var value json.RawMessage
 		if err := dec.Decode(&value); err != nil {
-			return nil, err
+			if sawBadKey {
+				fields = append(fields, member)
+				return fields, &objectParseError{kind: objectBadKeyEncoding}
+			}
+			return nil, &objectParseError{kind: objectSyntax}
 		}
-		fields = append(fields, objectField{key: key, value: value})
+		member.value = value
+		fields = append(fields, member)
 	}
 	if _, err := dec.Token(); err != nil { // closing brace
-		return nil, err
+		if sawBadKey {
+			return fields, &objectParseError{kind: objectBadKeyEncoding}
+		}
+		return nil, &objectParseError{kind: objectSyntax}
+	}
+	if sawBadKey {
+		return fields, &objectParseError{kind: objectBadKeyEncoding}
 	}
 	return fields, nil
 }
@@ -586,6 +687,9 @@ func keyTokenBytes(trimmed []byte, start, end int) []byte {
 func duplicateField(fields []objectField) (string, bool) {
 	seen := make(map[string]struct{}, len(fields))
 	for _, f := range fields {
+		if f.keyInvalid {
+			continue
+		}
 		if _, dup := seen[f.key]; dup {
 			return f.key, true
 		}
@@ -594,9 +698,13 @@ func duplicateField(fields []objectField) (string, bool) {
 	return "", false
 }
 
-// findField returns the raw value of the first member named name.
+// findField returns the raw value of the first member named name. Members
+// whose name could not be decoded are never matched.
 func findField(fields []objectField, name string) (json.RawMessage, bool) {
 	for _, f := range fields {
+		if f.keyInvalid {
+			continue
+		}
 		if f.key == name {
 			return f.value, true
 		}
@@ -604,10 +712,14 @@ func findField(fields []objectField, name string) (json.RawMessage, bool) {
 	return nil, false
 }
 
-// countField counts the members named name.
+// countField counts the members named name, ignoring members whose name
+// could not be decoded.
 func countField(fields []objectField, name string) int {
 	n := 0
 	for _, f := range fields {
+		if f.keyInvalid {
+			continue
+		}
 		if f.key == name {
 			n++
 		}
@@ -732,26 +844,35 @@ var batchRecordFields = map[string]struct{}{
 // batch in the error; otherwise it stays empty.
 //
 // The structural rules are shared with parseRegistryRecord; this source's
-// own choices are: member-name anomalies are reported in source order
-// (unknown and duplicate carry equal weight), text is trimmed and must stay
-// non-empty, and reasons use manifest wording (including *EncodingError for
-// malformed text).
+// own choices are: a member name whose encoding is invalid outranks every
+// other anomaly in the record and is reported as *keyEncodingError (wrapped
+// by the caller with the record position); other member-name anomalies are
+// reported in source order (unknown and duplicate carry equal weight), text
+// is trimmed and must stay non-empty, and reasons use manifest wording
+// (including *EncodingError for malformed field values).
 func parseManifestRecord(raw json.RawMessage) (Input, error) {
 	var in Input
-	members, err := parseObjectFields(raw)
-	if err != nil {
+	members, perr := parseObjectFields(raw)
+	if perr != nil && perr.kind != objectBadKeyEncoding {
 		return in, errors.New("record must be a JSON object with batch, product, quantity and unit")
 	}
 	// Attach the batch id to whatever error this record raises, but only when
 	// it is unambiguous: exactly one "batch" member (compared after JSON key
 	// decoding, so an escaped respelling counts as the same field) carrying a
 	// JSON string whose decoded text is valid UTF-8 and non-blank once
-	// trimmed. A missing, duplicated, mistyped, blank or malformed "batch"
-	// member leaves the id out — never a U+FFFD substitution, and never one
-	// of two duplicate values picked arbitrarily, even when both are equal.
-	// Where the "batch" member sits relative to the offending field does not
-	// matter.
+	// trimmed. A missing, duplicated, mistyped, blank, malformed or
+	// undecodable-name "batch" member leaves the id out — never a U+FFFD
+	// substitution, and never one of two duplicate values picked arbitrarily,
+	// even when both are equal. Where the "batch" member sits relative to the
+	// offending field does not matter.
 	in.Batch = unambiguousBatchID(members, textTrimmed)
+	if perr != nil {
+		// A member name that cannot be decoded is its own fault — distinct
+		// from a non-object record and from a field *value* with bad encoding
+		// — and outranks any other anomaly in the record. The invalid name is
+		// never quoted back.
+		return in, &keyEncodingError{}
+	}
 
 	// Manifest member-name problems are reported in source order: the first
 	// unknown name or first repeat fails the record.
@@ -778,6 +899,7 @@ func parseManifestRecord(raw json.RawMessage) (Input, error) {
 		return value, nil
 	}
 
+	var err error
 	in.Batch, err = textField("batch")
 	if err != nil {
 		return in, err

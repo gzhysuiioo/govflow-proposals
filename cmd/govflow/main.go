@@ -125,6 +125,18 @@ valid and unambiguous). A genuinely entered U+FFFD character is ordinary
 text, non-ASCII ids (Chinese text, emoji, ...) are welcome, and a JSON
 escape means the same text as the character written directly.
 
+Field names are held to the same encoding rule as field values, but the two
+failures are reported separately: a member name containing malformed UTF-8
+bytes or a lone surrogate escape is rejected as an invalid field name —
+never as "not an object", never as an ordinary unknown field, and never
+under the U+FFFD-substituted spelling the decoder would otherwise invent.
+The error names the file and says the field name encoding is invalid,
+without echoing the bad bytes: the root object for a registry root member,
+or the 1-based record position (plus the batch id when exactly one "batch"
+member is itself valid) for a registry or manifest record. A field name
+that genuinely is U+FFFD, Chinese text or a correctly paired surrogate
+escape is valid Unicode and is still judged by the normal name rules.
+
 On success stdout contains a single JSON object, e.g.
   {"batch":"B-001","product":"P-7","quantity":120,"unit":"kg","status":"created"}
 status is "created" for a new record and "duplicate" when the same batch was
