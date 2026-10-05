@@ -1375,6 +1375,12 @@ func init() {
 	// 登记提案的 timelock_end 同理：缺失/空值/类型不符的判定需要带上提案
 	// 编号，统一由 validateProposalTimelock 报错，结构扫描在此叶子位置保持宽松。
 	storedStateSchema.fields["proposals"].elem.fields["timelock_end"].kind = kindAny
+	// 投票提案的 ballots 是必填数组：缺失/null/标量/对象由
+	// validateVoteProposalBallots 统一报带提案编号的原因，因此该叶子位置对
+	// “非数组”保持宽松（kindLaxArray），但数组元素仍按票据对象严格扫描
+	// （未知字段、重复键等不放松），见 schemaKind.kindLaxArray。
+	voteProposalFields := storedStateSchema.fields["vote_proposals"].elem.fields
+	voteProposalFields["ballots"].kind = kindLaxArray
 	// 凭据的 executed_at 同理：缺失/空值/类型不符/早于时间锁的判定需要带上
 	// 提案编号与凭据位置，统一由 validateReceiptExecutedAt 报错，结构扫描在此
 	// 叶子位置保持宽松。

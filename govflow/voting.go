@@ -290,6 +290,16 @@ func validateStoredTally(id string, t *storedTally) error {
 // 记录不能按零值补出，因此解码时保留 delegations 的原始 JSON，由
 // validateVoteProposalDelegations 区分“缺失/空值/类型不符”。明确写出的
 // 空数组仍表示无人委托，成员各自代表自己、按原始权重投票。
+//
+// ballots 同理必须明确写出且为 JSON 数组：它是代表选择与首次投票时间的
+// 唯一留痕。字段缺失或为 null 绝不能折叠成空列表——尚在投票的提案会因此
+// 被展示成无人投票、已投代表还能再次投票，到期计票则按零参与权重给出
+// 拒绝结论，原有选择与首次投票时间全部丢失；写成对象、字符串等其它类型
+// 同样不合法。此要求不取决于提案状态：voting/passed/rejected/executed
+// 都适用，即使计票汇总恰好为零、资金余额仍能与执行凭据对应，也不能把缺损
+// 列表补成空数组。解码时保留 ballots 的原始 JSON，由
+// validateVoteProposalBallots 区分“缺失/空值/类型不符”。明确写出的空数组
+// 仍表示确实无人投票。
 type storedVoteProposal struct {
 	ID          string             `json:"id"`
 	State       string             `json:"state"`
@@ -309,10 +319,17 @@ type storedVoteProposal struct {
 	// 不直接返回它，以免解码器抢在 validateVoteProposalDelegations 之前给出
 	// 不含提案编号的通用错误；判定与错误文案统一由该校验函数负责。
 	delegationsShapeErr error
+
+	ballotsRaw json.RawMessage
+	// ballotsShapeErr 记录数组元素形状与 []storedBallot 不符时的解码错误
+	// （如元素写成数字、字符串）。外层 UnmarshalJSON 不直接返回它，以免
+	// 解码器抢在 validateVoteProposalBallots 之前给出不含提案编号的通用
+	// 错误；判定与错误文案统一由该校验函数负责。
+	ballotsShapeErr error
 }
 
 // storedVoteProposalJSONShape 只用于解码，按保存格式的字段名逐字接住
-// delegations 的原始 JSON；其余字段直接按目标类型解码。
+// delegations 与 ballots 的原始 JSON；其余字段直接按目标类型解码。
 type storedVoteProposalJSONShape struct {
 	ID          string          `json:"id"`
 	State       string          `json:"state"`
@@ -323,16 +340,17 @@ type storedVoteProposalJSONShape struct {
 	Deadline    int64           `json:"deadline"`
 	TimelockEnd int64           `json:"timelock_end"`
 	Actions     []string        `json:"actions"`
-	Ballots     []storedBallot  `json:"ballots"`
+	Ballots     json.RawMessage `json:"ballots"`
 	Tally       *storedTally    `json:"tally,omitempty"`
 }
 
-// UnmarshalJSON 保留 delegations 是否出现及其原始写法（缺失为 nil、null 为
-// "null"），使“字段缺失/显式 null/写错类型”与“明确写出空数组”在解码后仍可
-// 区分：encoding/json 直接解进 []storedDelegation 会把前三种情况都折叠成
-// nil 切片，恰好与无人委托无法区分，已委托成员就会被当成各自代表。判定统一
-// 交给 validateVoteProposalDelegations，此处只在字段确实是 JSON 数组时填充
-// 委托列表（元素形状由解码器核对，类型不符直接报错）。
+// UnmarshalJSON 保留 delegations/ballots 是否出现及其原始写法（缺失为 nil、
+// null 为 "null"），使“字段缺失/显式 null/写错类型”与“明确写出空数组”在
+// 解码后仍可区分：encoding/json 直接解进切片会把前三种情况都折叠成 nil
+// 切片，委托缺失会把已委托成员当成各自代表，票据缺失则把已投票提案当成
+// 无人投票。判定统一交给 validateVoteProposalDelegations 与
+// validateVoteProposalBallots，此处只在字段确实是 JSON 数组时填充列表
+// （元素形状由解码器核对，类型不符直接记录、延后报告）。
 func (p *storedVoteProposal) UnmarshalJSON(data []byte) error {
 	var shape storedVoteProposalJSONShape
 	if err := json.Unmarshal(data, &shape); err != nil {
@@ -346,14 +364,19 @@ func (p *storedVoteProposal) UnmarshalJSON(data []byte) error {
 	p.Deadline = shape.Deadline
 	p.TimelockEnd = shape.TimelockEnd
 	p.Actions = shape.Actions
-	p.Ballots = shape.Ballots
 	p.Tally = shape.Tally
 	p.delegationsRaw = shape.Delegations
+	p.ballotsRaw = shape.Ballots
 	if jsonValueType(shape.Delegations) == "array" {
 		// 元素形状非法时不在此返回：让整份文档解码通过，由
 		// validateVoteProposalDelegations 统一给出带提案编号与字段名的
 		// “类型不符”原因，而不是退化成不含提案定位的解码器通用错误。
 		p.delegationsShapeErr = json.Unmarshal(shape.Delegations, &p.Delegations)
+	}
+	if jsonValueType(shape.Ballots) == "array" {
+		// 同理：票据元素形状非法时延后由 validateVoteProposalBallots 统一
+		// 报出带提案编号与字段名的原因。
+		p.ballotsShapeErr = json.Unmarshal(shape.Ballots, &p.Ballots)
 	}
 	return nil
 }
@@ -633,9 +656,11 @@ func (s *Store) CreateVoteProposal(in *CreateVoteInput) (view *VoteProposalView,
 		stored.Delegations = append(stored.Delegations, storedDelegation{From: d.From, To: d.To})
 	}
 	// 同步填上字段原始片段，使“提交前校验”与“打开重放校验”走同一份
-	// delegations 判定时不会把本进程新建的提案误判为字段缺失。创建时不提供
-	// 委托是合法的：空数组明确写出即表示无人委托。
+	// delegations/ballots 判定时不会把本进程新建的提案误判为字段缺失。
+	// 创建时不提供委托、尚无投票都是合法的：空数组明确写出即表示无人委托、
+	// 无人投票。
 	stored.delegationsRaw, _ = json.Marshal(stored.Delegations)
+	stored.ballotsRaw, _ = json.Marshal(stored.Ballots)
 	state.VoteProposals[in.ID] = stored
 	if err := s.commitLocked(state); err != nil {
 		return nil, false, err
@@ -793,6 +818,9 @@ func (s *Store) CastVote(id, voter string, support bool, now int64) (*BallotView
 	}
 
 	p.Ballots = append(p.Ballots, mustStoreBallot(voter, spec.groupW[voter], support, now))
+	// 同步刷新 ballots 原始片段：提交前 validateState 与读取路径走同一份
+	// “必须明确写出数组”判定，追加新票后该片段仍应是实际票据列表。
+	p.ballotsRaw, _ = json.Marshal(p.Ballots)
 	if err := s.commitLocked(state); err != nil {
 		return nil, err
 	}
@@ -1005,6 +1033,27 @@ func validateVoteProposalDelegations(p *storedVoteProposal) error {
 	return nil
 }
 
+// validateVoteProposalBallots 严格判定一项已保存投票提案的 ballots：
+// 字段必须明确写出且为 JSON 数组。字段缺失、显式为 null 或写成对象/字符串/
+// 数字/布尔等其它类型都返回带提案编号与字段名的错误，由 validateState 判
+// 整份状态文件损坏——ballots 是代表选择与首次投票时间的唯一留痕，缺损列表
+// 不能被折叠成空切片后按“无人投票”处理：尚在投票的提案会展示空票据、已投
+// 代表还能再次投票，到期计票则按零参与权重给出拒绝结论，原有选择与首次
+// 投票时间就此丢失。此要求不取决于提案状态：voting/passed/rejected/
+// executed 适用同一条要求，不能因为计票汇总恰好为零或资金余额仍能与执行
+// 凭据对应就把缺损列表补成空数组。数组写出但元素形状与票据记录不符（元素
+// 不是对象等）同样拒绝。明确写出的空数组是合法的“确实无人投票”列表，
+// 不与缺失混同；空数组合法只说明列表没有缺损，不放宽状态与计票一致性。
+func validateVoteProposalBallots(p *storedVoteProposal) error {
+	if problem := requiredArrayProblem(p.ballotsRaw); problem != "" {
+		return fmt.Errorf("voting proposal %q field %q %s", p.ID, "ballots", problem)
+	}
+	if p.ballotsShapeErr != nil {
+		return fmt.Errorf("voting proposal %q field %q has wrong type: %v", p.ID, "ballots", p.ballotsShapeErr)
+	}
+	return nil
+}
+
 // validateVoteProposals 在打开状态文件时严格校验全部投票提案：
 // 编号与 register 来源不冲突；状态机与计票结论一致；票重/代表与名单及委托明细一致；
 // 首次投票时间落在窗口内；首次计票不早于截止且结论可由明细重放。
@@ -1029,6 +1078,14 @@ func validateVoteProposals(state *storedState) error {
 		// 绝不能把缺失记录折叠成空委托列表后再按“无人委托”继续查询、投票或
 		// 复核计票——未投票、已计票与已执行的提案适用同一条要求。
 		if err := validateVoteProposalDelegations(p); err != nil {
+			return err
+		}
+		// ballots 是代表选择与首次投票时间的唯一留痕，必须明确写出且为 JSON
+		// 数组。先于逐票字段核对、代表资格与票重重放执行：字段缺损时直接判
+		// 整份文件损坏，绝不能把缺失列表折叠成空票据后再按“无人投票”继续
+		// 查询、接受重复投票或复核出零参与权重的拒绝结论。voting/passed/
+		// rejected/executed 适用同一条要求。
+		if err := validateVoteProposalBallots(p); err != nil {
 			return err
 		}
 		spec, err := specOf(p)
