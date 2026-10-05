@@ -1929,3 +1929,133 @@ func TestOldStateWithoutVoteProposalsReadable(t *testing.T) {
 		t.Fatalf("pending proposal = %+v ok=%v", p, ok)
 	}
 }
+
+// TestRegisterProposalReportsActualState：登记响应必须反映这次登记实际认可的
+// 记录——首次登记为 passed；相同内容重试保留已有记录的实际状态，提案已执行
+// 时返回 executed 而不是 passed。返回的编号、时间锁、动作原文及顺序与认可的
+// 记录一致；重试不改写状态、余额或首次执行凭据。
+func TestRegisterProposalReportsActualState(t *testing.T) {
+	store, _ := openTempStore(t, 1000)
+	defer store.Close()
+
+	// 首次登记：existed=false，状态 passed，字段与提交内容一致。
+	record, existed, err := store.RegisterProposal("gip-1", 100, []string{"transfer:audits:250", "transfer:legal:5"})
+	if err != nil || existed {
+		t.Fatalf("first register existed=%v err=%v", existed, err)
+	}
+	if record.ID != "gip-1" || record.State != "passed" || record.TimelockEnd != 100 ||
+		!sameActions(record.Actions, []string{"transfer:audits:250", "transfer:legal:5"}) {
+		t.Fatalf("first record = %+v", record)
+	}
+
+	// 尚未执行的相同内容重试：existed=true，状态仍为 passed。
+	record, existed, err = store.RegisterProposal("gip-1", 100, []string{"transfer:audits:250", "transfer:legal:5"})
+	if err != nil || !existed || record.State != "passed" {
+		t.Fatalf("pending retry existed=%v state=%s err=%v", existed, record.State, err)
+	}
+
+	// 执行后相同内容重试：existed=true，状态必须是 executed，不得报成 passed。
+	if _, err := store.Execute("gip-1", 100); err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	record, existed, err = store.RegisterProposal("gip-1", 100, []string{"transfer:audits:250", "transfer:legal:5"})
+	if err != nil || !existed {
+		t.Fatalf("executed retry existed=%v err=%v", existed, err)
+	}
+	if record.State != "executed" {
+		t.Fatalf("executed retry reported state=%q, want executed", record.State)
+	}
+	if record.ID != "gip-1" || record.TimelockEnd != 100 ||
+		!sameActions(record.Actions, []string{"transfer:audits:250", "transfer:legal:5"}) {
+		t.Fatalf("executed retry record = %+v", record)
+	}
+
+	// 兼容的 Register 接口对已执行提案的相同内容重试仍返回 existed=true。
+	if existed, err := store.Register("gip-1", 100, []string{"transfer:audits:250", "transfer:legal:5"}); err != nil || !existed {
+		t.Fatalf("Register retry after execute existed=%v err=%v", existed, err)
+	}
+
+	// 已执行提案的内容冲突（时间锁、动作原文、动作顺序）仍然报错。
+	if _, _, err := store.RegisterProposal("gip-1", 101, []string{"transfer:audits:250", "transfer:legal:5"}); !errors.Is(err, ErrProposalConflict) {
+		t.Fatalf("timelock conflict after execute err=%v", err)
+	}
+	if _, _, err := store.RegisterProposal("gip-1", 100, []string{"transfer:legal:5", "transfer:audits:250"}); !errors.Is(err, ErrProposalConflict) {
+		t.Fatalf("action order conflict after execute err=%v", err)
+	}
+
+	// 重试只确认已有提案：状态、余额与首次执行凭据不被改写。
+	if p, ok, _ := store.Proposal("gip-1"); !ok || p.State != "executed" {
+		t.Fatalf("proposal state = %+v ok=%v", p, ok)
+	}
+	if bal, _ := store.TreasuryBalance(); bal != 745 {
+		t.Fatalf("treasury = %d, want 745", bal)
+	}
+	receipt, ok, err := store.Receipt("gip-1")
+	if err != nil || !ok || receipt.ExecutedAt != 100 {
+		t.Fatalf("receipt = %+v ok=%v err=%v", receipt, ok, err)
+	}
+
+	// 返回的记录是副本：调用方改写不影响状态文件中的记录。
+	record.State = "mutated"
+	record.Actions[0] = "mutated"
+	if p, _, _ := store.Proposal("gip-1"); p.State != "executed" || p.Actions[0] != "transfer:audits:250" {
+		t.Fatalf("stored record was mutated through returned copy: %+v", p)
+	}
+}
+
+// TestRegisterRetryVersusExecuteRace：相同内容的登记重试与首次执行同时发生时，
+// 响应按两者实际确认的先后反映状态——登记先确认返回 passed，执行先完成返回
+// executed；无论哪种结果，字段都必须来自同一条被认可的记录，且重试不产生
+// 二次资金变动。
+func TestRegisterRetryVersusExecuteRace(t *testing.T) {
+	store, _ := openTempStore(t, 100000)
+	defer store.Close()
+	mustRegister(t, store, "gip-race", 0, "transfer:a:1")
+
+	const n = 64
+	states := make([]string, n)
+	existedFlags := make([]bool, n)
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(2)
+		go func(i int) {
+			defer wg.Done()
+			record, existed, err := store.RegisterProposal("gip-race", 0, []string{"transfer:a:1"})
+			if err != nil || !existed {
+				t.Errorf("retry existed=%v err=%v", existed, err)
+				return
+			}
+			if record.ID != "gip-race" || record.TimelockEnd != 0 ||
+				!sameActions(record.Actions, []string{"transfer:a:1"}) {
+				t.Errorf("retry record = %+v", record)
+				return
+			}
+			states[i] = record.State
+			existedFlags[i] = existed
+		}(i)
+		go func() {
+			defer wg.Done()
+			_, _ = store.Execute("gip-race", 0)
+		}()
+	}
+	wg.Wait()
+
+	for i, state := range states {
+		if state != "passed" && state != "executed" {
+			t.Fatalf("retry %d reported state=%q", i, state)
+		}
+		if !existedFlags[i] {
+			t.Fatalf("retry %d lost existed flag", i)
+		}
+	}
+	// 全部重试结束后提案已执行，资金只扣减一次。
+	if p, _, _ := store.Proposal("gip-race"); p.State != "executed" {
+		t.Fatalf("final state = %s", p.State)
+	}
+	if bal, _ := store.TreasuryBalance(); bal != 100000-1 {
+		t.Fatalf("treasury = %d, want %d", bal, 100000-1)
+	}
+	if receipts, _ := store.Receipts(); len(receipts) != 1 {
+		t.Fatalf("receipts = %d, want 1", len(receipts))
+	}
+}

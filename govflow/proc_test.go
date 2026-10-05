@@ -2,6 +2,7 @@ package govflow
 
 import (
 	"bytes"
+	"encoding/json"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -1018,5 +1019,89 @@ func TestCLIDelegationParamOrderIrrelevant(t *testing.T) {
 		"--voter", "team:bob", "--choice", "for", "--now", "50", "--json"); code != 0 ||
 		!strings.Contains(vo, `"weight": 100`) {
 		t.Fatalf("team:bob should carry all 100 weight: exit=%d so=%s", code, vo)
+	}
+}
+
+// TestCLIRegisterReportsAcknowledgedState：register 的成功响应必须反映这次登记
+// 实际认可的记录——首次登记 already_registered=false、state=passed；相同内容
+// 重试 already_registered=true 且保留实际状态：未执行为 passed，已执行为
+// executed，不得把已执行提案报成 passed。编号、时间锁、动作原文及顺序与认可
+// 的记录一致；已执行提案的内容冲突仍然失败。
+func TestCLIRegisterReportsAcknowledgedState(t *testing.T) {
+	binary := buildCLI(t)
+	state := filepath.Join(t.TempDir(), "treasury.json")
+	if _, _, code := runCLI(t, binary, state, "init", "--balance", "1000"); code != 0 {
+		t.Fatal("init failed")
+	}
+	register := []string{"register", "--id", "gip-1", "--timelock", "100",
+		"--action", "transfer:audits:250", "--action", "transfer:legal:5", "--json"}
+
+	type registerResponse struct {
+		ID                string   `json:"id"`
+		State             string   `json:"state"`
+		TimelockEnd       int64    `json:"timelock_end"`
+		Actions           []string `json:"actions"`
+		AlreadyRegistered bool     `json:"already_registered"`
+	}
+	runRegister := func() registerResponse {
+		t.Helper()
+		so, se, code := runCLI(t, binary, state, register...)
+		if code != 0 {
+			t.Fatalf("register exit=%d: %s", code, se)
+		}
+		var resp registerResponse
+		if err := json.Unmarshal([]byte(so), &resp); err != nil {
+			t.Fatalf("register output is not JSON: %v\n%s", err, so)
+		}
+		return resp
+	}
+	wantActions := []string{"transfer:audits:250", "transfer:legal:5"}
+	check := func(resp registerResponse, state string, existed bool) {
+		t.Helper()
+		if resp.ID != "gip-1" || resp.TimelockEnd != 100 || resp.State != state ||
+			resp.AlreadyRegistered != existed || strings.Join(resp.Actions, ",") != strings.Join(wantActions, ",") {
+			t.Fatalf("register response = %+v, want state=%s already_registered=%v actions=%v",
+				resp, state, existed, wantActions)
+		}
+	}
+
+	// 首次登记：already_registered=false，state=passed。
+	check(runRegister(), "passed", false)
+	// 尚未执行的相同内容重试：already_registered=true，state=passed。
+	check(runRegister(), "passed", true)
+
+	// 执行后相同内容重试：state 必须是 executed，不能报成 passed。
+	if _, se, code := runCLI(t, binary, state, "execute", "--id", "gip-1", "--now", "100"); code != 0 {
+		t.Fatalf("execute failed: %s", se)
+	}
+	check(runRegister(), "executed", true)
+
+	// 普通文本输出同样明确实际状态。
+	if so, se, code := runCLI(t, binary, state, "register", "--id", "gip-1", "--timelock", "100",
+		"--action", "transfer:audits:250", "--action", "transfer:legal:5"); code != 0 ||
+		!strings.Contains(so, "already registered") || !strings.Contains(so, "state=executed") {
+		t.Fatalf("text retry after execute exit=%d so=%s se=%s", code, so, se)
+	}
+
+	// 已执行提案的内容冲突（时间锁、动作原文、动作顺序）仍然失败，不返回成功对象。
+	if so, se, code := runCLI(t, binary, state, "register", "--id", "gip-1", "--timelock", "101",
+		"--action", "transfer:audits:250", "--action", "transfer:legal:5", "--json"); code != 1 ||
+		!strings.Contains(se, "different timelock or actions") || strings.Contains(so, "already_registered") {
+		t.Fatalf("timelock conflict after execute exit=%d so=%s se=%s", code, so, se)
+	}
+	if _, se, code := runCLI(t, binary, state, "register", "--id", "gip-1", "--timelock", "100",
+		"--action", "transfer:legal:5", "--action", "transfer:audits:250"); code != 1 ||
+		!strings.Contains(se, "different timelock or actions") {
+		t.Fatalf("action order conflict after execute exit=%d: %s", code, se)
+	}
+
+	// 重试只确认已有提案：余额与首次执行凭据不被改写。
+	if bo, _, code := runCLI(t, binary, state, "balances", "--json"); code != 0 ||
+		!strings.Contains(bo, `"treasury": 745`) {
+		t.Fatalf("treasury changed by register retry:\n%s", bo)
+	}
+	if ro, _, code := runCLI(t, binary, state, "receipt", "--id", "gip-1", "--json"); code != 0 ||
+		!strings.Contains(ro, `"executed_at": 100`) {
+		t.Fatalf("first execution receipt changed:\n%s", ro)
 	}
 }
