@@ -1105,3 +1105,214 @@ func TestCLIRegisterReportsAcknowledgedState(t *testing.T) {
 		t.Fatalf("first execution receipt changed:\n%s", ro)
 	}
 }
+
+// TestCLIRejectsMissingTimelock：登记一项时间锁为 5000、尚未执行且动作合法的
+// 提案后，保存记录里的 timelock_end 被删掉时——重新打开与打开后再次读取都
+// 把整份文件判为损坏：原因写入 stderr（指出提案编号、timelock_end 字段与
+// 缺失/null/类型不符的具体原因），以域错误退出码 1 结束；文本与 JSON 输出
+// 模式都不在 stdout 给出成功结果或部分查询结果；执行不扣款、不追加凭据、
+// 不改提案状态，文件内容保持原样。即使操作的是另一份完整提案也拒绝整个文件。
+func TestCLIRejectsMissingTimelock(t *testing.T) {
+	binary := buildCLI(t)
+	dir := t.TempDir()
+	state := filepath.Join(dir, "treasury.json")
+	if _, _, code := runCLI(t, binary, state, "init", "--balance", "10000"); code != 0 {
+		t.Fatal("init failed")
+	}
+	// 时间锁为 5000、尚未执行且动作合法的提案。
+	if _, _, code := runCLI(t, binary, state, "register", "--id", "gip-7",
+		"--timelock", "5000", "--action", "transfer:audits:250"); code != 0 {
+		t.Fatal("register gip-7 failed")
+	}
+	// 另一份完整提案：本次查询/执行即使指向它，也必须拒绝含缺损记录的文件。
+	if _, _, code := runCLI(t, binary, state, "register", "--id", "gip-other",
+		"--timelock", "100", "--action", "transfer:legal:5"); code != 0 {
+		t.Fatal("register gip-other failed")
+	}
+	raw, err := os.ReadFile(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 以结构化改写构造每种缺损：delete 模拟“记录里的 timelock_end 被删掉”，
+	// null 模拟空值，字符串/小数/指数/超界模拟类型不符。
+	mutate := func(fn func(p map[string]any)) string {
+		var doc map[string]any
+		if err := json.Unmarshal(raw, &doc); err != nil {
+			t.Fatal(err)
+		}
+		fn(doc["proposals"].(map[string]any)["gip-7"].(map[string]any))
+		out, err := json.MarshalIndent(doc, "", "  ")
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(append(out, '\n'))
+	}
+	cases := []struct {
+		name    string
+		raw     string
+		wantMsg []string
+	}{
+		{
+			name: "missing",
+			raw: mutate(func(p map[string]any) {
+				delete(p, "timelock_end")
+			}),
+			wantMsg: []string{"corrupt", "gip-7", `"timelock_end"`, "is missing"},
+		},
+		{
+			name:    "null",
+			raw:     mutate(func(p map[string]any) { p["timelock_end"] = nil }),
+			wantMsg: []string{"corrupt", "gip-7", `"timelock_end"`, "is null"},
+		},
+		{
+			name:    "string",
+			raw:     mutate(func(p map[string]any) { p["timelock_end"] = "5000" }),
+			wantMsg: []string{"corrupt", "gip-7", `"timelock_end"`, "wrong type"},
+		},
+		{
+			name:    "decimal",
+			raw:     mutate(func(p map[string]any) { p["timelock_end"] = 5000.5 }),
+			wantMsg: []string{"corrupt", "gip-7", `"timelock_end"`, "wrong type"},
+		},
+		{
+			name:    "boolean",
+			raw:     mutate(func(p map[string]any) { p["timelock_end"] = true }),
+			wantMsg: []string{"corrupt", "gip-7", `"timelock_end"`, "wrong type"},
+		},
+	}
+	// 指数写法与超界整数无法经通用 map 保留词面，直接做文本替换。
+	exponent := strings.Replace(string(raw), `"timelock_end": 5000`, `"timelock_end": 5e3`, 1)
+	overInt64 := strings.Replace(string(raw), `"timelock_end": 5000`, `"timelock_end": 9223372036854775808`, 1)
+	if exponent == string(raw) || overInt64 == string(raw) {
+		t.Fatal("setup: timelock_end field not found for text replacement")
+	}
+	cases = append(cases,
+		struct {
+			name    string
+			raw     string
+			wantMsg []string
+		}{"exponent", exponent, []string{"corrupt", "gip-7", `"timelock_end"`, "wrong type"}},
+		struct {
+			name    string
+			raw     string
+			wantMsg []string
+		}{"over-int64", overInt64, []string{"corrupt", "gip-7", `"timelock_end"`, "wrong type"}},
+	)
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			bad := filepath.Join(dir, "timelock-"+strings.ReplaceAll(tc.name, " ", "-")+".json")
+			if err := os.WriteFile(bad, []byte(tc.raw), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			// 重新打开资金库即判损坏：所有读取类与执行类命令（文本/JSON）
+			// 都以退出码 1 失败，stdout 为空，原因定位到提案与字段。
+			for _, args := range [][]string{
+				{"proposal", "--id", "gip-7"},
+				{"proposal", "--id", "gip-7", "--json"},
+				// 即使查询的是另一项完整提案，也拒绝这份含缺损记录的文件。
+				{"proposal", "--id", "gip-other"},
+				{"proposals"},
+				{"proposals", "--json"},
+				{"balances"},
+				{"balances", "--json"},
+				{"receipts"},
+				{"receipts", "--json"},
+				// 攻击场景：缺损时间锁不得被当作 0，now=0 不能转账。
+				{"execute", "--id", "gip-7", "--now", "0"},
+				{"execute", "--id", "gip-7", "--now", "0", "--json"},
+				// 对另一项完整提案的执行同样被整体拒绝。
+				{"execute", "--id", "gip-other", "--now", "100"},
+			} {
+				so, se, code := runCLI(t, binary, bad, args...)
+				if code != 1 {
+					t.Fatalf("%v exit=%d want 1, stdout=%q stderr=%q", args, code, so, se)
+				}
+				if so != "" {
+					t.Fatalf("%v stdout must stay empty on corruption, got %q", args, so)
+				}
+				for _, want := range tc.wantMsg {
+					if !strings.Contains(se, want) {
+						t.Fatalf("%v stderr %q missing %q", args, se, want)
+					}
+				}
+			}
+			// 不整理、补齐或覆盖缺损文件。
+			if got, err := os.ReadFile(bad); err != nil || string(got) != tc.raw {
+				t.Fatalf("corrupt file was modified or rewritten")
+			}
+		})
+	}
+
+	// 打开资金库之后文件才被删字段：后续查询与执行仍按损坏拒绝，
+	// 且文件不被改写、资金与提案状态不变。
+	t.Run("detected after open", func(t *testing.T) {
+		live := filepath.Join(dir, "live.json")
+		if err := os.WriteFile(live, raw, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		// 先以完整文件正常查询一次，再替换成删字段版本。
+		if _, _, code := runCLI(t, binary, live, "balances", "--json"); code != 0 {
+			t.Fatal("pre-corruption balances failed")
+		}
+		corrupt := mutate(func(p map[string]any) { delete(p, "timelock_end") })
+		if err := os.WriteFile(live, []byte(corrupt), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		for _, args := range [][]string{
+			{"proposals"},
+			{"proposals", "--json"},
+			{"balances", "--json"},
+			{"execute", "--id", "gip-7", "--now", "0"},
+			{"execute", "--id", "gip-other", "--now", "100"},
+		} {
+			so, se, code := runCLI(t, binary, live, args...)
+			if code != 1 || so != "" {
+				t.Fatalf("%v exit=%d stdout=%q stderr=%q", args, code, so, se)
+			}
+			if !strings.Contains(se, "corrupt") || !strings.Contains(se, "gip-7") {
+				t.Fatalf("%v stderr %q missing corrupt/gip-7", args, se)
+			}
+		}
+		if got, err := os.ReadFile(live); err != nil || string(got) != corrupt {
+			t.Fatal("state file was modified by rejected operations")
+		}
+	})
+
+	// 对照：明确写出的 0 与负时间锁是合法值，不能与缺失混同；完整记录仍按
+	// 调用方时间判定，恰好到达可执行、提前被拒绝；正常登记与相同内容重试保留。
+	legal := filepath.Join(dir, "legal.json")
+	if _, _, code := runCLI(t, binary, legal, "init", "--balance", "10000"); code != 0 {
+		t.Fatal("legal init failed")
+	}
+	if _, _, code := runCLI(t, binary, legal, "register", "--id", "gip-zero",
+		"--timelock", "0", "--action", "transfer:z:1"); code != 0 {
+		t.Fatal("register zero timelock failed")
+	}
+	if _, _, code := runCLI(t, binary, legal, "register", "--id", "gip-neg",
+		"--timelock", "-100", "--action", "transfer:n:1"); code != 0 {
+		t.Fatal("register negative timelock failed")
+	}
+	// 相同内容重试幂等成功。
+	if _, _, code := runCLI(t, binary, legal, "register", "--id", "gip-zero",
+		"--timelock", "0", "--action", "transfer:z:1"); code != 0 {
+		t.Fatalf("identical retry should succeed, code=%d", code)
+	}
+	// 提前执行被拒绝（退出码 1，但不是损坏错误）。
+	if _, se, code := runCLI(t, binary, legal, "execute", "--id", "gip-zero", "--now", "-1"); code != 1 ||
+		strings.Contains(se, "corrupt") || !strings.Contains(se, "timelock not reached") {
+		t.Fatalf("early execute code=%d se=%s, want timelock-not-reached, not corrupt", code, se)
+	}
+	// 恰好到达时间锁可以执行；已执行后重试返回首次凭据，不二次扣款。
+	if _, _, code := runCLI(t, binary, legal, "execute", "--id", "gip-zero", "--now", "0"); code != 0 {
+		t.Fatalf("execute exactly at timelock failed, code=%d", code)
+	}
+	if so, _, code := runCLI(t, binary, legal, "execute", "--id", "gip-zero", "--now", "999", "--json"); code != 0 ||
+		!strings.Contains(so, `"executed_at": 0`) {
+		t.Fatalf("retry should return first receipt, code=%d so=%s", code, so)
+	}
+	if so, _, code := runCLI(t, binary, legal, "balances", "--json"); code != 0 ||
+		!strings.Contains(so, `"treasury": 9999`) {
+		t.Fatalf("treasury changed on retry: %s", so)
+	}
+}

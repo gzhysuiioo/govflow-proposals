@@ -186,11 +186,61 @@ type ProposalRecord struct {
 
 // ---- 磁盘结构（JSON） ----
 
+// storedProposal 是 register 登记提案的磁盘形状。时间锁决定提案何时可以支出，
+// 必须明确保存为有符号 64 位范围内的 JSON 整数：字段缺失、为 null 或类型
+// 不符都不得被折叠成 0 再当作已到期提案读出。timelock_end 先用 RawMessage
+// 接住，使“字段缺失”与“显式写出 0”在解码后仍可区分（encoding/json 直接
+// 解进 int64 会把缺失/null/类型不符都折叠成 0）；判定由
+// validateRegisteredTimelock 完成，记录在内存中首次登记时同步填上原始片段，
+// 使提交前校验与打开重放校验走同一份判定。state/actions 等其余字段沿用
+// 默认解码。
 type storedProposal struct {
 	ID          string   `json:"id"`
 	State       string   `json:"state"`
 	TimelockEnd int64    `json:"timelock_end"`
 	Actions     []string `json:"actions"`
+
+	timelockEndRaw json.RawMessage
+}
+
+// storedProposalJSONShape 只用于解码，按保存格式的字段名逐字接住每个字段的
+// 原始 JSON；timelock_end 保留原文以供“缺失/空值/类型不符”判定。
+type storedProposalJSONShape struct {
+	ID          string          `json:"id"`
+	State       string          `json:"state"`
+	TimelockEnd json.RawMessage `json:"timelock_end"`
+	Actions     []string        `json:"actions"`
+}
+
+// UnmarshalJSON 保留 timelock_end 是否出现及其原始写法（缺失为 nil、null 为
+// "null"），使“字段缺失”与“显式写出 0”在解码后仍可区分：时间锁决定资金何时
+// 可以支出，缺失记录不能被解释为已经到期。判定统一交给
+// validateRegisteredTimelock，此处只在字段确实是 int64 整数时填充值。
+func (p *storedProposal) UnmarshalJSON(data []byte) error {
+	var shape storedProposalJSONShape
+	if err := json.Unmarshal(data, &shape); err != nil {
+		return err
+	}
+	p.ID = shape.ID
+	p.State = shape.State
+	p.Actions = shape.Actions
+	p.timelockEndRaw = shape.TimelockEnd
+	fillInt64(shape.TimelockEnd, &p.TimelockEnd)
+	return nil
+}
+
+// mustStoredProposal 构造一份内存中的合法登记提案（首次登记路径使用）。
+// 同步填上 timelock_end 的原始片段，使“提交前校验”与“打开重放校验”走同一
+// 份 validateRegisteredTimelock 判定时不会把本进程新建的记录误判为字段缺失。
+func mustStoredProposal(id, state string, timelockEnd int64, actions []string) *storedProposal {
+	raw, _ := json.Marshal(timelockEnd)
+	return &storedProposal{
+		ID:             id,
+		State:          state,
+		TimelockEnd:    timelockEnd,
+		Actions:        actions,
+		timelockEndRaw: raw,
+	}
 }
 
 type storedState struct {
@@ -470,12 +520,7 @@ func (s *Store) RegisterProposal(id string, timelockEnd int64, actions []string)
 	if vp, ok := state.VoteProposals[id]; ok {
 		return ProposalRecord{}, false, fmt.Errorf("%w: proposal id %s belongs to a voting proposal (state=%s)", ErrProposalConflict, id, vp.State)
 	}
-	fresh := &storedProposal{
-		ID:          id,
-		State:       "passed",
-		TimelockEnd: timelockEnd,
-		Actions:     stored,
-	}
+	fresh := mustStoredProposal(id, "passed", timelockEnd, stored)
 	state.Proposals[id] = fresh
 	if err := s.commitLocked(state); err != nil {
 		return ProposalRecord{}, false, err
@@ -933,6 +978,13 @@ func validateState(state *storedState) error {
 		if p.State != "passed" && p.State != "executed" {
 			return fmt.Errorf("proposal %q has unknown state %q", p.ID, p.State)
 		}
+		// timelock_end 决定资金何时可以支出，必须明确保存为 int64 范围内的
+		// JSON 整数：缺失/null/类型不符一律判整份文件损坏，绝不能折叠成 0
+		// 后把缺少时间锁的提案当作已经到期。记录已是 executed、执行凭据与
+		// 余额能一致重放也不宽免，不能从 executed_at 或其它记录推测补齐。
+		if err := validateRegisteredTimelock(p); err != nil {
+			return err
+		}
 		// 动作原文登记时原样保存；空串或非法原文留待执行时拒绝。
 	}
 	if err := validateVoteProposals(state); err != nil {
@@ -1070,6 +1122,22 @@ func quoteAccounts(accounts []string) []string {
 		quoted[i] = strconv.Quote(account)
 	}
 	return quoted
+}
+
+// validateRegisteredTimelock 严格判定一条 register 登记提案的 timelock_end：
+// 时间锁决定资金何时可以支出，字段必须明确写出、非 null 且为 int64 范围内的
+// JSON 整数。字段缺失不得被解释成已经到期——缺失读到的 0 与明确写出的 0 在
+// 解码后仍可区分；字符串形式的数字、布尔、小数、指数写法与超出 int64 范围的
+// 数值同样拒绝。明确写出的 0 是合法时间锁；登记路径允许的负时间取值继续
+// 有效，不新增非负限制。记录已是 executed、执行凭据与余额能一致核对也不
+// 宽免本项，不能从 executed_at 或其它记录推测补齐时间锁。
+// “缺失/空值/类型不符”的判定与逐票明细、计票结果、执行凭据共用同一份规则
+// （requiredScalarProblem）。
+func validateRegisteredTimelock(p *storedProposal) error {
+	if problem := requiredScalarProblem(p.timelockEndRaw, scalarInteger); problem != "" {
+		return fmt.Errorf("proposal %q field %q %s", p.ID, "timelock_end", problem)
+	}
+	return nil
 }
 
 // validateReceiptExecutedAt 严格判定一份已保存凭据的 executed_at：
@@ -1225,6 +1293,11 @@ func schemaOf(t reflect.Type) *schemaNode {
 var storedStateSchema = schemaOf(reflect.TypeOf(storedState{}))
 
 func init() {
+	// register 登记提案的 timelock_end 同理：缺失/空值/类型不符的判定需要带上
+	// 提案编号（时间锁决定资金何时可以支出，缺失不能被解释成已到期的 0），
+	// 统一由 validateRegisteredTimelock 报错，结构扫描在此叶子位置保持宽松。
+	proposalFields := storedStateSchema.fields["proposals"].elem.fields
+	proposalFields["timelock_end"].kind = kindAny
 	// 票据的四个标量字段（representative/weight/support/voted_at）由
 	// validateStoredBallot 逐票判定“缺失/空值/类型不符”，其错误原因需要带上
 	// 提案编号、票据下标与字段名；因此结构扫描在这些叶子位置保持宽松（kindAny），
