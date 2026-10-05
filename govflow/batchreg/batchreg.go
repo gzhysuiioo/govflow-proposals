@@ -302,13 +302,49 @@ func hex4(p []byte) (int, bool) {
 	return v, true
 }
 
+// resolveRegistryTarget determines the file a registry path ultimately names
+// when path is a symbolic link, following the whole link chain the way the
+// operating system does: a relative link target is resolved against the
+// directory holding the link, never against the process working directory,
+// and intermediate links are followed to the final regular file. A path that
+// is not a symlink — a plain file, or a name that does not exist yet — is
+// returned unchanged and the caller's own read/write error paths deal with
+// it. A symlink whose target cannot be determined is an error naming the
+// path the caller passed: a dangling link must never be treated as a missing
+// file (saving "through" it would either replace the link with a regular
+// file or create the target as if this were a first registration), and a
+// link loop has no target at all.
+func resolveRegistryTarget(path string) (string, error) {
+	info, err := os.Lstat(path)
+	if err != nil || info.Mode()&os.ModeSymlink == 0 {
+		return path, nil
+	}
+	resolved, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			if linkTarget, readErr := os.Readlink(path); readErr == nil {
+				return "", fmt.Errorf("registry path %q is a symbolic link to %q, but that target does not exist; refusing to treat it as a new registry", path, linkTarget)
+			}
+			return "", fmt.Errorf("registry path %q is a symbolic link whose target does not exist; refusing to treat it as a new registry", path)
+		}
+		return "", fmt.Errorf("registry path %q is a symbolic link whose target cannot be determined: %w", path, err)
+	}
+	return resolved, nil
+}
+
 // Load reads the registry at path. A missing file yields an empty registry
 // with existed == false. An existing file that is empty, not parseable as
 // the public format — including missing, null, duplicated, misspelled or
 // mistyped fields — of an unsupported version, or holding duplicate batch
 // ids is an error: callers must never overwrite such a file as if it were a
-// fresh registry.
+// fresh registry. A symbolic link is followed to the registry it names; a
+// link whose target does not exist or cannot be determined (a link loop) is
+// an error, not a missing file, so it can never be replaced by a fresh
+// registry.
 func Load(path string) (reg *Registry, existed bool, err error) {
+	if _, err := resolveRegistryTarget(path); err != nil {
+		return nil, false, err
+	}
 	data, err := os.ReadFile(path)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
@@ -1000,6 +1036,15 @@ var (
 // Records are serialized in their current order; the file is created with
 // 0644 permissions or, when replacing an existing file, with its permissions.
 //
+// When path is a symbolic link, the save lands on the registry the link
+// names: the new content replaces the link's target (wherever it lives, and
+// however the link spells it — absolute or relative to the link's own
+// directory), the target keeps its permissions, and the link itself is left
+// exactly as it was, still pointing at the same target. A link whose target
+// does not exist or cannot be determined (a link loop) rejects the save
+// outright: the link is never replaced by a regular file and the missing
+// target is never created as if this were a first registration.
+//
 // Every record must satisfy the same effective-value rules Load enforces, so
 // a registry saved successfully always reads back: batch, product and unit
 // must be non-empty valid UTF-8 text (kept verbatim — no trimming or case
@@ -1017,14 +1062,22 @@ func Save(path string, reg *Registry) error {
 	if err := validateForSave(reg); err != nil {
 		return fmt.Errorf("cannot save registry %q: %w", path, err)
 	}
+	// A symlinked registry path saves onto the link's target, so every file
+	// system step below — permission lookup, temporary file, atomic replace —
+	// works on the resolved target while errors keep naming the path the
+	// caller passed. The link itself is never touched.
+	target, err := resolveRegistryTarget(path)
+	if err != nil {
+		return err
+	}
 	mode := os.FileMode(0o644)
-	if info, err := os.Stat(path); err == nil {
+	if info, err := os.Stat(target); err == nil {
 		mode = info.Mode().Perm()
 	} else if !errors.Is(err, fs.ErrNotExist) {
 		return fmt.Errorf("cannot inspect registry %q: %w", path, err)
 	}
 
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
 		return fmt.Errorf("cannot save registry %q: %w", path, err)
 	}
 
@@ -1042,7 +1095,7 @@ func Save(path string, reg *Registry) error {
 		return fmt.Errorf("cannot encode registry %q: %w", path, err)
 	}
 
-	tmp, err := os.CreateTemp(filepath.Dir(path), ".govflow-registry-*.tmp")
+	tmp, err := os.CreateTemp(filepath.Dir(target), ".govflow-registry-*.tmp")
 	if err != nil {
 		return fmt.Errorf("cannot save registry %q: %w", path, err)
 	}
@@ -1065,7 +1118,7 @@ func Save(path string, reg *Registry) error {
 		os.Remove(tmpName)
 		return fmt.Errorf("cannot save registry %q: %w", path, err)
 	}
-	if err := RenameTempFile(tmpName, path); err != nil {
+	if err := RenameTempFile(tmpName, target); err != nil {
 		os.Remove(tmpName)
 		return fmt.Errorf("cannot save registry %q: %w", path, err)
 	}
