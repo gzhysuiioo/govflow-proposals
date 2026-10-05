@@ -535,6 +535,101 @@ func TestCLIRejectsMissingRegisteredTimelock(t *testing.T) {
 	}
 }
 
+// TestCLIRejectsIncompleteDelegations：投票提案的 delegations 字段缺损（缺失或
+// null）时，文本与 JSON 的查询、投票、计票、执行都把整份文件判为损坏：原因写入
+// stderr（能看出提案编号、delegations 字段与缺失/空值原因），以域错误退出码 1
+// 结束，stdout 不出现成功记录或部分结果，文件不改写；请求同库内另一项委托记录
+// 完整的提案也同样拒绝。缺少委托记录不等于撤回委托。
+func TestCLIRejectsIncompleteDelegations(t *testing.T) {
+	binary := buildCLI(t)
+	dir := t.TempDir()
+	state := filepath.Join(dir, "treasury.json")
+	if _, _, code := runCLI(t, binary, state, "init", "--balance", "1000"); code != 0 {
+		t.Fatal("init failed")
+	}
+	// alice 权重 300、bob 权重 200，bob 已委托 alice，两人尚未投票。
+	if _, _, code := runCLI(t, binary, state, "create-vote", "--id", "gip-cli-del",
+		"--member", "alice:300", "--member", "bob:200", "--delegate", "bob:alice",
+		"--quorum", "300", "--start", "0", "--deadline", "10", "--timelock", "10",
+		"--action", "transfer:a:1"); code != 0 {
+		t.Fatal("create-vote failed")
+	}
+	// 同库另一项委托记录完整的提案，用于验证损坏不被选择性忽略。
+	if _, _, code := runCLI(t, binary, state, "create-vote", "--id", "gip-other",
+		"--member", "alice:300", "--member", "bob:200",
+		"--quorum", "300", "--start", "0", "--deadline", "10", "--timelock", "10"); code != 0 {
+		t.Fatal("create-vote gip-other failed")
+	}
+	raw, err := os.ReadFile(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var doc map[string]any
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		t.Fatal(err)
+	}
+	delete(doc["vote_proposals"].(map[string]any)["gip-cli-del"].(map[string]any), "delegations")
+	corruptRaw, err := json.MarshalIndent(doc, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	corrupt := string(append(corruptRaw, '\n'))
+	if err := os.WriteFile(state, []byte(corrupt), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// 文本与 JSON 采用同一判定：均为退出码 1、原因在 stderr、stdout 为空。
+	for _, args := range [][]string{
+		{"proposal", "--id", "gip-cli-del"},
+		{"proposal", "--id", "gip-cli-del", "--json"},
+		{"proposal", "--id", "gip-other"},
+		{"proposals"},
+		{"proposals", "--json"},
+		{"vote", "--id", "gip-cli-del", "--voter", "bob", "--choice", "for", "--now", "5"},
+		{"tally", "--id", "gip-cli-del", "--now", "10"},
+		{"tally", "--id", "gip-cli-del", "--now", "10", "--json"},
+		{"execute", "--id", "gip-cli-del", "--now", "10"},
+		{"balances", "--json"},
+	} {
+		name := strings.Join(args, "_")
+		t.Run(name, func(t *testing.T) {
+			so, se, code := runCLI(t, binary, state, args...)
+			if code != 1 {
+				t.Fatalf("exit=%d want 1, stdout=%q stderr=%q", code, so, se)
+			}
+			if so != "" {
+				t.Fatalf("stdout must stay empty on corruption, got %q", so)
+			}
+			for _, want := range []string{"corrupt", "gip-cli-del", `"delegations"`, "missing"} {
+				if !strings.Contains(se, want) {
+					t.Fatalf("stderr %q missing %q", se, want)
+				}
+			}
+		})
+	}
+	if got, err := os.ReadFile(state); err != nil || string(got) != corrupt {
+		t.Fatalf("corrupt file was modified or rewritten")
+	}
+
+	// null 与缺失同属缺损：同样判损坏，原因指出空值。
+	nullDoc := doc
+	nullDoc["vote_proposals"].(map[string]any)["gip-cli-del"].(map[string]any)["delegations"] = nil
+	nullRaw, err := json.MarshalIndent(nullDoc, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(state, append(nullRaw, '\n'), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	so, se, code := runCLI(t, binary, state, "proposals", "--json")
+	if code != 1 || so != "" {
+		t.Fatalf("null delegations: exit=%d want 1, stdout=%q", code, so)
+	}
+	if !strings.Contains(se, `"delegations"`) || !strings.Contains(se, "null") {
+		t.Fatalf("stderr %q must name delegations and null", se)
+	}
+}
+
 // TestCLIRejectsIncompleteBallot：未计票提案的票据缺 support 时，文本与 JSON
 // 查询、计票都把整份文件判为损坏：原因写入 stderr（能看出提案编号、票据与字段、
 // 空值/缺失/类型不符），以域错误退出码 1 结束，stdout 不出现部分结果，文件不改写。

@@ -282,6 +282,12 @@ func validateStoredTally(id string, t *storedTally) error {
 
 // storedVoteProposal 按成员提交顺序保存成员与委托（顺序不影响相等性），
 // 动作文本与顺序原样保存（顺序影响相等性）。
+//
+// delegations 必须明确写出且为 JSON 数组：委托关系直接决定投票资格与票重
+// 归集，字段缺失、为 null 或写成对象/字符串等其它类型，都不得被折叠成
+// “无人委托”再当作正常提案读出——缺少记录不等于撤回委托。因此解码时保留
+// 字段的原始 JSON，由 validateStoredDelegations 区分“缺失/空值/类型不符”。
+// 明确写出的空数组仍表示无人委托：成员各自代表自己，按原始权重投票。
 type storedVoteProposal struct {
 	ID          string             `json:"id"`
 	State       string             `json:"state"`
@@ -294,6 +300,64 @@ type storedVoteProposal struct {
 	Actions     []string           `json:"actions"`
 	Ballots     []storedBallot     `json:"ballots"`
 	Tally       *storedTally       `json:"tally,omitempty"`
+
+	delegationsRaw json.RawMessage
+}
+
+// voteProposalJSONShape 只用于解码，按保存格式的字段名逐字接住每个字段；
+// delegations 保留原始 JSON，使“字段缺失”与“显式 null/写错类型”在解码后
+// 仍可区分：encoding/json 直接解进切片时会把这三种情况都折叠成 nil，
+// 恰好与“无人委托”的合法空列表无法区分。
+type voteProposalJSONShape struct {
+	ID          string          `json:"id"`
+	State       string          `json:"state"`
+	Members     []storedMember  `json:"members"`
+	Delegations json.RawMessage `json:"delegations"`
+	Quorum      int64           `json:"quorum"`
+	StartAt     int64           `json:"start_at"`
+	Deadline    int64           `json:"deadline"`
+	TimelockEnd int64           `json:"timelock_end"`
+	Actions     []string        `json:"actions"`
+	Ballots     []storedBallot  `json:"ballots"`
+	Tally       *storedTally    `json:"tally,omitempty"`
+}
+
+// UnmarshalJSON 保留 delegations 是否出现及其原始写法（缺失为 nil、null 为
+// "null"），供 validateStoredDelegations 区分缺失、空值与类型不符。
+// delegations 类型不符时这里不返回错误（治理字段保持 nil），以免解码器在
+// 不含提案编号的通用错误处提前失败；定位与判定统一交给
+// validateStoredDelegations。仅当字段确实是 JSON 数组时才填充治理字段，
+// 绝不能让错误类型悄悄落成空列表并参与查询、投票或计票。
+func (p *storedVoteProposal) UnmarshalJSON(data []byte) error {
+	var shape voteProposalJSONShape
+	if err := json.Unmarshal(data, &shape); err != nil {
+		return err
+	}
+	p.ID, p.State, p.Members = shape.ID, shape.State, shape.Members
+	p.Quorum, p.StartAt, p.Deadline, p.TimelockEnd = shape.Quorum, shape.StartAt, shape.Deadline, shape.TimelockEnd
+	p.Actions, p.Ballots, p.Tally = shape.Actions, shape.Ballots, shape.Tally
+	p.delegationsRaw = shape.Delegations
+	if jsonValueType(shape.Delegations) == "array" {
+		if err := json.Unmarshal(shape.Delegations, &p.Delegations); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// validateStoredDelegations 严格判定一项已保存投票提案的 delegations：
+// 字段未写出、显式为 null 或不是 JSON 数组（对象/字符串/数字/布尔）都返回
+// 带提案编号与字段名的错误。明确写出的空数组是合法的“无人委托”，不得当成
+// 缺失。未投票、已计票和已执行的提案适用同一要求：不能因为票据与计票结论
+// 仍能复核，就把缺损的委托记录解释成撤回委托。
+// “缺失/空值/类型不符”的判定与逐票明细、计票结果、执行凭据共用同一份规则
+// （validateRawFields），此处只补充业务位置：提案编号。
+func validateStoredDelegations(id string, p *storedVoteProposal) error {
+	return validateRawFields([]rawField{
+		{name: "delegations", kind: scalarArray, raw: p.delegationsRaw},
+	}, func(field, problem string) error {
+		return fmt.Errorf("voting proposal %q field %q %s", id, field, problem)
+	})
 }
 
 // ---- 校验与派生 ----
@@ -570,6 +634,10 @@ func (s *Store) CreateVoteProposal(in *CreateVoteInput) (view *VoteProposalView,
 	for _, d := range in.Delegations {
 		stored.Delegations = append(stored.Delegations, storedDelegation{From: d.From, To: d.To})
 	}
+	// 同步填上字段原始片段（无委托时是明确写出的空数组），使“提交前校验”与
+	// “打开重放校验”走同一份 validateStoredDelegations 判定时不会把本进程
+	// 新建的提案误判为字段缺失。
+	stored.delegationsRaw, _ = json.Marshal(stored.Delegations)
 	state.VoteProposals[in.ID] = stored
 	if err := s.commitLocked(state); err != nil {
 		return nil, false, err
@@ -921,6 +989,14 @@ func validateVoteProposals(state *storedState) error {
 		case "voting", "passed", "rejected", "executed":
 		default:
 			return fmt.Errorf("voting proposal %q has unknown state %q", p.ID, p.State)
+		}
+		// 委托列表必须明确写出且为 JSON 数组。先于委托路径与票重归集的重建
+		// 执行：字段缺损时直接判整份文件损坏，绝不能把缺失/空值/写错类型的
+		// delegations 默认成“无人委托”后再继续给出查询、投票或计票结果——
+		// 缺少记录不等于撤回委托。未投票、已计票和已执行的提案适用同一要求，
+		// 即使已有票据与计票结论仍能复核也不放过缺损记录。
+		if err := validateStoredDelegations(p.ID, p); err != nil {
+			return err
 		}
 		spec, err := specOf(p)
 		if err != nil {
