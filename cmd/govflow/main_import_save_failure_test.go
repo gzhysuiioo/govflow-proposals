@@ -57,6 +57,9 @@ func TestMain(m *testing.M) {
 	if *wrapBatchImport {
 		os.Exit(runWrappedBatchImport())
 	}
+	if *wrapBatchRegister {
+		os.Exit(runWrappedBatchRegister())
+	}
 	os.Exit(m.Run())
 }
 
