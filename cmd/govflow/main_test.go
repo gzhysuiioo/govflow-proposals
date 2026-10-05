@@ -250,6 +250,151 @@ func TestBatchImportCLIConflictPreservesRegistry(t *testing.T) {
 	}
 }
 
+// A conflict after identical repeats of a manifest-introduced batch must
+// point at the batch's first manifest occurrence: record 4 changing B1's
+// quantity conflicts with record 1, never with the identical record 3. The
+// whole import is rejected — stdout stays empty, no new batch lands, and
+// both files keep their bytes (the registry its mtime as well).
+func TestBatchImportCLIConflictPointsAtFirstManifestRecord(t *testing.T) {
+	dir := t.TempDir()
+	registry := filepath.Join(dir, "reg.json")
+	manifest := filepath.Join(dir, "in.json")
+	original := `{"version":1,"batches":[{"batch":"B0","product":"P-0","quantity":5,"unit":"box"}]}`
+	writeFile(t, registry, original)
+	manifestContent := `[
+  {"batch":"B1","product":"P-7","quantity":10,"unit":"kg"},
+  {"batch":"B2","product":"P-8","quantity":1,"unit":"box"},
+  {"batch":"B1","product":"P-7","quantity":10,"unit":"kg"},
+  {"batch":"B1","product":"P-7","quantity":11,"unit":"kg"}
+]`
+	writeFile(t, manifest, manifestContent)
+	content, pinned := pinRegistry(t, registry)
+
+	var stdout bytes.Buffer
+	err := runBatchImport([]string{"--registry", registry, "--input", manifest}, &stdout)
+	if err == nil {
+		t.Fatal("the conflicting manifest must be rejected as a whole")
+	}
+	msg := err.Error()
+	for _, want := range []string{"record 4", strconv.Quote("B1"), "quantity", "conflicts with manifest record 1"} {
+		if !strings.Contains(msg, want) {
+			t.Fatalf("error must contain %q: %v", want, msg)
+		}
+	}
+	if strings.Contains(msg, "manifest record 3") {
+		t.Fatalf("the intermediate duplicate must not become the conflict source: %v", msg)
+	}
+	if stdout.Len() != 0 {
+		t.Fatalf("stdout must stay empty on failure, got %q", stdout.String())
+	}
+	assertRegistryUntouched(t, registry, content, pinned)
+	if after, _ := os.ReadFile(registry); string(after) != original {
+		t.Fatalf("registry content changed: %s", after)
+	}
+	if after, _ := os.ReadFile(manifest); string(after) != manifestContent {
+		t.Fatal("the read-only manifest was modified")
+	}
+	if batches := readStoredBatches(t, registry); len(batches) != 1 || batches[0].Batch != "B0" {
+		t.Fatalf("rejected import left new batches behind: %v", batches)
+	}
+}
+
+// When the batch was registered before the import, identical manifest
+// records only confirm it — even repeatedly. A later differing record
+// conflicts with the registered record, and the error must say so instead of
+// pointing at one of the confirming manifest records.
+func TestBatchImportCLIConflictWithRegisteredRecordAfterDuplicates(t *testing.T) {
+	dir := t.TempDir()
+	registry := filepath.Join(dir, "reg.json")
+	manifest := filepath.Join(dir, "in.json")
+	original := `{"version":1,"batches":[{"batch":"B1","product":"P-7","quantity":10,"unit":"kg"}]}`
+	writeFile(t, registry, original)
+	manifestContent := `[
+  {"batch":"B1","product":"P-7","quantity":10,"unit":"kg"},
+  {"batch":"B1","product":"P-7","quantity":10,"unit":"kg"},
+  {"batch":"B1","product":"P-9","quantity":12,"unit":"g"}
+]`
+	writeFile(t, manifest, manifestContent)
+	content, pinned := pinRegistry(t, registry)
+
+	var stdout bytes.Buffer
+	err := runBatchImport([]string{"--registry", registry, "--input", manifest}, &stdout)
+	if err == nil {
+		t.Fatal("the conflicting manifest must be rejected as a whole")
+	}
+	msg := err.Error()
+	for _, want := range []string{"record 3", strconv.Quote("B1"), "product", "quantity", "unit", "conflicts with the registered record"} {
+		if !strings.Contains(msg, want) {
+			t.Fatalf("error must contain %q: %v", want, msg)
+		}
+	}
+	if strings.Contains(msg, "conflicts with manifest record") {
+		t.Fatalf("a duplicate confirmation must not become the conflict source: %v", msg)
+	}
+	if stdout.Len() != 0 {
+		t.Fatalf("stdout must stay empty on failure, got %q", stdout.String())
+	}
+	assertRegistryUntouched(t, registry, content, pinned)
+	if after, _ := os.ReadFile(manifest); string(after) != manifestContent {
+		t.Fatal("the read-only manifest was modified")
+	}
+}
+
+// The success mirror: with the last record matching the first occurrence
+// again, the import goes through. Results keep manifest order — first
+// occurrence created, identical repeats and the already-registered batch
+// duplicates — and the registry ends up holding exactly one record per id.
+func TestBatchImportCLISucceedsWhenLateRecordMatchesAgain(t *testing.T) {
+	dir := t.TempDir()
+	registry := filepath.Join(dir, "reg.json")
+	manifest := filepath.Join(dir, "in.json")
+	writeFile(t, registry, `{"version":1,"batches":[{"batch":"B0","product":"P-0","quantity":5,"unit":"box"}]}`)
+	writeFile(t, manifest, `[
+  {"batch":" B1 ","product":"P-7","quantity":10,"unit":"kg"},
+  {"batch":"B2","product":"P-8","quantity":1,"unit":"box"},
+  {"batch":"B1","product":"P-7","quantity":10,"unit":"kg"},
+  {"batch":"B0","product":"P-0","quantity":5,"unit":"box"},
+  {"batch":"B1","product":"P-7","quantity":10,"unit":"kg"}
+]`)
+
+	var stdout bytes.Buffer
+	if err := runBatchImport([]string{"--registry", registry, "--input", manifest}, &stdout); err != nil {
+		t.Fatalf("import failed: %v", err)
+	}
+	var out importOutput
+	if err := json.Unmarshal(bytes.TrimSpace(stdout.Bytes()), &out); err != nil {
+		t.Fatalf("stdout is not the expected JSON: %v (%q)", err, stdout.String())
+	}
+	wantStatus := []string{"created", "created", "duplicate", "duplicate", "duplicate"}
+	wantBatch := []string{"B1", "B2", "B1", "B0", "B1"}
+	if len(out.Results) != len(wantStatus) {
+		t.Fatalf("got %d results, want %d", len(out.Results), len(wantStatus))
+	}
+	for i := range wantStatus {
+		if out.Results[i].Status != wantStatus[i] || out.Results[i].Batch != wantBatch[i] {
+			t.Errorf("result %d = %q/%q, want %q/%q (manifest order)",
+				i+1, out.Results[i].Batch, out.Results[i].Status, wantBatch[i], wantStatus[i])
+		}
+	}
+
+	batches := readStoredBatches(t, registry)
+	wantStored := []registerResult{
+		{Batch: "B0", Product: "P-0", Quantity: 5, Unit: "box"},
+		{Batch: "B1", Product: "P-7", Quantity: 10, Unit: "kg"},
+		{Batch: "B2", Product: "P-8", Quantity: 1, Unit: "box"},
+	}
+	if len(batches) != len(wantStored) {
+		t.Fatalf("registry holds %d records, want one per batch id: %v", len(batches), batches)
+	}
+	for i, want := range wantStored {
+		got := batches[i]
+		got.Status = ""
+		if got != want {
+			t.Errorf("stored record %d = %+v, want %+v", i+1, got, want)
+		}
+	}
+}
+
 func TestBatchImportCLICorruptRegistryRejected(t *testing.T) {
 	dir := t.TempDir()
 	registry := filepath.Join(dir, "reg.json")
