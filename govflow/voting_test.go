@@ -2489,3 +2489,317 @@ func TestCreateVoteRetryActionSwapAfterExecutionConflicts(t *testing.T) {
 	assertExecutedProposalUntouched(t, v2, in)
 	assertFirstReceiptUntouched(t, reopened, in.ID, 850)
 }
+
+// retryScenarioInput 构造“计票后原票重试”回归用的提案输入：
+// 多跳委托 erin->carol->bob，使最终代表 bob 归集 bob+carol+erin=175 的权重，
+// 大于 bob 本人的 100；另有未委托的 alice(300) 与 dave(400) 两位最终代表。
+// 名单与委托的提交顺序刻意与路径推演顺序不同。
+func retryScenarioInput(id string, quorum int64) *CreateVoteInput {
+	return &CreateVoteInput{
+		ID: id,
+		Members: []VoteMember{
+			{ID: "alice", Weight: 300},
+			{ID: "bob", Weight: 100},
+			{ID: "carol", Weight: 50},
+			{ID: "dave", Weight: 400},
+			{ID: "erin", Weight: 25},
+		},
+		Delegations: []Delegation{
+			{From: "erin", To: "carol"},
+			{From: "carol", To: "bob"},
+		},
+		Quorum:      quorum,
+		StartAt:     100,
+		Deadline:    200,
+		TimelockEnd: 300,
+		Actions:     []string{"transfer:audits:100"},
+	}
+}
+
+// assertBallotExactly 断言重试返回的票据与首次票据逐项一致：
+// 代表编号、归集权重、赞成/反对选择、首次投票时间四个字段都必须吻合，
+// 不能只返回一个“提交成功”的空结果。
+func assertBallotExactly(t *testing.T, prefix string, got *BallotView, want BallotView) {
+	t.Helper()
+	if got == nil {
+		t.Fatalf("%s: retry returned nil ballot", prefix)
+	}
+	if got.Representative != want.Representative || got.Weight != want.Weight ||
+		got.Support != want.Support || got.VotedAt != want.VotedAt {
+		t.Fatalf("%s: returned ballot=%+v, want original %+v", prefix, got, want)
+	}
+}
+
+// assertTalliedProposalFrozen 断言无论原票重试成功还是补投/改投被拒绝，
+// 已计票提案的全部留痕都保持首次计票时的原样：
+// 票据数量、每张票据（代表/权重/选择/首次时间）与先后顺序不变；
+// 提案状态、两侧权重、参与权重与首次计票时间不变。
+func assertTalliedProposalFrozen(t *testing.T, store *Store, id string, wantState string,
+	wantBallots []BallotView, forW, againstW, turnout, talliedAt int64) {
+	t.Helper()
+	v, ok, err := store.VoteProposal(id)
+	if err != nil || !ok {
+		t.Fatalf("VoteProposal(%s): ok=%v err=%v", id, ok, err)
+	}
+	if v.State != wantState {
+		t.Fatalf("state=%s, want %s", v.State, wantState)
+	}
+	if len(v.Ballots) != len(wantBallots) {
+		t.Fatalf("ballot count=%d, want %d: %+v", len(v.Ballots), len(wantBallots), v.Ballots)
+	}
+	// 逐票比较且保持首次投票先后顺序，而不是只按代表编号查表。
+	for i, want := range wantBallots {
+		if v.Ballots[i] != want {
+			t.Fatalf("ballot %d=%+v, want %+v (full ordered list: %+v)", i, v.Ballots[i], want, v.Ballots)
+		}
+	}
+	if v.Tally == nil {
+		t.Fatalf("tally conclusion missing")
+	}
+	if v.Tally.ForWeight != forW || v.Tally.AgainstWeight != againstW ||
+		v.Tally.Turnout != turnout || v.Tally.TalliedAt != talliedAt {
+		t.Fatalf("tally=%+v, want for=%d against=%d turnout=%d tallied_at=%d",
+			v.Tally, forW, againstW, turnout, talliedAt)
+	}
+}
+
+// TestOriginalBallotRetryAfterTallyPassed 回归保护“原票重试”与“计票后补投”的区别：
+// 代表在窗口内投出赞成票，提案到期计票通过后，再以同一编号、同一代表、同一选择
+// 提交，即使重试时间早于投票开始或晚于截止，也必须成功返回首次原票的完整四元组；
+// 重试时间既不替换首次投票时间，也不能使已记录的赞成票变成失败。
+// 原票来自承接多跳委托（erin->carol->bob）的代表，返回的票重必须是完整归集
+// 权重 175，而不是代表本人的 100。提案中保留未投票的最终代表 dave 与 alice，
+// 用来区分“取回旧票”与“真正补投”。
+func TestOriginalBallotRetryAfterTallyPassed(t *testing.T) {
+	store, _ := openTempStore(t, 1000)
+	defer store.Close()
+	id := "gip-retry-passed"
+	in := retryScenarioInput(id, 400)
+	mustCreateVote(t, store, in)
+
+	// bob 承接 erin->carol->bob 的多跳委托，归集 100+50+25=175，大于本人 100。
+	first, err := store.CastVote(id, "bob", true, 150)
+	if err != nil {
+		t.Fatalf("first vote: %v", err)
+	}
+	wantFirst := BallotView{Representative: "bob", Weight: 175, Support: true, VotedAt: 150}
+	assertBallotExactly(t, "first vote", first, wantFirst)
+
+	// alice 也在窗口内投赞成：for=475、against=0，参与 475 >= quorum 400 => 通过。
+	if _, err := store.CastVote(id, "alice", true, 160); err != nil {
+		t.Fatalf("alice vote: %v", err)
+	}
+	// dave 与（被委托的）carol、erin 均不再投票：dave 是未投票的最终代表。
+	tally, err := store.TallyVote(id, 200)
+	if err != nil || !tally.Passed {
+		t.Fatalf("tally=%+v err=%v, want passed", tally, err)
+	}
+
+	// 计票通过后，同一代表以同一选择重试：时间晚于截止——成功返回首次原票，
+	// 时间不被替换为 201，票重仍是完整归集权重 175。
+	late, err := store.CastVote(id, "bob", true, 201)
+	if err != nil {
+		t.Fatalf("identical retry after deadline must succeed, got %v", err)
+	}
+	assertBallotExactly(t, "late retry", late, wantFirst)
+
+	// 重试时间早于投票开始（也早于首次时间）：同样返回首次原票，首次时间保持 150。
+	early, err := store.CastVote(id, "bob", true, 50)
+	if err != nil {
+		t.Fatalf("identical retry before start must succeed, got %v", err)
+	}
+	assertBallotExactly(t, "early retry", early, wantFirst)
+
+	// 再传一个远在未来的时间，结论仍逐项一致。
+	far, err := store.CastVote(id, "bob", true, 1<<40)
+	if err != nil {
+		t.Fatalf("identical retry far future must succeed, got %v", err)
+	}
+	assertBallotExactly(t, "far-future retry", far, wantFirst)
+
+	// 返回的票据必须与后续提案查询中原有的那张票逐项一致，而不是仅表示提交成功。
+	v, ok, err := store.VoteProposal(id)
+	if err != nil || !ok {
+		t.Fatalf("query: ok=%v err=%v", ok, err)
+	}
+	if len(v.Ballots) != 2 {
+		t.Fatalf("ballot count=%d, want 2 (retries must not append)", len(v.Ballots))
+	}
+	var storedBob *BallotView
+	for i := range v.Ballots {
+		b := v.Ballots[i]
+		if b.Representative == "bob" {
+			storedBob = &v.Ballots[i]
+		}
+	}
+	if storedBob == nil {
+		t.Fatalf("original bob ballot missing from query: %+v", v.Ballots)
+	}
+	assertBallotExactly(t, "retry vs query", far, *storedBob)
+
+	// 票据数量、顺序（bob 150 在前、alice 160 在后）、状态与计票结论全部冻结。
+	assertTalliedProposalFrozen(t, store, id, "passed",
+		[]BallotView{
+			{Representative: "bob", Weight: 175, Support: true, VotedAt: 150},
+			{Representative: "alice", Weight: 300, Support: true, VotedAt: 160},
+		}, 475, 0, 475, 200)
+}
+
+// TestOriginalBallotRetryAfterTallyRejectedAgainst 覆盖拒绝结论与反对票：
+// 代表在窗口内投反对票，计票拒绝后以同一选择重试仍取回首次反对记录。
+// 场景同时固定“开始时间为零、首次在零时刻投下反对票”的合法情形：
+// 反对选择 false 与零时刻 0 都必须准确保留，既不被补成赞成，也不被替换成重试时间。
+func TestOriginalBallotRetryAfterTallyRejectedAgainst(t *testing.T) {
+	store, _ := openTempStore(t, 1000)
+	defer store.Close()
+	id := "gip-retry-rejected"
+	in := retryScenarioInput(id, 600)
+	in.StartAt, in.Deadline, in.TimelockEnd = 0, 100, 200
+	mustCreateVote(t, store, in)
+
+	// bob 在零时刻投下反对票：start=0 时 0 是合法的首次投票时间。
+	first, err := store.CastVote(id, "bob", false, 0)
+	if err != nil {
+		t.Fatalf("first against vote at zero: %v", err)
+	}
+	wantFirst := BallotView{Representative: "bob", Weight: 175, Support: false, VotedAt: 0}
+	assertBallotExactly(t, "first against vote", first, wantFirst)
+
+	// 仅 175 权重参与，低于 quorum 600：计票拒绝。
+	tally, err := store.TallyVote(id, 100)
+	if err != nil || tally.Passed {
+		t.Fatalf("tally=%+v err=%v, want rejected", tally, err)
+	}
+
+	// 拒绝结论同样允许原票重试：时间晚于截止，反对选择与零时刻保留。
+	late, err := store.CastVote(id, "bob", false, 250)
+	if err != nil {
+		t.Fatalf("identical against retry after deadline must succeed, got %v", err)
+	}
+	assertBallotExactly(t, "late against retry", late, wantFirst)
+
+	// 早于开始时间（这里 start=0，给一个负时间）重试也不替换首次时间 0。
+	negative, err := store.CastVote(id, "bob", false, -10)
+	if err != nil {
+		t.Fatalf("identical against retry before start must succeed, got %v", err)
+	}
+	assertBallotExactly(t, "negative-time against retry", negative, wantFirst)
+
+	// 返回票据与查询中原有票据逐项一致。
+	v, ok, err := store.VoteProposal(id)
+	if err != nil || !ok {
+		t.Fatalf("query: ok=%v err=%v", ok, err)
+	}
+	if len(v.Ballots) != 1 || v.Ballots[0] != wantFirst {
+		t.Fatalf("stored ballot=%+v, want %+v", v.Ballots, wantFirst)
+	}
+
+	// 拒绝状态、两侧权重（反对 175）、参与量与首次计票时间保持不变。
+	assertTalliedProposalFrozen(t, store, id, "rejected",
+		[]BallotView{{Representative: "bob", Weight: 175, Support: false, VotedAt: 0}},
+		0, 175, 175, 100)
+}
+
+// TestSwitchChoiceAfterTallyConflictsLikeInWindow 固定改投冲突在计票后仍然成立：
+// 已投代表在计票后改选另一侧，必须得到与窗口内改投相同的冲突错误，
+// 即使重试时间落在窗口之外；冲突既不改写首次选择/时间，也不追加票据。
+func TestSwitchChoiceAfterTallyConflictsLikeInWindow(t *testing.T) {
+	store, _ := openTempStore(t, 1000)
+	defer store.Close()
+	id := "gip-retry-switch"
+	in := retryScenarioInput(id, 1)
+	mustCreateVote(t, store, in)
+	if _, err := store.CastVote(id, "bob", true, 150); err != nil {
+		t.Fatalf("first vote: %v", err)
+	}
+	if _, err := store.TallyVote(id, 200); err != nil {
+		t.Fatalf("tally: %v", err)
+	}
+
+	// 窗口内改投的错误分类作为对照（在另一项尚未计票的同形提案上取得）。
+	freshID := "gip-retry-switch-fresh"
+	mustCreateVote(t, store, retryScenarioInput(freshID, 1))
+	if _, err := store.CastVote(freshID, "bob", true, 150); err != nil {
+		t.Fatalf("fresh first vote: %v", err)
+	}
+	inWindow, err := store.CastVote(freshID, "bob", false, 160)
+	if !errors.Is(err, ErrProposalConflict) {
+		t.Fatalf("in-window switch err=%v, want ErrProposalConflict", err)
+	}
+	if inWindow != nil {
+		t.Fatalf("in-window switch returned ballot=%+v, want nil", inWindow)
+	}
+
+	// 计票后改选另一侧，时间晚于截止：与窗口内改投同为冲突，而非“投票已关闭”的拒绝。
+	late, err := store.CastVote(id, "bob", false, 201)
+	if !errors.Is(err, ErrProposalConflict) {
+		t.Fatalf("post-tally switch late err=%v, want same ErrProposalConflict as in-window switch", err)
+	}
+	if late != nil {
+		t.Fatalf("post-tally switch returned ballot=%+v, want nil", late)
+	}
+	// 时间早于投票开始仍按冲突处理，而不是按窗口外新票拒绝。
+	early, err := store.CastVote(id, "bob", false, 50)
+	if !errors.Is(err, ErrProposalConflict) {
+		t.Fatalf("post-tally switch early err=%v, want ErrProposalConflict", err)
+	}
+	if early != nil {
+		t.Fatalf("post-tally early switch returned ballot=%+v, want nil", early)
+	}
+
+	// 首次赞成票原样保留：选择未被改成反对、时间仍为 150、票据仍只有一张。
+	assertTalliedProposalFrozen(t, store, id, "passed",
+		[]BallotView{{Representative: "bob", Weight: 175, Support: true, VotedAt: 150}},
+		175, 0, 175, 200)
+	// 对照提案保持未计票、仍只有一张赞成票。
+	fv, ok, err := store.VoteProposal(freshID)
+	if err != nil || !ok || fv.State != "voting" || fv.Tally != nil || len(fv.Ballots) != 1 ||
+		!fv.Ballots[0].Support || fv.Ballots[0].VotedAt != 150 {
+		t.Fatalf("fresh proposal changed after in-window conflict: %+v ok=%v err=%v", fv, ok, err)
+	}
+}
+
+// TestNewBallotAfterTallyRejectedEvenInsideWindow 固定“计票后新增票据”被拒绝：
+// 尚未投票的最终代表（含承接委托的代表）在计票后提交任何选择，即使提供窗口内
+// 时间，也必须因已经计票被拒绝（ErrVoteRejected），而不是与原票重试混淆。
+// 无论拒绝是否成功，查询中的票据数量、内容与先后顺序以及计票结论都保持不变。
+func TestNewBallotAfterTallyRejectedEvenInsideWindow(t *testing.T) {
+	store, _ := openTempStore(t, 1000)
+	defer store.Close()
+	id := "gip-retry-newvoter"
+	in := retryScenarioInput(id, 400)
+	mustCreateVote(t, store, in)
+	// bob(175) 赞成，alice 不投票、dave(400) 不投票：for=175 < quorum 400 => 拒绝。
+	if _, err := store.CastVote(id, "bob", true, 150); err != nil {
+		t.Fatalf("first vote: %v", err)
+	}
+	if tally, err := store.TallyVote(id, 200); err != nil || tally.Passed {
+		t.Fatalf("tally=%+v err=%v, want rejected", tally, err)
+	}
+
+	// 未投票的最终代表 dave：窗口内时间的补投也必须按“已计票”拒绝。
+	if b, err := store.CastVote(id, "dave", false, 150); !errors.Is(err, ErrVoteRejected) {
+		t.Fatalf("new voter with in-window time: ballot=%+v err=%v, want ErrVoteRejected", b, err)
+	}
+	// 未投票的最终代表 alice 改投赞成、给窗口内时间，同样拒绝。
+	if b, err := store.CastVote(id, "alice", true, 100); !errors.Is(err, ErrVoteRejected) {
+		t.Fatalf("new voter at start boundary: ballot=%+v err=%v, want ErrVoteRejected", b, err)
+	}
+	// 窗口外时间的补投当然也拒绝。
+	if b, err := store.CastVote(id, "dave", false, 201); !errors.Is(err, ErrVoteRejected) {
+		t.Fatalf("new voter after deadline: ballot=%+v err=%v, want ErrVoteRejected", b, err)
+	}
+
+	// 与此同时，已投代表的原票重试仍成功——证明拒绝只针对“新票”，不波及原票取回。
+	retry, err := store.CastVote(id, "bob", true, 999)
+	if err != nil {
+		t.Fatalf("identical retry by existing voter must still succeed, got %v", err)
+	}
+	assertBallotExactly(t, "original retry alongside rejected new ballots", retry,
+		BallotView{Representative: "bob", Weight: 175, Support: true, VotedAt: 150})
+
+	// 全部补投尝试都未写入：票据仍只有 bob 的首次那一张，拒绝结论保持不变。
+	assertTalliedProposalFrozen(t, store, id, "rejected",
+		[]BallotView{{Representative: "bob", Weight: 175, Support: true, VotedAt: 150}},
+		175, 0, 175, 200)
+}
