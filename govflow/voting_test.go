@@ -2803,3 +2803,457 @@ func TestNewBallotAfterTallyRejectedEvenInsideWindow(t *testing.T) {
 		[]BallotView{{Representative: "bob", Weight: 175, Support: true, VotedAt: 150}},
 		175, 0, 175, 200)
 }
+
+// corruptDelegationsState 构造一份含“bob 委托给 alice”的合法状态文件，
+// 再按 mutate 改写该提案的 delegations 字段，返回改写前后的字节与路径。
+// phase 决定提案停留在哪个生命周期：
+//   - "voting"：尚未投票；
+//   - "passed"：alice（归集 500）投赞成后已计票通过；
+//   - "rejected"：无人投票直接计票，未达法定人数；
+//   - "executed"：通过提案已执行。
+func corruptDelegationsState(t *testing.T, phase string, mutate func(p map[string]any)) (path string, good, bad []byte) {
+	t.Helper()
+	dir := t.TempDir()
+	path = filepath.Join(dir, "treasury.json")
+	store, err := InitTreasury(path, 1000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	in := &CreateVoteInput{
+		ID: "gip-del",
+		Members: []VoteMember{
+			{ID: "alice", Weight: 300},
+			{ID: "bob", Weight: 200},
+		},
+		Delegations: []Delegation{{From: "bob", To: "alice"}},
+		Quorum:      250,
+		StartAt:     0,
+		Deadline:    200,
+		TimelockEnd: 300,
+		Actions:     []string{"transfer:audits:100"},
+	}
+	mustCreateVote(t, store, in)
+	switch phase {
+	case "voting":
+	case "passed":
+		if _, err := store.CastVote("gip-del", "alice", true, 100); err != nil {
+			t.Fatal(err)
+		}
+		if r, err := store.TallyVote("gip-del", 200); err != nil || !r.Passed {
+			t.Fatalf("tally passed: %+v err=%v", r, err)
+		}
+	case "rejected":
+		if r, err := store.TallyVote("gip-del", 200); err != nil || r.Passed {
+			t.Fatalf("tally rejected: %+v err=%v", r, err)
+		}
+	case "executed":
+		if _, err := store.CastVote("gip-del", "alice", true, 100); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := store.TallyVote("gip-del", 200); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := store.Execute("gip-del", 300); err != nil {
+			t.Fatal(err)
+		}
+	default:
+		t.Fatalf("unknown phase %q", phase)
+	}
+	store.Close()
+
+	good, err = os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var clone map[string]any
+	if err := json.Unmarshal(good, &clone); err != nil {
+		t.Fatal(err)
+	}
+	p := clone["vote_proposals"].(map[string]any)["gip-del"].(map[string]any)
+	mutate(p)
+	bad, err = json.MarshalIndent(clone, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	bad = append(bad, '\n')
+	if err := os.WriteFile(path, bad, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return path, good, bad
+}
+
+// TestCorruptDelegationsRejectedAsCorrupt：delegations 缺失、为 null 或写成
+// 对象/字符串/数字/布尔/元素类型不对的数组，都必须判整份状态文件损坏，
+// 且原因指出提案编号与 delegations，并区分缺失、空值与类型不符。
+// 未投票、已计票（通过/否决）与已执行的提案适用同一条要求。
+func TestCorruptDelegationsRejectedAsCorrupt(t *testing.T) {
+	mutations := map[string]struct {
+		mutate func(p map[string]any)
+		want   string // 错误原因中必须包含的片段
+	}{
+		"missing": {
+			mutate: func(p map[string]any) { delete(p, "delegations") },
+			want:   `field "delegations" is missing`,
+		},
+		"null": {
+			mutate: func(p map[string]any) { p["delegations"] = nil },
+			want:   `field "delegations" is null`,
+		},
+		"object": {
+			mutate: func(p map[string]any) { p["delegations"] = map[string]any{"bob": "alice"} },
+			want:   `field "delegations" has wrong type: want array, got object`,
+		},
+		"string": {
+			mutate: func(p map[string]any) { p["delegations"] = "bob:alice" },
+			want:   `field "delegations" has wrong type: want array, got string`,
+		},
+		"number": {
+			mutate: func(p map[string]any) { p["delegations"] = 7 },
+			want:   `field "delegations" has wrong type: want array, got number`,
+		},
+		"boolean": {
+			mutate: func(p map[string]any) { p["delegations"] = true },
+			want:   `field "delegations" has wrong type: want array, got boolean`,
+		},
+		"wrong element": {
+			mutate: func(p map[string]any) { p["delegations"] = []any{5} },
+			want:   `field "delegations" has wrong type`,
+		},
+	}
+	for _, phase := range []string{"voting", "passed", "rejected", "executed"} {
+		for name, tc := range mutations {
+			t.Run(phase+"/"+name, func(t *testing.T) {
+				path, _, bad := corruptDelegationsState(t, phase, tc.mutate)
+				s, err := Open(path)
+				if !errors.Is(err, ErrStateCorrupt) {
+					if s != nil {
+						s.Close()
+					}
+					t.Fatalf("Open err=%v, want ErrStateCorrupt", err)
+				}
+				if s != nil {
+					t.Fatal("corrupt open must not return a usable store")
+				}
+				if err == nil || !strings.Contains(err.Error(), `voting proposal "gip-del"`) {
+					t.Fatalf("error must name proposal gip-del, got: %v", err)
+				}
+				if err == nil || !strings.Contains(err.Error(), tc.want) {
+					t.Fatalf("error must distinguish %s (%q), got: %v", name, tc.want, err)
+				}
+				// 失败的打开不得改写原文件。
+				if got, rerr := os.ReadFile(path); rerr != nil || string(got) != string(bad) {
+					t.Fatalf("failed open rewrote or normalized the state file")
+				}
+			})
+		}
+	}
+}
+
+// TestCorruptDelegationsOpsRejectAndKeepFile：委托记录缺损后，查询不得返回
+// 部分列表或推算出的委托路径，投票不得追加票据，计票和执行不得改变状态、
+// 余额或凭据；所有操作都返回状态损坏错误，原文件保持原样。
+func TestCorruptDelegationsOpsRejectAndKeepFile(t *testing.T) {
+	path, good, bad := corruptDelegationsState(t, "voting", func(p map[string]any) {
+		delete(p, "delegations")
+	})
+
+	// 辅助函数把缺损字节留在 path 上；先恢复成完好文件，再验证损坏前的正常语义。
+	if err := os.WriteFile(path, good, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	live, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	v, ok, err := live.VoteProposal("gip-del")
+	if err != nil || !ok {
+		t.Fatalf("view before corruption: ok=%v err=%v", ok, err)
+	}
+	var bob *MemberView
+	for i := range v.Members {
+		if v.Members[i].ID == "bob" {
+			bob = &v.Members[i]
+		}
+	}
+	if bob == nil || bob.Delegate != "alice" || bob.Direct != "alice" ||
+		len(bob.Path) != 2 || bob.Path[0] != "bob" || bob.Path[1] != "alice" {
+		t.Fatalf("bob delegation view before corruption = %+v", bob)
+	}
+	if _, err := live.CastVote("gip-del", "bob", true, 100); !errors.Is(err, ErrVoteRejected) {
+		t.Fatalf("bob must not vote directly while delegated, got %v", err)
+	}
+	live.Close()
+
+	// 把委托记录删成缺损后直接打开：拒绝且不返回可用句柄。
+	if err := os.WriteFile(path, bad, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if s, err := Open(path); !errors.Is(err, ErrStateCorrupt) || s != nil {
+		if s != nil {
+			s.Close()
+		}
+		t.Fatalf("Open corrupt: store=%v err=%v", s, err)
+	}
+
+	// 用一个真实打开的句柄，随后在句柄之外把文件改坏，验证每条操作路径。
+	recoverPath := filepath.Join(t.TempDir(), "recover.json")
+	if err := os.WriteFile(recoverPath, good, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	h, err := Open(recoverPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer h.Close()
+	if err := os.WriteFile(recoverPath, bad, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	checks := map[string]func() error{
+		"VoteProposal":      func() error { _, _, e := h.VoteProposal("gip-del"); return e },
+		"VoteProposals":     func() error { _, e := h.VoteProposals(); return e },
+		"ProposalsSnapshot": func() error { _, e := h.ProposalsSnapshot(); return e },
+		"Proposal":          func() error { _, _, e := h.Proposal("gip-del"); return e },
+		"Proposals":         func() error { _, e := h.Proposals(); return e },
+		"Receipt":           func() error { _, _, e := h.Receipt("gip-del"); return e },
+		"Receipts":          func() error { _, e := h.Receipts(); return e },
+		"Balance":           func() error { _, e := h.Balance("audits"); return e },
+		"Balances":          func() error { _, e := h.Balances(); return e },
+		"BalanceSnapshot":   func() error { _, e := h.BalanceSnapshot(); return e },
+		"TreasuryBalance":   func() error { _, e := h.TreasuryBalance(); return e },
+		"CastVote":          func() error { _, e := h.CastVote("gip-del", "bob", true, 100); return e },
+		"TallyVote":         func() error { _, e := h.TallyVote("gip-del", 200); return e },
+		"Execute":           func() error { _, e := h.Execute("gip-del", 300); return e },
+	}
+	for name, op := range checks {
+		if e := op(); !errors.Is(e, ErrStateCorrupt) {
+			t.Fatalf("%s after corruption err=%v, want ErrStateCorrupt", name, e)
+		}
+	}
+	// 全部失败后文件字节保持缺损被发现时的原样：没有追加票据、没有计票、
+	// 没有执行、没有正常化重写。
+	if got, rerr := os.ReadFile(recoverPath); rerr != nil || string(got) != string(bad) {
+		t.Fatalf("failed ops rewrote or normalized the state file")
+	}
+}
+
+// TestCorruptDelegationsCLIUsesSameJudgement：命令行普通输出与 --json 使用同
+// 一份判定：失败时不向标准输出给出成功记录或部分结果，原因写入标准错误，
+// 退出码为 1。
+func TestCorruptDelegationsCLIUsesSameJudgement(t *testing.T) {
+	binary := buildCLI(t)
+	path, _, _ := corruptDelegationsState(t, "passed", func(p map[string]any) {
+		delete(p, "delegations")
+	})
+	commands := [][]string{
+		{"proposal", "--id", "gip-del"},
+		{"proposals"},
+		{"vote", "--id", "gip-del", "--voter", "bob", "--choice", "for", "--now", "100"},
+		{"tally", "--id", "gip-del", "--now", "200"},
+		{"execute", "--id", "gip-del", "--now", "300"},
+		{"balances"},
+		{"receipts"},
+	}
+	for _, args := range commands {
+		for _, asJSON := range []bool{false, true} {
+			name := strings.Join(args, " ")
+			full := args
+			if asJSON {
+				full = append(append([]string{}, full...), "--json")
+				name += " --json"
+			}
+			so, se, code := runCLI(t, binary, path, full...)
+			if code != 1 {
+				t.Fatalf("%s: exit code=%d, want 1; stdout=%s stderr=%s", name, code, so, se)
+			}
+			if so != "" {
+				t.Fatalf("%s: stdout must stay empty, got: %s", name, so)
+			}
+			if !strings.Contains(se, "corrupt") || !strings.Contains(se, "gip-del") ||
+				!strings.Contains(se, "delegations") {
+				t.Fatalf("%s: stderr must name corrupt state, proposal and delegations, got: %s", name, se)
+			}
+		}
+	}
+}
+
+// TestExplicitEmptyDelegationsLegal：明确写出的空数组仍表示无人委托，成员各自
+// 代表自己、按原始权重投票；正常创建时不提供委托仍然合法，保存的记录应能
+// 照常读取（落盘必须明确写出 "delegations": []）。
+func TestExplicitEmptyDelegationsLegal(t *testing.T) {
+	t.Run("handwritten empty array", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "treasury.json")
+		raw := `{
+  "magic": "govflow-treasury-state",
+  "version": 1,
+  "initial_treasury": 1000,
+  "treasury": 1000,
+  "balances": {},
+  "proposals": {},
+  "receipts": [],
+  "vote_proposals": {
+    "gip-empty": {
+      "id": "gip-empty",
+      "state": "voting",
+      "members": [{"id": "alice", "weight": 300}, {"id": "bob", "weight": 200}],
+      "delegations": [],
+      "quorum": 1,
+      "start_at": 0,
+      "deadline": 200,
+      "timelock_end": 300,
+      "actions": [],
+      "ballots": []
+    }
+  }
+}
+`
+		if err := os.WriteFile(path, []byte(raw), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		store, err := Open(path)
+		if err != nil {
+			t.Fatalf("empty delegations array rejected: %v", err)
+		}
+		defer store.Close()
+		v, ok, err := store.VoteProposal("gip-empty")
+		if err != nil || !ok {
+			t.Fatalf("query: ok=%v err=%v", ok, err)
+		}
+		for _, m := range v.Members {
+			if m.Delegate != m.ID || m.Direct != "" || len(m.Path) != 1 || m.Path[0] != m.ID {
+				t.Fatalf("member %s must represent itself, got %+v", m.ID, m)
+			}
+		}
+		// 未委托成员各自按原始权重投票。
+		if b, err := store.CastVote("gip-empty", "bob", false, 100); err != nil || b.Weight != 200 {
+			t.Fatalf("bob direct vote: %+v err=%v", b, err)
+		}
+	})
+
+	t.Run("create without delegations round-trips", func(t *testing.T) {
+		// 从不含整张投票提案表的旧版状态文件起步：旧文件仍可读。
+		dir := t.TempDir()
+		path := filepath.Join(dir, "treasury.json")
+		old := `{
+  "magic": "govflow-treasury-state",
+  "version": 1,
+  "initial_treasury": 1000,
+  "treasury": 1000,
+  "balances": {},
+  "proposals": {},
+  "receipts": []
+}
+`
+		if err := os.WriteFile(path, []byte(old), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		store, err := Open(path)
+		if err != nil {
+			t.Fatalf("old state file rejected: %v", err)
+		}
+		in := &CreateVoteInput{
+			ID:       "gip-nodelegate",
+			Members:  []VoteMember{{ID: "alice", Weight: 300}, {ID: "bob", Weight: 200}},
+			Quorum:   1,
+			StartAt:  0,
+			Deadline: 200, TimelockEnd: 300,
+			Actions: []string{},
+		}
+		if v, existed, err := store.CreateVoteProposal(in); err != nil || existed {
+			t.Fatalf("create without delegations: existed=%v err=%v view=%+v", existed, err, v)
+		}
+		store.Close()
+
+		// 落盘记录必须明确写出空数组，而不是省略 delegations。
+		persisted, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(string(persisted), `"delegations": []`) {
+			t.Fatalf("persisted state must write explicit empty delegations array:\n%s", persisted)
+		}
+		reopened, err := Open(path)
+		if err != nil {
+			t.Fatalf("reopen after create without delegations: %v", err)
+		}
+		defer reopened.Close()
+		v, ok, err := reopened.VoteProposal("gip-nodelegate")
+		if err != nil || !ok {
+			t.Fatalf("query after reopen: ok=%v err=%v", ok, err)
+		}
+		if len(v.Members) != 2 || v.TotalWeight != 500 {
+			t.Fatalf("unexpected roster after reopen: %+v", v)
+		}
+		for _, m := range v.Members {
+			if m.Delegate != m.ID || len(m.Path) != 1 {
+				t.Fatalf("member %s must represent itself after reopen, got %+v", m.ID, m)
+			}
+		}
+	})
+}
+
+// TestCorruptDelegationsSiblingProposalRejectsWholeFile：文件里即使还有其他
+// 内容完整的提案，也不能只略过坏提案继续查询或投票——整份文件判损坏。
+func TestCorruptDelegationsSiblingProposalRejectsWholeFile(t *testing.T) {
+	path, good, bad := corruptDelegationsState(t, "voting", func(p map[string]any) {
+		delete(p, "delegations")
+	})
+	// 向缺损文件再加入一项内容完整的姊妹提案 gip-ok。
+	var doc map[string]any
+	if err := json.Unmarshal(bad, &doc); err != nil {
+		t.Fatal(err)
+	}
+	props := doc["vote_proposals"].(map[string]any)
+	props["gip-ok"] = map[string]any{
+		"id": "gip-ok", "state": "voting",
+		"members":     []any{map[string]any{"id": "zoe", "weight": 1}},
+		"delegations": []any{},
+		"quorum":      1, "start_at": 0, "deadline": 200, "timelock_end": 300,
+		"actions": []any{}, "ballots": []any{},
+	}
+	withSibling, err := json.MarshalIndent(doc, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	withSibling = append(withSibling, '\n')
+	if err := os.WriteFile(path, withSibling, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s, err := Open(path)
+	if !errors.Is(err, ErrStateCorrupt) || s != nil {
+		if s != nil {
+			s.Close()
+		}
+		t.Fatalf("Open with sibling good proposal: store=%v err=%v", s, err)
+	}
+	if !strings.Contains(err.Error(), `"gip-del"`) || !strings.Contains(err.Error(), "delegations") {
+		t.Fatalf("error must still name the corrupt proposal, got: %v", err)
+	}
+
+	// 句柄打开在完好文件上，随后在文件内加入坏提案：即使查询目标是完好的
+	// gip-ok，也不得返回部分列表。
+	livePath := filepath.Join(t.TempDir(), "live.json")
+	if err := os.WriteFile(livePath, good, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	live, err := Open(livePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer live.Close()
+	if err := os.WriteFile(livePath, withSibling, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, qerr := live.VoteProposal("gip-ok"); !errors.Is(qerr, ErrStateCorrupt) {
+		t.Fatalf("querying the intact sibling must still fail: ok=%v err=%v", ok, qerr)
+	}
+	if _, qerr := live.VoteProposals(); !errors.Is(qerr, ErrStateCorrupt) {
+		t.Fatalf("listing proposals must not skip the bad one: err=%v", qerr)
+	}
+	if _, verr := live.CastVote("gip-ok", "zoe", true, 100); !errors.Is(verr, ErrStateCorrupt) {
+		t.Fatalf("voting on the intact sibling must still fail: err=%v", verr)
+	}
+	if got, rerr := os.ReadFile(livePath); rerr != nil || string(got) != string(withSibling) {
+		t.Fatalf("failed ops rewrote or normalized the state file")
+	}
+}

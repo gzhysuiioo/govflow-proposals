@@ -282,6 +282,14 @@ func validateStoredTally(id string, t *storedTally) error {
 
 // storedVoteProposal 按成员提交顺序保存成员与委托（顺序不影响相等性），
 // 动作文本与顺序原样保存（顺序影响相等性）。
+//
+// delegations 必须明确写出且为 JSON 数组：委托记录决定成员的完整委托路径、
+// 最终代表与归集票重，谁能直接投票完全由它派生。字段缺失或为 null 绝不能
+// 被解释成“撤回全部委托”——那样已委托成员会被显示成各自代表、还能直接
+// 投票，悄悄改变投票资格；写成对象、字符串等其它类型同样不合法。缺少
+// 记录不能按零值补出，因此解码时保留 delegations 的原始 JSON，由
+// validateVoteProposalDelegations 区分“缺失/空值/类型不符”。明确写出的
+// 空数组仍表示无人委托，成员各自代表自己、按原始权重投票。
 type storedVoteProposal struct {
 	ID          string             `json:"id"`
 	State       string             `json:"state"`
@@ -294,6 +302,60 @@ type storedVoteProposal struct {
 	Actions     []string           `json:"actions"`
 	Ballots     []storedBallot     `json:"ballots"`
 	Tally       *storedTally       `json:"tally,omitempty"`
+
+	delegationsRaw json.RawMessage
+	// delegationsShapeErr 记录数组元素形状与 []storedDelegation 不符时的解码
+	// 错误（如元素写成数字、字符串、from/to 不是字符串）。外层 UnmarshalJSON
+	// 不直接返回它，以免解码器抢在 validateVoteProposalDelegations 之前给出
+	// 不含提案编号的通用错误；判定与错误文案统一由该校验函数负责。
+	delegationsShapeErr error
+}
+
+// storedVoteProposalJSONShape 只用于解码，按保存格式的字段名逐字接住
+// delegations 的原始 JSON；其余字段直接按目标类型解码。
+type storedVoteProposalJSONShape struct {
+	ID          string          `json:"id"`
+	State       string          `json:"state"`
+	Members     []storedMember  `json:"members"`
+	Delegations json.RawMessage `json:"delegations"`
+	Quorum      int64           `json:"quorum"`
+	StartAt     int64           `json:"start_at"`
+	Deadline    int64           `json:"deadline"`
+	TimelockEnd int64           `json:"timelock_end"`
+	Actions     []string        `json:"actions"`
+	Ballots     []storedBallot  `json:"ballots"`
+	Tally       *storedTally    `json:"tally,omitempty"`
+}
+
+// UnmarshalJSON 保留 delegations 是否出现及其原始写法（缺失为 nil、null 为
+// "null"），使“字段缺失/显式 null/写错类型”与“明确写出空数组”在解码后仍可
+// 区分：encoding/json 直接解进 []storedDelegation 会把前三种情况都折叠成
+// nil 切片，恰好与无人委托无法区分，已委托成员就会被当成各自代表。判定统一
+// 交给 validateVoteProposalDelegations，此处只在字段确实是 JSON 数组时填充
+// 委托列表（元素形状由解码器核对，类型不符直接报错）。
+func (p *storedVoteProposal) UnmarshalJSON(data []byte) error {
+	var shape storedVoteProposalJSONShape
+	if err := json.Unmarshal(data, &shape); err != nil {
+		return err
+	}
+	p.ID = shape.ID
+	p.State = shape.State
+	p.Members = shape.Members
+	p.Quorum = shape.Quorum
+	p.StartAt = shape.StartAt
+	p.Deadline = shape.Deadline
+	p.TimelockEnd = shape.TimelockEnd
+	p.Actions = shape.Actions
+	p.Ballots = shape.Ballots
+	p.Tally = shape.Tally
+	p.delegationsRaw = shape.Delegations
+	if jsonValueType(shape.Delegations) == "array" {
+		// 元素形状非法时不在此返回：让整份文档解码通过，由
+		// validateVoteProposalDelegations 统一给出带提案编号与字段名的
+		// “类型不符”原因，而不是退化成不含提案定位的解码器通用错误。
+		p.delegationsShapeErr = json.Unmarshal(shape.Delegations, &p.Delegations)
+	}
+	return nil
 }
 
 // ---- 校验与派生 ----
@@ -570,6 +632,10 @@ func (s *Store) CreateVoteProposal(in *CreateVoteInput) (view *VoteProposalView,
 	for _, d := range in.Delegations {
 		stored.Delegations = append(stored.Delegations, storedDelegation{From: d.From, To: d.To})
 	}
+	// 同步填上字段原始片段，使“提交前校验”与“打开重放校验”走同一份
+	// delegations 判定时不会把本进程新建的提案误判为字段缺失。创建时不提供
+	// 委托是合法的：空数组明确写出即表示无人委托。
+	stored.delegationsRaw, _ = json.Marshal(stored.Delegations)
 	state.VoteProposals[in.ID] = stored
 	if err := s.commitLocked(state); err != nil {
 		return nil, false, err
@@ -903,6 +969,42 @@ func specOf(p *storedVoteProposal) (*proposalSpec, error) {
 	return validateProposalInput(in)
 }
 
+// requiredArrayProblem 统一判定一个“必须明确写出的 JSON 数组”字段的原始
+// JSON：字段未写出返回 is missing、显式为 null 返回 is null、写成对象/字符串/
+// 数字/布尔等其它类型返回带期望与实际类型的类型不符原因；合法数组（含空
+// 数组）返回空串。与 requiredScalarProblem 同理，缺失绝不补成空数组。
+func requiredArrayProblem(raw json.RawMessage) string {
+	switch {
+	case raw == nil:
+		return "is missing"
+	case jsonValueType(raw) == "null":
+		return "is null"
+	case jsonValueType(raw) != "array":
+		return fmt.Sprintf("has wrong type: want array, got %s", jsonValueType(raw))
+	}
+	return ""
+}
+
+// validateVoteProposalDelegations 严格判定一项已保存投票提案的 delegations：
+// 字段必须明确写出且为 JSON 数组。字段缺失、显式为 null 或写成对象/字符串等
+// 其它类型都返回带提案编号与字段名的错误，由 validateState 判整份状态文件
+// 损坏——委托记录决定完整路径、最终代表与归集票重，缺少记录不能被解释成
+// “撤回委托”，即使提案尚未投票、票据与计票结论仍能复核也不例外；未投票、
+// 已计票与已执行的提案适用同一条要求。明确写出的空数组是合法的无人委托
+// 列表，成员各自代表自己、按原始权重投票，不与缺失混同。
+func validateVoteProposalDelegations(p *storedVoteProposal) error {
+	if problem := requiredArrayProblem(p.delegationsRaw); problem != "" {
+		return fmt.Errorf("voting proposal %q field %q %s", p.ID, "delegations", problem)
+	}
+	// 数组写出但元素形状与委托记录不符（元素不是对象、或 from/to 类型不对等）：
+	// 解码错误被延后到这里统一报告，原因同样指出提案编号与 delegations，并
+	// 归为类型不符；这类数组不能被当成“无人委托”的空列表接受。
+	if p.delegationsShapeErr != nil {
+		return fmt.Errorf("voting proposal %q field %q has wrong type: %v", p.ID, "delegations", p.delegationsShapeErr)
+	}
+	return nil
+}
+
 // validateVoteProposals 在打开状态文件时严格校验全部投票提案：
 // 编号与 register 来源不冲突；状态机与计票结论一致；票重/代表与名单及委托明细一致；
 // 首次投票时间落在窗口内；首次计票不早于截止且结论可由明细重放。
@@ -921,6 +1023,13 @@ func validateVoteProposals(state *storedState) error {
 		case "voting", "passed", "rejected", "executed":
 		default:
 			return fmt.Errorf("voting proposal %q has unknown state %q", p.ID, p.State)
+		}
+		// delegations 决定委托路径、最终代表与归集票重，必须明确写出且为 JSON
+		// 数组。先于 specOf 的派生核对执行：字段缺损时直接判整份文件损坏，
+		// 绝不能把缺失记录折叠成空委托列表后再按“无人委托”继续查询、投票或
+		// 复核计票——未投票、已计票与已执行的提案适用同一条要求。
+		if err := validateVoteProposalDelegations(p); err != nil {
+			return err
 		}
 		spec, err := specOf(p)
 		if err != nil {
