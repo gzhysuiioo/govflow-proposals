@@ -109,6 +109,263 @@ func assertGovernanceUnchanged(t *testing.T, store *Store, id string, actions []
 	}
 }
 
+// TestExecutedProposalBallotRetryReturnsOriginal：提案真实经过成员投票、截止
+// 计票与到期执行（资金库已完成转账）之后，原投票入口仍是取回首次票据的通道。
+// 重点场景：dave 承接多跳委托（bob→carol→dave，归集 150+100+200=450）投反对，
+// alice（300）与 erin（250）的赞成权重仍恰好达到法定人数 1000 并形成严格多数
+// （550 > 450），提案成功执行。执行之后：
+//   - 反对代表与赞成代表用同一选择重试（时间在窗口之前或之后）都返回首次票据：
+//     原代表编号、完整归集权重（不是代表本人的原始权重）、选择与首次投票时间；
+//   - 反对代表改投赞成报改投冲突（ErrProposalConflict），不能覆盖原票，
+//     也不能因提案已执行而退化成普通的投票关闭错误；
+//   - 始终未投票的 frank 即使用窗口内时间首次投票，也因已计票被拒绝，
+//     不能借旧时间追加票据；
+//   - 以上成功与失败都不落盘任何变化：查询仍展示 executed，票据数量/顺序/
+//     选择/权重/首次时间、首次计票权重与时间、资金库与收款账户余额、唯一的
+//     成功凭据（执行时间与动作留痕）全部保持首次执行后的原值。
+func TestExecutedProposalBallotRetryReturnsOriginal(t *testing.T) {
+	store, path := openTempStore(t, 1000)
+	defer store.Close()
+
+	// 多跳委托链 bob→carol→dave：dave 是承接两跳委托的最终代表。
+	// 成员总权重 1090，法定人数 1000；frank（90）始终不投票。
+	in := &CreateVoteInput{
+		ID: "gip-exec",
+		Members: []VoteMember{
+			{ID: "alice", Weight: 300},
+			{ID: "bob", Weight: 150},
+			{ID: "carol", Weight: 100},
+			{ID: "dave", Weight: 200},
+			{ID: "erin", Weight: 250},
+			{ID: "frank", Weight: 90},
+		},
+		Delegations: []Delegation{{From: "bob", To: "carol"}, {From: "carol", To: "dave"}},
+		Quorum:      1000,
+		StartAt:     100,
+		Deadline:    200,
+		TimelockEnd: 300,
+		Actions:     []string{"transfer:audits:250", "transfer:legal:150"},
+	}
+	mustCreateVote(t, store, in)
+
+	// 窗口内投票：alice、erin 各自代表自己投赞成；dave 代表多跳链投反对。
+	// dave 的票重必须是归集权重 450（含沿途的 bob、carol），不是其本人的 200。
+	if b, err := store.CastVote("gip-exec", "alice", true, 150); err != nil ||
+		b.Representative != "alice" || b.Weight != 300 || !b.Support || b.VotedAt != 150 {
+		t.Fatalf("alice first ballot=%+v err=%v, want alice/300/for/150", b, err)
+	}
+	if b, err := store.CastVote("gip-exec", "erin", true, 155); err != nil ||
+		b.Representative != "erin" || b.Weight != 250 || !b.Support || b.VotedAt != 155 {
+		t.Fatalf("erin first ballot=%+v err=%v, want erin/250/for/155", b, err)
+	}
+	if b, err := store.CastVote("gip-exec", "dave", false, 160); err != nil ||
+		b.Representative != "dave" || b.Weight != 450 || b.Support || b.VotedAt != 160 {
+		t.Fatalf("dave first ballot=%+v err=%v, want dave/450/against/160 (multi-hop aggregate)", b, err)
+	}
+
+	// 截止时刻计票：参与量 1000 恰好达到法定人数，赞成 550 严格多于反对 450。
+	res, err := store.TallyVote("gip-exec", 200)
+	if err != nil {
+		t.Fatalf("tally: %v", err)
+	}
+	if !res.Passed || res.ForWeight != 550 || res.AgainstWeight != 450 ||
+		res.Turnout != 1000 || res.Quorum != 1000 || res.TalliedAt != 200 {
+		t.Fatalf("tally=%+v, want passed for=550 against=450 turnout=1000 quorum=1000 tallied=200", res)
+	}
+
+	// 时间锁到期执行：两笔转账真实落账，资金库 1000→600。
+	receipt, err := store.Execute("gip-exec", 300)
+	if err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	if receipt.Order != 0 || receipt.ExecutedAt != 300 || len(receipt.Actions) != 2 {
+		t.Fatalf("receipt=%+v, want order=0 executed_at=300 with 2 actions", receipt)
+	}
+
+	// 使用条件守卫：被保护的提案必须确实经过成员投票、截止计票与到期执行，
+	// 直接 register 的已通过提案没有这份投票留痕，不能代替本场景。
+	mustRegister(t, store, "gip-plain", 0, "transfer:audits:1")
+	if _, ok, err := store.VoteProposal("gip-plain"); err != nil || ok {
+		t.Fatalf("registered proposal must not carry a voting trace: ok=%v err=%v", ok, err)
+	}
+	guard, ok, err := store.VoteProposal("gip-exec")
+	if err != nil || !ok {
+		t.Fatalf("VoteProposal(gip-exec): ok=%v err=%v", ok, err)
+	}
+	if guard.Source != "vote" || guard.State != "executed" || len(guard.Ballots) != 3 || guard.Tally == nil {
+		t.Fatalf("protected proposal must be a genuinely voted+tallied+executed one: %+v", guard)
+	}
+
+	// 查询中的原始票据记录：重试返回的票据必须与它逐字段一致。
+	wantBallots := guard.Ballots
+
+	// 成功重试与两类失败都不得落盘任何变化：记录当前状态文件字节。
+	beforeBytes, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// ---- 已执行提案上的同选择重试：反对代表与赞成代表都取回首次票据 ----
+	// 重试时间早于开始时刻（50）或晚于截止时刻（9999）都不能替换原票时间，
+	// 也不能重新套用首次投票的时间窗口。
+	for _, now := range []int64{50, 9999} {
+		b, err := store.CastVote("gip-exec", "dave", false, now)
+		if err != nil {
+			t.Fatalf("dave retry against at now=%d: %v", now, err)
+		}
+		if *b != wantBallots[2] {
+			t.Fatalf("dave retry at now=%d got %+v, want original ballot %+v", now, *b, wantBallots[2])
+		}
+		if b.Weight != 450 {
+			t.Fatalf("dave retry weight=%d, want aggregated 450 (not dave's own 200)", b.Weight)
+		}
+	}
+	for _, now := range []int64{50, 9999} {
+		b, err := store.CastVote("gip-exec", "alice", true, now)
+		if err != nil {
+			t.Fatalf("alice retry for at now=%d: %v", now, err)
+		}
+		if *b != wantBallots[0] {
+			t.Fatalf("alice retry at now=%d got %+v, want original ballot %+v", now, *b, wantBallots[0])
+		}
+	}
+	if b, err := store.CastVote("gip-exec", "erin", true, 9999); err != nil || *b != wantBallots[1] {
+		t.Fatalf("erin retry got %+v err=%v, want original ballot %+v", b, err, wantBallots[1])
+	}
+
+	// ---- 改投另一选择：明确报改投冲突，不能覆盖成赞成票，也不能只报投票关闭 ----
+	_, changeErr := store.CastVote("gip-exec", "dave", true, 150)
+	if !errors.Is(changeErr, ErrProposalConflict) {
+		t.Fatalf("dave change vote err=%v, want ErrProposalConflict", changeErr)
+	}
+	if errors.Is(changeErr, ErrVoteRejected) {
+		t.Fatalf("dave change vote must not degrade to a plain voting-closed error: %v", changeErr)
+	}
+
+	// ---- 始终未投票的 frank：即使提供窗口内时间，也因已计票被拒绝 ----
+	// 不能借旧时间追加票据；两种选择都不允许。
+	for _, attempt := range []struct {
+		support bool
+		now     int64
+	}{{true, 150}, {false, 160}} {
+		_, err := store.CastVote("gip-exec", "frank", attempt.support, attempt.now)
+		if !errors.Is(err, ErrVoteRejected) {
+			t.Fatalf("frank first vote after execution (support=%v now=%d) err=%v, want ErrVoteRejected",
+				attempt.support, attempt.now, err)
+		}
+		if !strings.Contains(err.Error(), "already been tallied") {
+			t.Fatalf("frank rejection must cite the completed tally, not the time window: %v", err)
+		}
+	}
+
+	// 成功重试与上述失败都没有向状态文件写入任何变化。
+	afterBytes, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(afterBytes) != string(beforeBytes) {
+		t.Fatal("ballot retries / rejected votes on an executed proposal wrote to the state file")
+	}
+
+	// assertExecutedTrace 断言全部留痕保持首次执行后的原值：查询展示 executed，
+	// 成员委托路径、逐票明细、首次计票结论、余额与唯一凭据都不变。
+	assertExecutedTrace := func(t *testing.T, store *Store) {
+		t.Helper()
+		v, ok, err := store.VoteProposal("gip-exec")
+		if err != nil || !ok {
+			t.Fatalf("VoteProposal(gip-exec): ok=%v err=%v", ok, err)
+		}
+		if v.State != "executed" || v.Source != "vote" {
+			t.Fatalf("state=%s source=%s, want executed/vote", v.State, v.Source)
+		}
+		// 多跳委托路径与最终代表保持原值。
+		got := memberPaths(v)
+		if !equalStrings(got["bob"].Path, []string{"bob", "carol", "dave"}) {
+			t.Fatalf("bob path=%v, want [bob carol dave]", got["bob"].Path)
+		}
+		if !equalStrings(got["carol"].Path, []string{"carol", "dave"}) {
+			t.Fatalf("carol path=%v, want [carol dave]", got["carol"].Path)
+		}
+		for id, head := range map[string]string{
+			"alice": "alice", "bob": "dave", "carol": "dave",
+			"dave": "dave", "erin": "erin", "frank": "frank",
+		} {
+			if got[id].Delegate != head {
+				t.Fatalf("member %s final representative=%s, want %s", id, got[id].Delegate, head)
+			}
+		}
+		// 票据数量、顺序、代表、归集权重、选择与首次时间保持原样：
+		// frank 的失败尝试没有追加票据，dave 的改投没有覆盖原票。
+		if len(v.Ballots) != 3 {
+			t.Fatalf("ballots=%+v, want exactly the original 3", v.Ballots)
+		}
+		for i, want := range wantBallots {
+			if v.Ballots[i] != want {
+				t.Fatalf("ballot %d=%+v, want original %+v", i, v.Ballots[i], want)
+			}
+		}
+		// 首次计票的赞成、反对、参与权重与计票时间保持原值。
+		if v.Tally == nil || v.Tally.ForWeight != 550 || v.Tally.AgainstWeight != 450 ||
+			v.Tally.Turnout != 1000 || !v.Tally.Passed || v.Tally.TalliedAt != 200 {
+			t.Fatalf("tally=%+v, want for=550 against=450 turnout=1000 passed tallied=200", v.Tally)
+		}
+		// 资金库与收款账户余额停留在首次执行后的数值。
+		snap, err := store.BalanceSnapshot()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if snap.Treasury != 600 {
+			t.Fatalf("treasury=%d, want 600", snap.Treasury)
+		}
+		if len(snap.Balances) != 2 || snap.Balances["audits"] != 250 || snap.Balances["legal"] != 150 {
+			t.Fatalf("balances=%+v, want audits=250 legal=150 only", snap.Balances)
+		}
+		// 成功执行凭据仍是原来的一份：执行时间与动作留痕（顺序编号、原文、
+		// 资金库与收款账户前后余额）不变。
+		receipts, err := store.Receipts()
+		if err != nil || len(receipts) != 1 {
+			t.Fatalf("receipts=%v err=%v, want exactly the original one", receipts, err)
+		}
+		r := receipts[0]
+		if r.ProposalID != "gip-exec" || r.Order != 0 || r.ExecutedAt != 300 || len(r.Actions) != 2 {
+			t.Fatalf("receipt=%+v, want gip-exec order=0 executed_at=300 with 2 actions", r)
+		}
+		a0, a1 := r.Actions[0], r.Actions[1]
+		if a0.Index != 0 || a0.Action != "transfer:audits:250" ||
+			a0.Treasury.Before != 1000 || a0.Treasury.After != 750 ||
+			a0.Recipient.Account != "audits" || a0.Recipient.Before != 0 || a0.Recipient.After != 250 {
+			t.Fatalf("action 0 trace=%+v, want transfer:audits:250 treasury 1000->750 audits 0->250", a0)
+		}
+		if a1.Index != 1 || a1.Action != "transfer:legal:150" ||
+			a1.Treasury.Before != 750 || a1.Treasury.After != 600 ||
+			a1.Recipient.Account != "legal" || a1.Recipient.Before != 0 || a1.Recipient.After != 150 {
+			t.Fatalf("action 1 trace=%+v, want transfer:legal:150 treasury 750->600 legal 0->150", a1)
+		}
+	}
+	assertExecutedTrace(t, store)
+
+	// 重开状态文件：全部留痕与重试行为在重开后保持一致。
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := Open(path)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer reopened.Close()
+	assertExecutedTrace(t, reopened)
+	if b, err := reopened.CastVote("gip-exec", "dave", false, 40); err != nil || *b != wantBallots[2] {
+		t.Fatalf("dave retry after reopen got %+v err=%v, want original ballot %+v", b, err, wantBallots[2])
+	}
+	if _, err := reopened.CastVote("gip-exec", "dave", true, 150); !errors.Is(err, ErrProposalConflict) {
+		t.Fatalf("dave change vote after reopen err=%v, want ErrProposalConflict", err)
+	}
+	if _, err := reopened.CastVote("gip-exec", "frank", true, 150); !errors.Is(err, ErrVoteRejected) {
+		t.Fatalf("frank first vote after reopen err=%v, want ErrVoteRejected", err)
+	}
+	assertExecutedTrace(t, reopened)
+}
+
 // TestPassedVoteProposalExecutionFailureFullyReverts：投票通过提案在时间锁到期
 // 执行一组有序转账，后面的动作才暴露出问题（格式错误 / 前序消耗导致余额不足）时，
 // 整项拒绝必须固定下来——不能只看到返回了错误，也不能用 register 直接登记的
