@@ -1629,7 +1629,8 @@ func TestExplicitFalseAndZeroBallotLegal(t *testing.T) {
 		t.Fatalf("unexpected tally for explicit-false ballot: %+v", res)
 	}
 
-	// 尚未投票的提案允许空票据列表（null 与 [] 两种旧/新写法都合法）。
+	// 尚未投票的提案允许明确写出的空票据列表（缺损/null 的 ballots 字段不
+	// 合法，见 corrupt_ballots 相关回归）。
 	empty, _ := openTempStore(t, 1000)
 	defer empty.Close()
 	mustCreateVote(t, empty, &CreateVoteInput{
