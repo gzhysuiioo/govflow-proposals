@@ -200,22 +200,12 @@ func classifyJSONQuantity(token []byte) (int64, quantityShape) {
 	return value, qtyValid
 }
 
-// recordTextField is one of the three textual members every record carries.
-type recordTextField struct {
-	name  string
-	value string
-}
-
-// recordTextFields lists batch, product and unit in the fixed order in which
-// per-field problems are reported, so every validation entry point iterates
-// the same three members.
-func recordTextFields(batch, product, unit string) []recordTextField {
-	return []recordTextField{
-		{"batch", batch},
-		{"product", product},
-		{"unit", unit},
-	}
-}
+// textFieldNames lists the three textual members every record carries, in the
+// fixed order in which per-field problems are reported: batch, product, unit.
+// It is the single source of field names and field order for the decoded-record
+// checker (decoded.go); the strict JSON readers in this file address the same
+// members by name, which keeps those names stable.
+var textFieldNames = [3]string{"batch", "product", "unit"}
 
 // safeBatchIDForError returns id exactly when it may be cited in an error:
 // non-empty and valid UTF-8. An empty or malformed id yields "" so no value
@@ -225,12 +215,6 @@ func safeBatchIDForError(id string) string {
 		return id
 	}
 	return ""
-}
-
-// quantityInRange reports whether an already-decoded quantity lies in the
-// accepted 1..MaxQuantity window shared by every entry point.
-func quantityInRange(quantity int64) bool {
-	return quantity >= 1 && quantity <= MaxQuantity
 }
 
 // These wrappers keep the registry-specific reason strings next to the

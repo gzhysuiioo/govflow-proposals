@@ -807,27 +807,30 @@ type ImportResult struct {
 // in its reason and cites the batch id only when that id is itself
 // non-empty, valid UTF-8 text; it is never invented or substituted when the
 // batch field is empty or malformed.
+//
+// The checks themselves come from checkDecodedRecord; this wrapper only keeps
+// the direct-import reporting order — an encoding problem in any of the three
+// text fields first, then an empty text field, then the quantity — and the
+// import-specific error type and wording.
 func validateManifestInput(in Input, pos int) error {
 	// batchID is "" whenever the batch field itself is empty or malformed, so
 	// it is safe to attach it to whichever error follows.
 	batchID := safeBatchIDForError(in.Batch)
-	textFields := recordTextFields(in.Batch, in.Product, in.Unit)
-	for _, tv := range textFields {
-		if !utf8.ValidString(tv.value) {
-			return &ManifestRecordError{Position: pos, Batch: batchID, Reason: (&EncodingError{Field: tv.name}).Error()}
-		}
+	fail := func(reason string) error {
+		return &ManifestRecordError{Position: pos, Batch: batchID, Reason: reason}
 	}
-	for _, tv := range textFields {
-		if tv.value == "" {
-			return &ManifestRecordError{Position: pos, Batch: batchID, Reason: fmt.Sprintf("field %q must not be empty", tv.name)}
-		}
+	faults := checkDecodedRecord(in.Batch, in.Product, in.Unit, in.Quantity)
+	if field, ok := faults.firstTextFault(textFieldInvalidUTF8); ok {
+		return fail((&EncodingError{Field: field}).Error())
 	}
-	if in.Quantity <= 0 {
-		return &ManifestRecordError{Position: pos, Batch: batchID, Reason: `field "quantity" must be greater than zero`}
+	if field, ok := faults.firstTextFault(textFieldEmpty); ok {
+		return fail(fmt.Sprintf("field %q must not be empty", field))
 	}
-	if in.Quantity > MaxQuantity {
-		return &ManifestRecordError{Position: pos, Batch: batchID,
-			Reason: fmt.Sprintf("field %q must be an integer no greater than %d", "quantity", MaxQuantity)}
+	switch faults.quantity {
+	case quantityNotPositive:
+		return fail(`field "quantity" must be greater than zero`)
+	case quantityTooLarge:
+		return fail(fmt.Sprintf("field %q must be an integer no greater than %d", "quantity", MaxQuantity))
 	}
 	return nil
 }
@@ -920,15 +923,17 @@ func Register(reg *Registry, in Input) (Outcome, error) {
 	if reg.Version != FormatVersion {
 		return Outcome{}, fmt.Errorf("unsupported registry version %d", reg.Version)
 	}
-	if in.Batch == "" || in.Product == "" || in.Unit == "" {
+	// Reporting order for one record: any empty text field first, then the
+	// first malformed text field, then the quantity. The rules and field order
+	// come from checkDecodedRecord; only the errors are Register-specific.
+	faults := checkDecodedRecord(in.Batch, in.Product, in.Unit, in.Quantity)
+	if _, empty := faults.firstTextFault(textFieldEmpty); empty {
 		return Outcome{}, errors.New("batch, product and unit must be non-empty")
 	}
-	for _, tv := range recordTextFields(in.Batch, in.Product, in.Unit) {
-		if !utf8.ValidString(tv.value) {
-			return Outcome{}, &EncodingError{Field: tv.name}
-		}
+	if field, ok := faults.firstTextFault(textFieldInvalidUTF8); ok {
+		return Outcome{}, &EncodingError{Field: field}
 	}
-	if !quantityInRange(in.Quantity) {
+	if faults.quantity != quantityOK {
 		return Outcome{}, fmt.Errorf("quantity must be a positive integer no greater than %d", MaxQuantity)
 	}
 	for _, b := range reg.Batches {
@@ -955,21 +960,27 @@ func Register(reg *Registry, in Input) (Outcome, error) {
 // positions, even when the two records are identical: Save persists records,
 // it never confirms duplicates or merges them. Text is checked verbatim —
 // no trimming, no case folding — and reg is never modified.
+//
+// The validity rules come from checkDecodedRecord; only Save's reporting
+// order stays here: fields are scanned in batch, product, unit order with a
+// field's encoding fault outranking its empty value, quantity follows, and
+// the duplicate-id check remains last.
 func validateForSave(reg *Registry) error {
 	seen := make(map[string]int, len(reg.Batches))
 	for i, b := range reg.Batches {
 		pos := i + 1
 		batchID := safeBatchIDForError(b.Batch)
-		for _, tv := range recordTextFields(b.Batch, b.Product, b.Unit) {
-			if !utf8.ValidString(tv.value) {
-				return &FormatError{Position: pos, Batch: batchID, Field: tv.name,
+		faults := checkDecodedRecord(b.Batch, b.Product, b.Unit, b.Quantity)
+		for i, name := range textFieldNames {
+			switch faults.text[i] {
+			case textFieldInvalidUTF8:
+				return &FormatError{Position: pos, Batch: batchID, Field: name,
 					Reason: "must be valid UTF-8 text: malformed bytes are rejected instead of being replaced with U+FFFD"}
-			}
-			if tv.value == "" {
-				return &FormatError{Position: pos, Batch: batchID, Field: tv.name, Reason: "must not be empty"}
+			case textFieldEmpty:
+				return &FormatError{Position: pos, Batch: batchID, Field: name, Reason: "must not be empty"}
 			}
 		}
-		if !quantityInRange(b.Quantity) {
+		if faults.quantity != quantityOK {
 			return &FormatError{Position: pos, Batch: batchID, Field: "quantity",
 				Reason: fmt.Sprintf("must be between 1 and %d", MaxQuantity)}
 		}
