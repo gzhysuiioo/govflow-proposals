@@ -145,8 +145,8 @@ func TestSaveWriteFailureKeepsExistingRegistryIntact(t *testing.T) {
 
 	cause := errors.New("injected write failure: disk full")
 	writeAttempted := false
-	old := writeTempContent
-	writeTempContent = func(f *os.File, data []byte) (int, error) {
+	old := WriteTempContent
+	WriteTempContent = func(f *os.File, data []byte) (int, error) {
 		writeAttempted = true
 		// Part of the new content genuinely reaches the temporary file before
 		// the write fails, so the save aborts with the write incomplete.
@@ -156,7 +156,7 @@ func TestSaveWriteFailureKeepsExistingRegistryIntact(t *testing.T) {
 		}
 		return half, cause
 	}
-	t.Cleanup(func() { writeTempContent = old })
+	t.Cleanup(func() { WriteTempContent = old })
 
 	submitted := failureSubmission()
 	reg := &Registry{Version: FormatVersion, Batches: append([]Batch(nil), submitted...)}
@@ -180,8 +180,8 @@ func TestSaveRenameFailureKeepsExistingRegistryIntact(t *testing.T) {
 
 	cause := errors.New("injected rename failure: cannot replace target")
 	renameAttempted := false
-	old := renameTempFile
-	renameTempFile = func(oldpath, newpath string) error {
+	old := RenameTempFile
+	RenameTempFile = func(oldpath, newpath string) error {
 		renameAttempted = true
 		if newpath != path {
 			t.Errorf("rename must target the actual save path %q, got %q", path, newpath)
@@ -198,7 +198,7 @@ func TestSaveRenameFailureKeepsExistingRegistryIntact(t *testing.T) {
 		}
 		return cause
 	}
-	t.Cleanup(func() { renameTempFile = old })
+	t.Cleanup(func() { RenameTempFile = old })
 
 	submitted := failureSubmission()
 	reg := &Registry{Version: FormatVersion, Batches: append([]Batch(nil), submitted...)}
@@ -217,20 +217,20 @@ func TestSaveRenameFailureKeepsExistingRegistryIntact(t *testing.T) {
 // survive.
 func TestSaveFailureOnMissingTargetLeavesNoFile(t *testing.T) {
 	injectWriteFailure := func(t *testing.T, cause error) {
-		old := writeTempContent
-		writeTempContent = func(f *os.File, data []byte) (int, error) {
+		old := WriteTempContent
+		WriteTempContent = func(f *os.File, data []byte) (int, error) {
 			half := len(data) / 2
 			if _, err := f.Write(data[:half]); err != nil {
 				return 0, err
 			}
 			return half, cause
 		}
-		t.Cleanup(func() { writeTempContent = old })
+		t.Cleanup(func() { WriteTempContent = old })
 	}
 	injectRenameFailure := func(t *testing.T, cause error) {
-		old := renameTempFile
-		renameTempFile = func(oldpath, newpath string) error { return cause }
-		t.Cleanup(func() { renameTempFile = old })
+		old := RenameTempFile
+		RenameTempFile = func(oldpath, newpath string) error { return cause }
+		t.Cleanup(func() { RenameTempFile = old })
 	}
 	cases := []struct {
 		name   string

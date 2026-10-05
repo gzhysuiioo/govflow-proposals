@@ -982,15 +982,17 @@ func validateForSave(reg *Registry) error {
 	return nil
 }
 
-// writeTempContent and renameTempFile are the two failure-prone steps of the
+// WriteTempContent and RenameTempFile are the two failure-prone steps of the
 // atomic save — writing the new content into the temporary file, and replacing
 // the target with it — kept behind package-level variables so the regression
-// tests can make a chosen step of a real save fail deterministically, on the
+// tests (including the batch-import entry-point tests in the cmd/govflow
+// package) can make a chosen step of a real save fail deterministically, on the
 // save's actual target rather than a neighboring unusable path. Production
-// behavior is exactly the wrapped os operations.
+// behavior is exactly the wrapped os operations; production code never swaps
+// them.
 var (
-	writeTempContent = func(f *os.File, data []byte) (int, error) { return f.Write(data) }
-	renameTempFile   = os.Rename
+	WriteTempContent = func(f *os.File, data []byte) (int, error) { return f.Write(data) }
+	RenameTempFile   = os.Rename
 )
 
 // Save atomically writes reg to path, replacing the file only after the new
@@ -1050,7 +1052,7 @@ func Save(path string, reg *Registry) error {
 		os.Remove(tmpName)
 		return fmt.Errorf("cannot save registry %q: %w", path, cause)
 	}
-	if _, err := writeTempContent(tmp, buf.Bytes()); err != nil {
+	if _, err := WriteTempContent(tmp, buf.Bytes()); err != nil {
 		return abort(err)
 	}
 	if err := tmp.Chmod(mode); err != nil {
@@ -1063,7 +1065,7 @@ func Save(path string, reg *Registry) error {
 		os.Remove(tmpName)
 		return fmt.Errorf("cannot save registry %q: %w", path, err)
 	}
-	if err := renameTempFile(tmpName, path); err != nil {
+	if err := RenameTempFile(tmpName, path); err != nil {
 		os.Remove(tmpName)
 		return fmt.Errorf("cannot save registry %q: %w", path, err)
 	}
