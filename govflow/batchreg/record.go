@@ -227,10 +227,78 @@ func safeBatchIDForError(id string) string {
 	return ""
 }
 
+// textIssueKind classifies one problem with an already-decoded text field.
+type textIssueKind int
+
+const (
+	textEmpty    textIssueKind = iota // the empty string; whitespace-only text is not empty
+	textEncoding                      // the bytes are not valid UTF-8
+)
+
+// textIssue is one problem with one text field of an already-decoded record.
+type textIssue struct {
+	field string // "batch", "product" or "unit"
+	kind  textIssueKind
+}
+
+// inspectRecordText examines the three text fields of an already-decoded
+// record and lists every problem found, in the fixed batch, product, unit
+// field order with a field's encoding problem listed before its empty-string
+// problem. Text is checked verbatim — no trimming, no case folding — so
+// whitespace-only text counts as ordinary non-empty text. This is the single
+// definition of the text rules for the three entry points that validate
+// decoded records (Register, Import and Save); each of them picks which issue
+// to report first according to its own documented ordering.
+func inspectRecordText(batch, product, unit string) []textIssue {
+	var issues []textIssue
+	for _, tv := range recordTextFields(batch, product, unit) {
+		if !utf8.ValidString(tv.value) {
+			issues = append(issues, textIssue{field: tv.name, kind: textEncoding})
+		}
+		if tv.value == "" {
+			issues = append(issues, textIssue{field: tv.name, kind: textEmpty})
+		}
+	}
+	return issues
+}
+
+// firstTextIssue returns the first issue of the given kind, if any.
+func firstTextIssue(issues []textIssue, kind textIssueKind) (textIssue, bool) {
+	for _, issue := range issues {
+		if issue.kind == kind {
+			return issue, true
+		}
+	}
+	return textIssue{}, false
+}
+
+// decodedQuantityProblem classifies an already-decoded quantity against the
+// accepted 1..MaxQuantity window shared by every entry point.
+type decodedQuantityProblem int
+
+const (
+	decodedQtyOK decodedQuantityProblem = iota
+	decodedQtyNotPositive
+	decodedQtyAboveMax
+)
+
+// classifyDecodedQuantity is the single quantity rule for already-decoded
+// records; the callers decide how each class is phrased.
+func classifyDecodedQuantity(quantity int64) decodedQuantityProblem {
+	switch {
+	case quantity <= 0:
+		return decodedQtyNotPositive
+	case quantity > MaxQuantity:
+		return decodedQtyAboveMax
+	default:
+		return decodedQtyOK
+	}
+}
+
 // quantityInRange reports whether an already-decoded quantity lies in the
 // accepted 1..MaxQuantity window shared by every entry point.
 func quantityInRange(quantity int64) bool {
-	return quantity >= 1 && quantity <= MaxQuantity
+	return classifyDecodedQuantity(quantity) == decodedQtyOK
 }
 
 // These wrappers keep the registry-specific reason strings next to the
