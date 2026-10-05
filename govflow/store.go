@@ -135,6 +135,14 @@ func (a *ActionReceipt) UnmarshalJSON(data []byte) error {
 // Receipt 是一项提案首次成功执行后生成的执行凭据。
 // 一项提案只允许成功一次；重试返回同一份凭据。
 //
+// 成功执行必须实际包含至少一项动作（与首次执行入口“动作非空才可执行”是
+// 同一条规则）：actions 必须明确写出、为 JSON 数组且至少有一项动作留痕。
+// 字段缺失、为 null、写成其它 JSON 类型或读出后没有任何动作都不得当作一份
+// 成功记录——即使提案动作数同样为零、凭据序号与执行时间合法、余额也能核对
+// 一致（见 validateReceiptActions）。因此解码时保留 actions 的原始 JSON，
+// 使“字段缺失/null/类型不符”与“明确写出的空数组”都能被明确拒绝，而不是
+// 被折叠成空切片后因“条数相等、重放无变动”被误当成合法凭据。
+//
 // executed_at 必须明确写出且不得早于对应提案的 timelock_end：首次执行只在
 // now 达到时间锁后发生，保存的凭据必须满足同一条执行资格规则。字段缺失、
 // 为 null 或类型不符都不得被折叠成 0 再当作合法凭据读出，因此解码时保留
@@ -147,6 +155,13 @@ type Receipt struct {
 
 	executedAtRaw json.RawMessage
 	orderRaw      json.RawMessage
+	actionsRaw    json.RawMessage
+	// actionsShapeErr 记录 actions 数组元素形状与 []ActionReceipt 不符时的
+	// 解码错误（如元素写成数字、字符串，或其中的 treasury/recipient 不是
+	// 对象）。外层 UnmarshalJSON 不直接返回它，以免解码器抢在
+	// validateReceiptActions 之前给出不含提案编号的通用错误；判定与错误
+	// 文案统一由该校验函数负责。
+	actionsShapeErr error
 }
 
 // receiptJSONShape 只用于解码，按保存格式的字段名逐字接住每个字段的原始 JSON。
@@ -154,25 +169,42 @@ type receiptJSONShape struct {
 	ProposalID string          `json:"proposal_id"`
 	ExecutedAt json.RawMessage `json:"executed_at"`
 	Order      json.RawMessage `json:"order"`
-	Actions    []ActionReceipt `json:"actions"`
+	Actions    json.RawMessage `json:"actions"`
 }
 
-// UnmarshalJSON 保留 executed_at/order 是否出现及其原始写法（缺失为 nil、null 为
-// "null"），使“字段缺失”与“显式写出 0”在解码后仍可区分：encoding/json 直接
-// 解进 int64 会把缺失/null/类型不符都折叠成 0，第一份凭据缺失 order 时就会被
-// 误当成合法编号 0。判定统一交给 validateState，此处只在字段确实是 int64
-// 整数时填充 ExecutedAt/Order。
+// UnmarshalJSON 保留 executed_at/order/actions 是否出现及其原始写法（缺失为
+// nil、null 为 "null"），使“字段缺失”与“显式写出 0/空数组”在解码后仍可
+// 区分：encoding/json 直接解进标量会把缺失/null/类型不符折叠成 0，直接解进
+// 切片会把缺失/null 折叠成 nil，空动作凭据就会因“重放无变动”被误认成合法
+// 成功记录。actions 只在字段确实是 JSON 数组时填充动作列表，元素形状错误
+// 同样记录下来，由 validateReceiptActions 延后统一报出带提案编号的原因；
+// executed_at/order 在字段确实是 int64 整数时填充值。
 func (r *Receipt) UnmarshalJSON(data []byte) error {
 	var shape receiptJSONShape
 	if err := json.Unmarshal(data, &shape); err != nil {
 		return err
 	}
 	r.ProposalID = shape.ProposalID
-	r.Actions = shape.Actions
 	r.executedAtRaw = shape.ExecutedAt
 	r.orderRaw = shape.Order
+	r.actionsRaw = shape.Actions
 	fillInt64(shape.ExecutedAt, &r.ExecutedAt)
 	fillInt64(shape.Order, &r.Order)
+	if jsonValueType(shape.Actions) == "array" {
+		// 元素形状非法时不在此返回：让整份文档解码通过，由
+		// validateReceiptActions 统一给出带提案编号的“类型不符”原因，而不
+		// 是退化成不含提案定位的解码器通用错误。
+		r.actionsShapeErr = json.Unmarshal(shape.Actions, &r.Actions)
+		if r.actionsShapeErr == nil {
+			// 规范化为压缩 JSON：actionsRaw 只用于“字段是否明确写出、是否
+			// 为数组、是否为空”的判定，文件里的缩进不影响结论；统一压缩后
+			// 本进程首次执行构造的凭据（压缩 JSON）与重开文件读出的凭据
+			// （原文带缩进）在逐字节比较时仍保持同一份记录。
+			if canonical, err := json.Marshal(r.Actions); err == nil {
+				r.actionsRaw = canonical
+			}
+		}
+	}
 	return nil
 }
 
@@ -643,6 +675,9 @@ func (s *Store) Execute(id string, now int64) (*Receipt, error) {
 	for i, st := range steps {
 		receipt.Actions = append(receipt.Actions, st.actionReceipt(i, target.actions[i]))
 	}
+	// actionsRaw 在动作留痕填充完成后再序列化：内容必须与 Actions 一致，
+	// 提交前 validateState 才能与读取路径走同一份“数组且非空”判定。
+	receipt.actionsRaw, _ = json.Marshal(receipt.Actions)
 	state.Treasury = simTreasury
 	state.Balances = simBalances
 	target.markExecuted()
@@ -1018,6 +1053,14 @@ func validateState(state *storedState) error {
 		if err := validateReceiptExecutedAt(order, rcpt, ownerTimelock); err != nil {
 			return err
 		}
+		// 成功执行必须实际包含至少一项动作：actions 必须明确写出、为 JSON
+		// 数组且读出后非空。无动作提案在首次执行入口就会被拒绝，因此一份
+		// “executed 提案 + 空动作凭据”不可能来自成功执行，即使提案本身也
+		// 没有动作、凭据序号与执行时间合法、余额重放恰好一致，也必须在此
+		// 判整份状态损坏（见 validateReceiptActions）。
+		if err := validateReceiptActions(order, rcpt); err != nil {
+			return err
+		}
 		// 每项动作的 index 与四个余额字段（资金库/收款账户 × before/after）
 		// 都必须明确写出：任何一个缺失、为 null 或类型不符都判整份状态损坏，
 		// 不能按数组位置、转账金额、账户余额或其它凭据补出；明确写出的 0 是
@@ -1150,6 +1193,33 @@ func validateReceiptExecutedAt(order int, rcpt *Receipt, timelockEnd int64) erro
 	return nil
 }
 
+// validateReceiptActions 严格判定一份已保存凭据的动作列表：成功执行必须
+// 实际包含至少一项动作，与首次执行入口的“动作非空才可执行”是同一条规则。
+// actions 字段必须明确写出且为 JSON 数组——字段缺失、显式为 null 或写成
+// 对象/字符串/数字/布尔等其它类型都返回带凭据位置、提案编号与字段名的
+// 错误；数组写出但元素形状与动作留痕不符（元素不是对象、必填字段类型不
+// 对等）同样拒绝，原因指出提案编号与字段。明确写出的数组读出后一项动作
+// 都没有（[]）也不是成功执行记录：无动作提案在执行入口只会得到“没有动
+// 作”的拒绝，状态保持 passed，绝不可能产生凭据——因此不能只因凭据与提案
+// 的动作数量相等（都为零）、order/executed_at 合法、余额重放无出入就接受。
+// 登记来源与投票通过来源的凭据适用同一条要求。
+// position 是凭据在凭据表中的位置（0 起），与提案编号一起用于定位。
+func validateReceiptActions(position int, rcpt *Receipt) error {
+	if problem := requiredArrayProblem(rcpt.actionsRaw); problem != "" {
+		return fmt.Errorf("receipt %d for proposal %q field %q %s",
+			position, rcpt.ProposalID, "actions", problem)
+	}
+	if rcpt.actionsShapeErr != nil {
+		return fmt.Errorf("receipt %d for proposal %q field %q has wrong type: %v",
+			position, rcpt.ProposalID, "actions", rcpt.actionsShapeErr)
+	}
+	if len(rcpt.Actions) == 0 {
+		return fmt.Errorf("receipt %d for proposal %q has no actions: a successful execution requires at least one action",
+			position, rcpt.ProposalID)
+	}
+	return nil
+}
+
 // validateReceiptOrder 严格判定一份已保存凭据的 order：它是执行留痕中明确
 // 保存的成功提交序号（0 起），字段未写出、显式为 null 或不是 int64 整数都
 // 返回带提案编号与字段的错误；类型合法但值与凭据在记录表中的实际位置不符
@@ -1223,13 +1293,14 @@ func validateReceiptActionBalances(id string, index int, ar *ActionReceipt) erro
 type schemaKind int
 
 const (
-	kindAny     schemaKind = iota // 叶子值：结构检查不深入，类型由解码器核对
-	kindObject                    // 固定字段对象：键必须与保存格式的字段名逐字一致
-	kindMap                       // 业务编号表：键是自由文本（账户名、提案编号）
-	kindArray                     // 数组
-	kindString                    // 叶子：必须是 JSON 字符串
-	kindBoolean                   // 叶子：必须是 JSON 布尔值（不接受字符串/数字/null）
-	kindInteger                   // 叶子：必须是 int64 范围内的 JSON 整数（不接受小数/指数/字符串/null）
+	kindAny      schemaKind = iota // 叶子值：结构检查不深入，类型由解码器核对
+	kindObject                     // 固定字段对象：键必须与保存格式的字段名逐字一致
+	kindMap                        // 业务编号表：键是自由文本（账户名、提案编号）
+	kindArray                      // 数组
+	kindLaxArray                   // 必填数组：数组元素仍严格扫描，但缺失/null/其它标量类型放行给校验函数
+	kindString                     // 叶子：必须是 JSON 字符串
+	kindBoolean                    // 叶子：必须是 JSON 布尔值（不接受字符串/数字/null）
+	kindInteger                    // 叶子：必须是 int64 范围内的 JSON 整数（不接受小数/指数/字符串/null）
 )
 
 // schemaNode 描述状态文件某一层允许的形状。整棵树由 storedState 的 json tag
@@ -1312,6 +1383,11 @@ func init() {
 	// 凭据的 order 同理：缺失/空值/类型不符/位置不符的判定需要带上提案编号与
 	// 凭据位置，统一由 validateReceiptOrder 报错，结构扫描在此叶子位置保持宽松。
 	receiptFields["order"].kind = kindAny
+	// 凭据的 actions 是必填数组且必须非空：缺失/null/标量/对象由
+	// validateReceiptActions 统一报带提案编号的原因，因此该叶子位置对
+	// “非数组”保持宽松（kindLaxArray），但数组元素仍按动作留痕严格扫描
+	// （未知字段、重复键等不放松），见 schemaKind.kindLaxArray。
+	receiptFields["actions"].kind = kindLaxArray
 	// 凭据逐笔留痕的 index 同理：缺失/空值/类型不符/位置不符的判定需要带上
 	// 提案编号与动作下标，统一由 validateReceiptActionIndex 报错，结构扫描在
 	// 此叶子位置保持宽松。
@@ -1449,7 +1525,7 @@ func checkStateStructure(raw []byte) error {
 			case '{', '[':
 				frame := &scanFrame{isArray: d == '[', path: path}
 				shapeOK := (d == '{' && (node.kind == kindObject || node.kind == kindMap)) ||
-					(d == '[' && node.kind == kindArray)
+					(d == '[' && (node.kind == kindArray || node.kind == kindLaxArray))
 				if !shapeOK {
 					// 叶子位置出现容器或形状不符：跳过内容，类型错误由解码器报告。
 					frame.opaque = true
