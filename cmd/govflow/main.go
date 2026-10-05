@@ -140,9 +140,15 @@ registry file format (UTF-8 JSON, human-inspectable):
       {"batch": "B-001", "product": "P-7", "quantity": 120, "unit": "kg"}
     ]
   }
-A missing file is created on first registration. An existing file that is
-empty, cannot be read in this format, or contains several records with the
-same batch number is rejected outright and never overwritten. "This format"
+A missing file is created on first registration. The registry path may be a
+symbolic link to an existing registry file: new batches are saved into the
+linked file (a relative link target is resolved against the link's own
+directory), the link itself is left untouched and the target keeps its
+permissions. A link whose target does not exist, or a loop of links, is
+rejected — the target is never created and the link is never replaced. An
+existing file that is empty, cannot be read in this format, or contains
+several records with the same batch number is rejected outright and never
+overwritten. "This format"
 is strict: the root object must carry exactly version (the integer 1) and
 batches (an array, empty allowed), each record exactly the four lowercase
 fields batch, product, quantity and unit; missing, null, mistyped, unknown
@@ -233,7 +239,7 @@ func runBatchRegister(args []string, stdout io.Writer) error {
 		if err := batchreg.Save(*registryPath, reg); err != nil {
 			if !existed {
 				// Nothing was registered before; drop any partial new file.
-				os.Remove(*registryPath)
+				removePartialNewRegistry(*registryPath)
 			}
 			return err
 		}
@@ -347,7 +353,7 @@ func runBatchImport(args []string, stdout io.Writer) error {
 			if !existed {
 				// The registry never existed before this import; drop any
 				// partial new file so a failed save leaves nothing behind.
-				os.Remove(*registryPath)
+				removePartialNewRegistry(*registryPath)
 			}
 			return fmt.Errorf("batch-import: %w", err)
 		}
@@ -364,6 +370,18 @@ func runBatchImport(args []string, stdout io.Writer) error {
 		return fmt.Errorf("batch-import: %w", err)
 	}
 	return nil
+}
+
+// removePartialNewRegistry drops a partially written new registry file after
+// a failed first save. A symbolic link is never removed: the link is the
+// user's pointer to the real registry file, not a partial creation of this
+// run.
+func removePartialNewRegistry(path string) {
+	info, err := os.Lstat(path)
+	if err != nil || info.Mode()&os.ModeSymlink != 0 {
+		return
+	}
+	os.Remove(path)
 }
 
 func runDemo() {
