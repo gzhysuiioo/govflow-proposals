@@ -468,6 +468,73 @@ func TestCLIRejectsCaseVariantField(t *testing.T) {
 	}
 }
 
+// TestCLIRejectsMissingRegisteredTimelock：register 登记的提案缺失 timelock_end
+// 时，文本与 JSON 的查询、执行都把整份文件判为损坏：原因写入 stderr（能看出
+// 提案编号、timelock_end 字段与缺失/空值/类型不符），以域错误退出码 1 结束，
+// stdout 不出现成功结果或部分查询结果，文件不被改写；即使查询的是另一项完整
+// 提案也同样拒绝。缺失的时间锁不得被当作 0：now=0 执行也不能转账。
+func TestCLIRejectsMissingRegisteredTimelock(t *testing.T) {
+	binary := buildCLI(t)
+	dir := t.TempDir()
+	state := filepath.Join(dir, "treasury.json")
+	if _, _, code := runCLI(t, binary, state, "init", "--balance", "1000"); code != 0 {
+		t.Fatal("init failed")
+	}
+	if _, _, code := runCLI(t, binary, state, "register", "--id", "gip-1",
+		"--timelock", "5000", "--action", "transfer:a:100"); code != 0 {
+		t.Fatal("register gip-1 failed")
+	}
+	if _, _, code := runCLI(t, binary, state, "register", "--id", "gip-other",
+		"--timelock", "0", "--action", "transfer:o:1"); code != 0 {
+		t.Fatal("register gip-other failed")
+	}
+	raw, err := os.ReadFile(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	corrupt := removeLineContaining(string(raw), `"timelock_end": 5000`)
+	if corrupt == string(raw) {
+		t.Fatal("setup: timelock_end field not found")
+	}
+	if err := os.WriteFile(state, []byte(corrupt), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// 文本与 JSON 模式采用同一判定：均为退出码 1、原因在 stderr、stdout 为空。
+	for _, args := range [][]string{
+		{"proposal", "--id", "gip-1"},
+		{"proposal", "--id", "gip-1", "--json"},
+		{"proposal", "--id", "gip-other"},
+		{"proposal", "--id", "gip-other", "--json"},
+		{"proposals"},
+		{"proposals", "--json"},
+		{"execute", "--id", "gip-1", "--now", "0"},
+		{"execute", "--id", "gip-1", "--now", "0", "--json"},
+		{"balances"},
+		{"balances", "--json"},
+	} {
+		name := strings.Join(args, "_")
+		t.Run(name, func(t *testing.T) {
+			so, se, code := runCLI(t, binary, state, args...)
+			if code != 1 {
+				t.Fatalf("exit=%d want 1, stdout=%q stderr=%q", code, so, se)
+			}
+			if so != "" {
+				t.Fatalf("stdout must stay empty on corruption, got %q", so)
+			}
+			for _, want := range []string{"corrupt", "gip-1", "timelock_end", "missing"} {
+				if !strings.Contains(se, want) {
+					t.Fatalf("stderr %q missing %q", se, want)
+				}
+			}
+		})
+	}
+	// 执行不得扣款、追加凭据或改变提案状态：状态文件内容保持原样。
+	if got, err := os.ReadFile(state); err != nil || string(got) != corrupt {
+		t.Fatalf("corrupt file was modified or rewritten")
+	}
+}
+
 // TestCLIRejectsIncompleteBallot：未计票提案的票据缺 support 时，文本与 JSON
 // 查询、计票都把整份文件判为损坏：原因写入 stderr（能看出提案编号、票据与字段、
 // 空值/缺失/类型不符），以域错误退出码 1 结束，stdout 不出现部分结果，文件不改写。

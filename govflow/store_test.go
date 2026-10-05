@@ -946,6 +946,172 @@ func TestReceiptExecutedAtValidated(t *testing.T) {
 	})
 }
 
+// TestRegisteredProposalTimelockValidated：register 登记的每项提案都必须明确
+// 保存 timelock_end（int64 整数）。时间锁决定资金何时可以支出，字段缺失、
+// 为 null 或类型不符都不得被折叠成 0 再当作已到期——即使记录已是 executed
+// 状态、执行凭据与余额能一致核对，也不能从执行时间或其它记录推测补齐。
+// 明确写出的 0 与负时间取值仍是合法时间锁。
+func TestRegisteredProposalTimelockValidated(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "treasury.json")
+	store, err := InitTreasury(path, 1000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustRegister(t, store, "gip-1", 5000, "transfer:a:100")
+	// 明确写出的 0 与负时间取值是合法时间锁，不得与缺失混同。
+	mustRegister(t, store, "gip-zero", 0, "transfer:z:50")
+	mustRegister(t, store, "gip-neg", -100, "transfer:n:1")
+	// 已执行提案：凭据与余额一致，也不能免除明确保存时间锁的要求。
+	mustRegister(t, store, "gip-exec", 100, "transfer:e:10")
+	if _, err := store.Execute("gip-exec", 100); err != nil {
+		t.Fatal(err)
+	}
+	// 另一项完整提案：含缺损记录的文件被整体拒绝时，查询它也必顈报错。
+	mustRegister(t, store, "gip-other", 10, "transfer:o:5")
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	good, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 基线可读：明确写出的 0 与负时间锁照常返回；完整记录仍按调用方提供的
+	// 时间判断是否到期——恰好到达时间锁可以执行，提前执行仍被拒绝。
+	t.Run("baseline readable", func(t *testing.T) {
+		s, err := Open(path)
+		if err != nil {
+			t.Fatalf("reopen: %v", err)
+		}
+		defer s.Close()
+		rec, ok, err := s.Proposal("gip-zero")
+		if err != nil || !ok || rec.TimelockEnd != 0 {
+			t.Fatalf("Proposal(gip-zero) = %+v ok=%v err=%v, want timelock_end 0", rec, ok, err)
+		}
+		rec, ok, err = s.Proposal("gip-neg")
+		if err != nil || !ok || rec.TimelockEnd != -100 {
+			t.Fatalf("Proposal(gip-neg) = %+v ok=%v err=%v, want timelock_end -100", rec, ok, err)
+		}
+		if _, err := s.Execute("gip-1", 4999); err == nil ||
+			!strings.Contains(err.Error(), "timelock not reached") {
+			t.Fatalf("early execute err=%v, want timelock not reached", err)
+		}
+		if _, err := s.Execute("gip-zero", 0); err != nil {
+			t.Fatalf("execute at explicit zero timelock: %v", err)
+		}
+	})
+
+	corruptions := []struct {
+		name    string
+		raw     string
+		wantMsg []string
+	}{
+		{
+			name:    "timelock_end missing",
+			raw:     removeLineContaining(string(good), `"timelock_end": 5000`),
+			wantMsg: []string{`"gip-1"`, "timelock_end", "missing"},
+		},
+		{
+			name:    "timelock_end null",
+			raw:     strings.Replace(string(good), `"timelock_end": 5000`, `"timelock_end": null`, 1),
+			wantMsg: []string{`"gip-1"`, "timelock_end", "null"},
+		},
+		{
+			name:    "timelock_end string",
+			raw:     strings.Replace(string(good), `"timelock_end": 5000`, `"timelock_end": "5000"`, 1),
+			wantMsg: []string{`"gip-1"`, "timelock_end", "wrong type"},
+		},
+		{
+			name:    "timelock_end decimal",
+			raw:     strings.Replace(string(good), `"timelock_end": 5000`, `"timelock_end": 5000.5`, 1),
+			wantMsg: []string{`"gip-1"`, "timelock_end", "wrong type"},
+		},
+		{
+			name:    "timelock_end exponent",
+			raw:     strings.Replace(string(good), `"timelock_end": 5000`, `"timelock_end": 5e3`, 1),
+			wantMsg: []string{`"gip-1"`, "timelock_end", "wrong type"},
+		},
+		{
+			name:    "timelock_end out of range",
+			raw:     strings.Replace(string(good), `"timelock_end": 5000`, `"timelock_end": 9223372036854775808`, 1),
+			wantMsg: []string{`"gip-1"`, "timelock_end", "wrong type"},
+		},
+		{
+			// 已执行提案的凭据与余额完全一致，也不能补出缺失的时间锁。
+			name:    "executed proposal timelock_end missing",
+			raw:     removeLineContaining(string(good), `"timelock_end": 100`),
+			wantMsg: []string{`"gip-exec"`, "timelock_end", "missing"},
+		},
+	}
+	for _, tc := range corruptions {
+		t.Run(tc.name, func(t *testing.T) {
+			bad := filepath.Join(dir, "corrupt-"+strings.ReplaceAll(tc.name, " ", "-")+".json")
+			if err := os.WriteFile(bad, []byte(tc.raw), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			// 文件中其余提案与凭据均正常，也不能掩盖一条缺损记录。
+			s, err := Open(bad)
+			if !errors.Is(err, ErrStateCorrupt) {
+				if s != nil {
+					s.Close()
+				}
+				t.Fatalf("Open err=%v, want ErrStateCorrupt", err)
+			}
+			for _, want := range tc.wantMsg {
+				if !strings.Contains(err.Error(), want) {
+					t.Fatalf("error %q does not locate %q", err.Error(), want)
+				}
+			}
+			// 原状态文件保持原样，不被修复或覆盖。
+			got, rerr := os.ReadFile(bad)
+			if rerr != nil || string(got) != tc.raw {
+				t.Fatalf("corrupt file was modified")
+			}
+		})
+	}
+
+	// 已打开资金库之后再次读取到缺损记录同样识别：文件在打开后被替换成
+	// 缺失时间锁的版本，后续查询与执行都必须报损坏——即使查询的是另一项
+	// 完整提案；执行不得扣款、追加凭据或改变提案状态，状态文件保持原样。
+	t.Run("detected after open", func(t *testing.T) {
+		p := filepath.Join(dir, "swap.json")
+		if err := os.WriteFile(p, good, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		s, err := Open(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer s.Close()
+		corrupt := removeLineContaining(string(good), `"timelock_end": 5000`)
+		if err := os.WriteFile(p, []byte(corrupt), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, _, err := s.Proposal("gip-other"); !errors.Is(err, ErrStateCorrupt) {
+			t.Fatalf("Proposal(gip-other) err=%v, want ErrStateCorrupt", err)
+		}
+		if _, err := s.Proposals(); !errors.Is(err, ErrStateCorrupt) {
+			t.Fatalf("Proposals err=%v, want ErrStateCorrupt", err)
+		}
+		if _, err := s.BalanceSnapshot(); !errors.Is(err, ErrStateCorrupt) {
+			t.Fatalf("BalanceSnapshot err=%v, want ErrStateCorrupt", err)
+		}
+		// 缺失的时间锁不得被当作 0：now=0 也不能执行。
+		if _, err := s.Execute("gip-1", 0); !errors.Is(err, ErrStateCorrupt) {
+			t.Fatalf("Execute(gip-1) err=%v, want ErrStateCorrupt", err)
+		}
+		if _, err := s.Execute("gip-zero", 0); !errors.Is(err, ErrStateCorrupt) {
+			t.Fatalf("Execute(gip-zero) err=%v, want ErrStateCorrupt", err)
+		}
+		got, _ := os.ReadFile(p)
+		if string(got) != corrupt {
+			t.Fatalf("state file was modified by rejected operations")
+		}
+	})
+}
+
 func equalBytes(a, b []byte) bool {
 	if len(a) != len(b) {
 		return false
