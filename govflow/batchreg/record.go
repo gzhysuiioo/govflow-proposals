@@ -31,6 +31,16 @@ const (
 	textTrimmed                    // manifest record: trim ends, reject blank
 )
 
+// keyEncodingReason is the shared reason sentence for a member NAME that
+// cannot be decoded (malformed UTF-8 bytes or a lone surrogate escape in the
+// JSON string source). It is deliberately distinct from the two neighboring
+// causes: a field VALUE with bad encoding ("must be valid UTF-8 text" /
+// *EncodingError, naming the field) and a record that is not an object at
+// all ("record must be a JSON object"). The offending bytes are never
+// echoed: decoding them would substitute U+FFFD and make distinct names
+// collide, and the substituted text must never be mistaken for a real name.
+const keyEncodingReason = "a field name contains bytes that are not valid UTF-8 or holds a lone surrogate escape; the name is rejected instead of being replaced with U+FFFD"
+
 // unambiguousBatchID returns the record's batch id only when it can be
 // determined uniquely and reliably: exactly one "batch" member (counted after
 // JSON key decoding, so an escaped respelling is the same member) holding one

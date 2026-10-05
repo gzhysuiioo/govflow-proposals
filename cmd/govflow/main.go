@@ -121,7 +121,12 @@ escape such as "\ud800") is rejected and never replaced with the U+FFFD
 replacement character, so distinct inputs cannot collapse onto one batch
 id; the error names the parameter, or the manifest/registry file with the
 1-based record position and field (plus the batch id only when it is itself
-valid and unambiguous). A genuinely entered U+FFFD character is ordinary
+valid and unambiguous). The same rule applies to field NAMES in the JSON
+files: a name with malformed bytes or a lone surrogate escape rejects the
+whole operation with an invalid-field-name error naming the file (plus the
+1-based record position, and the batch id when unambiguous, for record
+level problems) — it is never reported as an unknown field under the
+substituted text. A genuinely entered U+FFFD character is ordinary
 text, non-ASCII ids (Chinese text, emoji, ...) are welcome, and a JSON
 escape means the same text as the character written directly.
 

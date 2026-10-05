@@ -95,11 +95,14 @@ func (e *DuplicateIDError) Error() string {
 }
 
 // FormatError reports a structural violation of the public registry file
-// format: a missing, duplicated, misspelled, null or mistyped field, either
-// in the root object (Position == 0) or in one batch record (Position is its
-// 1-based index in "batches"). Batch carries the record's batch id only when
-// it is uniquely determined; it stays empty when the "batch" member itself
-// is missing, duplicated or not a string.
+// format: a missing, duplicated, misspelled, null or mistyped field, or a
+// field NAME whose bytes are not valid UTF-8 (or hold a lone surrogate
+// escape) — either in the root object (Position == 0) or in one batch
+// record (Position is its 1-based index in "batches"). Batch carries the
+// record's batch id only when it is uniquely determined; it stays empty when
+// the "batch" member itself is missing, duplicated or not a string. A bad
+// field name is reported with an empty Field: the undecodable name is never
+// quoted back, since decoding it would substitute U+FFFD.
 type FormatError struct {
 	Position int
 	Batch    string
@@ -348,7 +351,11 @@ func Load(path string) (reg *Registry, existed bool, err error) {
 // "product", "quantity" and "unit". Field names are matched case-sensitively
 // after JSON string decoding, so "Version" or "Batch" are unknown fields and
 // an escaped respelling such as "bat\u0063h" counts as the same field. A
-// field appearing twice in one object is rejected even when both values are
+// field NAME whose source bytes are malformed UTF-8, or that hides a lone
+// surrogate escape, is its own rejection cause — reported as an invalid
+// field name, never as "must be an object" and never as an unknown field
+// under the U+FFFD-substituted text. A field appearing twice in one object
+// is rejected even when both values are
 // identical; missing fields, nulls, wrong types and unknown fields are
 // rejected just the same. Nothing is patched up by taking the later value,
 // merging or defaulting.
@@ -366,9 +373,12 @@ func decode(data []byte) (*Registry, error) {
 		return nil, err
 	}
 
-	fields, err := parseObjectFields(root)
+	fields, badKey, err := parseObjectFields(root)
 	if err != nil {
 		return nil, &FormatError{Reason: "root must be a JSON object holding exactly \"version\" and \"batches\""}
+	}
+	if badKey {
+		return nil, &FormatError{Reason: keyEncodingReason}
 	}
 	if dup, ok := duplicateField(fields); ok {
 		return nil, &FormatError{Field: dup, Reason: "field appears more than once; duplicate fields are not allowed"}
@@ -432,9 +442,12 @@ func parseRegistryVersion(raw json.RawMessage) (int, error) {
 // differs: problems are surfaced as *FormatError with registry wording, a
 // duplicated member anywhere in the object outranks an unknown one, and
 // text values are read verbatim — validate handles the empty-string case.
+// A member name that cannot be decoded is reported as an invalid field name
+// (keyEncodingReason), ahead of the duplicate/unknown scan, with the batch
+// id attached under the same unambiguity rule as every other record error.
 func parseRegistryRecord(raw json.RawMessage, pos int) (Batch, error) {
 	var b Batch
-	fields, err := parseObjectFields(raw)
+	fields, badKey, err := parseObjectFields(raw)
 	if err != nil {
 		return b, &FormatError{Position: pos, Reason: "record must be a JSON object holding exactly \"batch\", \"product\", \"quantity\" and \"unit\""}
 	}
@@ -444,6 +457,9 @@ func parseRegistryRecord(raw json.RawMessage, pos int) (Batch, error) {
 	// bytes are not valid UTF-8, no id (and never a U+FFFD replacement) is
 	// picked arbitrarily.
 	batchID := unambiguousBatchID(fields, textVerbatim)
+	if badKey {
+		return Batch{}, &FormatError{Position: pos, Batch: batchID, Reason: keyEncodingReason}
+	}
 	fail := func(field, reason string) (Batch, error) {
 		return Batch{}, &FormatError{Position: pos, Batch: batchID, Field: field, Reason: reason}
 	}
@@ -521,43 +537,54 @@ type objectField struct {
 // source order, keeping duplicates visible for the caller to reject. Keys
 // are re-scanned strictly: encoding/json would otherwise hand back U+FFFD
 // substitutions for malformed key bytes.
-func parseObjectFields(raw []byte) ([]objectField, error) {
+//
+// A member whose name cannot be decoded — malformed UTF-8 bytes or a lone
+// surrogate escape — is reported through the badKey flag and dropped from
+// the returned list: the substituted text encoding/json produced must never
+// be treated as a real name, where it could collide with a genuine field or
+// be misreported as an unknown field. Scanning still continues past such a
+// member (its value is consumed normally) so every other member, a valid
+// "batch" among them, stays visible to the caller's batch-id rule. The
+// returned error is reserved for structural problems: the value not being an
+// object, or malformed JSON inside it.
+func parseObjectFields(raw []byte) (fields []objectField, badKey bool, err error) {
 	trimmed := bytes.TrimSpace(raw)
 	if len(trimmed) == 0 || trimmed[0] != '{' {
-		return nil, errors.New("value is not a JSON object")
+		return nil, false, errors.New("value is not a JSON object")
 	}
 	dec := json.NewDecoder(bytes.NewReader(trimmed))
 	if _, err := dec.Token(); err != nil { // opening brace
-		return nil, err
+		return nil, false, err
 	}
-	var fields []objectField
 	for dec.More() {
 		keyStart := dec.InputOffset()
 		tok, err := dec.Token()
 		keyEnd := dec.InputOffset()
 		if err != nil {
-			return nil, err
+			return nil, false, err
 		}
 		key, ok := tok.(string)
 		if !ok {
-			return nil, errors.New("object keys must be JSON strings")
+			return nil, false, errors.New("object keys must be JSON strings")
 		}
-		if _, err := unmarshalStringStrict(keyTokenBytes(trimmed, int(keyStart), int(keyEnd))); err != nil {
-			if errors.Is(err, errStringEncoding) {
-				return nil, errors.New("object key contains bytes that are not valid UTF-8")
-			}
-			return nil, err
-		}
+		_, keyErr := unmarshalStringStrict(keyTokenBytes(trimmed, int(keyStart), int(keyEnd)))
 		var value json.RawMessage
 		if err := dec.Decode(&value); err != nil {
-			return nil, err
+			return nil, false, err
+		}
+		if keyErr != nil {
+			if errors.Is(keyErr, errStringEncoding) {
+				badKey = true
+				continue
+			}
+			return nil, false, keyErr
 		}
 		fields = append(fields, objectField{key: key, value: value})
 	}
 	if _, err := dec.Token(); err != nil { // closing brace
-		return nil, err
+		return nil, false, err
 	}
-	return fields, nil
+	return fields, badKey, nil
 }
 
 // trimJSONSpace strips only the four JSON whitespace bytes (space, tab,
@@ -735,10 +762,12 @@ var batchRecordFields = map[string]struct{}{
 // own choices are: member-name anomalies are reported in source order
 // (unknown and duplicate carry equal weight), text is trimmed and must stay
 // non-empty, and reasons use manifest wording (including *EncodingError for
-// malformed text).
+// malformed text). A member name that cannot be decoded fails the record
+// with keyEncodingReason before the source-order anomaly scan — the
+// U+FFFD-substituted text is never judged as an unknown or duplicate name.
 func parseManifestRecord(raw json.RawMessage) (Input, error) {
 	var in Input
-	members, err := parseObjectFields(raw)
+	members, badKey, err := parseObjectFields(raw)
 	if err != nil {
 		return in, errors.New("record must be a JSON object with batch, product, quantity and unit")
 	}
@@ -752,6 +781,12 @@ func parseManifestRecord(raw json.RawMessage) (Input, error) {
 	// Where the "batch" member sits relative to the offending field does not
 	// matter.
 	in.Batch = unambiguousBatchID(members, textTrimmed)
+
+	// A member name that cannot be decoded is a name-encoding problem, never
+	// an unknown field: the substituted text is not a real name.
+	if badKey {
+		return in, errors.New(keyEncodingReason)
+	}
 
 	// Manifest member-name problems are reported in source order: the first
 	// unknown name or first repeat fails the record.
