@@ -199,19 +199,23 @@ func runRegister(args []string) {
 		fail(err)
 	}
 	defer store.Close()
-	existed, err := store.Register(*id, timelock, []string(actions))
+	// 以这次登记确认的同一条记录为准：编号、时间锁、动作原文与动作顺序都取自
+	// 状态文件中的已确认记录，state 是确认时刻的实际状态——首次登记为 passed，
+	// 相同内容重试保留已有状态（passed 或 executed），不能固定写成 passed。
+	record, existed, err := store.RegisterRecord(*id, timelock, []string(actions))
 	if err != nil {
 		fail(err)
 	}
 	if cf.asJSON {
-		emitJSON(map[string]any{"id": *id, "state": "passed", "timelock_end": timelock,
-			"actions": []string(actions), "already_registered": existed})
+		emitJSON(map[string]any{"id": record.ID, "state": record.State, "timelock_end": record.TimelockEnd,
+			"actions": record.Actions, "already_registered": existed})
 		return
 	}
 	if existed {
-		fmt.Printf("proposal %s already registered with identical content\n", *id)
+		fmt.Printf("proposal %s already registered with identical content (state=%s)\n", record.ID, record.State)
 	} else {
-		fmt.Printf("registered passed proposal %s (%d action(s), timelock_end=%d)\n", *id, len(actions), timelock)
+		fmt.Printf("registered %s proposal %s (%d action(s), timelock_end=%d)\n",
+			record.State, record.ID, len(record.Actions), record.TimelockEnd)
 	}
 }
 

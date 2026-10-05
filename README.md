@@ -26,6 +26,9 @@ govflow init --state ./treasury.json --balance 10000
 
 # 登记已通过提案：编号非空，保留时间锁与动作原文
 # 同编号相同内容的重试幂等返回；内容不同报冲突
+# 成功响应反映这次登记确认的同一条记录：首次登记 state=passed、
+# already_registered=false；相同内容重试 already_registered=true，
+# state 保留记录的实际状态（提案执行后再登记为 executed）
 govflow register --state ./treasury.json \
   --id gip-7 --timelock 5000 \
   --action transfer:audits:25000 \

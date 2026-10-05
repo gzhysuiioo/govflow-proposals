@@ -1020,3 +1020,206 @@ func TestCLIDelegationParamOrderIrrelevant(t *testing.T) {
 		t.Fatalf("team:bob should carry all 100 weight: exit=%d so=%s", code, vo)
 	}
 }
+
+// TestCLIRegisterResultReflectsActualState：register 成功 JSON 必须反映这次
+// 登记实际认可的记录——首次登记 already_registered=false/state=passed；
+// 尚未执行的相同内容重试 already_registered=true/state=passed；提案执行后
+// 再登记 already_registered=true/state=executed，不能固定写成 passed。
+// 编号、时间锁、动作原文与动作顺序与状态文件中的完整记录一致；普通文本
+// 输出在重试说明中明确实际状态。
+func TestCLIRegisterResultReflectsActualState(t *testing.T) {
+	binary := buildCLI(t)
+	state := filepath.Join(t.TempDir(), "treasury.json")
+	if _, se, code := runCLI(t, binary, state, "init", "--balance", "1000"); code != 0 {
+		t.Fatalf("init: %s", se)
+	}
+	reg := []string{"register", "--id", "gip-1", "--timelock", "100",
+		"--action", "transfer:acct:10", "--action", "transfer:legal:20"}
+
+	// 首次登记。
+	so, se, code := runCLI(t, binary, state, append(append([]string{}, reg...), "--json")...)
+	if code != 0 {
+		t.Fatalf("first register code=%d se=%s", code, se)
+	}
+	for _, want := range []string{
+		`"id": "gip-1"`,
+		`"state": "passed"`,
+		`"timelock_end": 100`,
+		`"already_registered": false`,
+		`"actions": [`,
+		`"transfer:acct:10"`,
+		`"transfer:legal:20"`,
+	} {
+		if !strings.Contains(so, want) {
+			t.Fatalf("first register json missing %q:\n%s", want, so)
+		}
+	}
+	if ti := strings.Index(so, "transfer:acct:10"); ti < 0 {
+		t.Fatalf("actions missing")
+	} else if strings.Index(so, "transfer:acct:10") > strings.Index(so, "transfer:legal:20") {
+		t.Fatalf("action order not preserved:\n%s", so)
+	}
+	// 首次登记文本输出（用一个新的提案编号验证首次登记文案）。
+	if so, _, code := runCLI(t, binary, state, "register", "--id", "gip-fresh",
+		"--timelock", "100", "--action", "transfer:acct:10"); code != 0 ||
+		!strings.Contains(so, "registered passed proposal gip-fresh") {
+		t.Fatalf("first register text code=%d so=%q", code, so)
+	}
+
+	// 尚未执行时的相同内容重试。
+	so, se, code = runCLI(t, binary, state, append(append([]string{}, reg...), "--json")...)
+	if code != 0 {
+		t.Fatalf("pending retry code=%d se=%s", code, se)
+	}
+	if !strings.Contains(so, `"already_registered": true`) || !strings.Contains(so, `"state": "passed"`) {
+		t.Fatalf("pending retry json wrong:\n%s", so)
+	}
+	if so, _, _ := runCLI(t, binary, state, reg...); !strings.Contains(so, "already registered with identical content (state=passed)") {
+		t.Fatalf("pending retry text should state passed: %q", so)
+	}
+
+	// 执行提案。
+	if _, se, code := runCLI(t, binary, state, "execute", "--id", "gip-1", "--now", "100"); code != 0 {
+		t.Fatalf("execute code=%d se=%s", code, se)
+	}
+
+	// 已执行后的相同内容登记重试：必须报告 executed。
+	so, se, code = runCLI(t, binary, state, append(append([]string{}, reg...), "--json")...)
+	if code != 0 {
+		t.Fatalf("executed retry code=%d se=%s", code, se)
+	}
+	if !strings.Contains(so, `"already_registered": true`) || !strings.Contains(so, `"state": "executed"`) {
+		t.Fatalf("executed retry json must report executed:\n%s", so)
+	}
+	if strings.Contains(so, `"state": "passed"`) {
+		t.Fatalf("executed retry must not report passed:\n%s", so)
+	}
+	// 动作原文与顺序、编号、时间锁仍是被确认记录的完整内容。
+	for _, want := range []string{
+		`"id": "gip-1"`,
+		`"timelock_end": 100`,
+		`"transfer:acct:10"`,
+		`"transfer:legal:20"`,
+	} {
+		if !strings.Contains(so, want) {
+			t.Fatalf("executed retry json missing %q:\n%s", want, so)
+		}
+	}
+	if so, _, _ := runCLI(t, binary, state, reg...); !strings.Contains(so, "already registered with identical content (state=executed)") {
+		t.Fatalf("executed retry text should state executed: %q", so)
+	}
+
+	// 时间锁不同：即使已经执行仍报内容冲突（退出码 1，stderr，无成功对象）。
+	if so, se, code := runCLI(t, binary, state, "register", "--id", "gip-1",
+		"--timelock", "101",
+		"--action", "transfer:acct:10", "--action", "transfer:legal:20", "--json"); code != 1 {
+		t.Fatalf("timelock conflict after execute code=%d", code)
+	} else if so != "" || !strings.Contains(se, "different timelock or actions") {
+		t.Fatalf("timelock conflict so=%q se=%q", so, se)
+	}
+	// 调换动作顺序（总额相同）仍报冲突。
+	if so, se, code := runCLI(t, binary, state, "register", "--id", "gip-1", "--timelock", "100",
+		"--action", "transfer:legal:20", "--action", "transfer:acct:10", "--json"); code != 1 {
+		t.Fatalf("action-order conflict after execute code=%d", code)
+	} else if so != "" || !strings.Contains(se, "different timelock or actions") {
+		t.Fatalf("action-order conflict so=%q se=%q", so, se)
+	}
+
+	// 重试与冲突都不改变余额。
+	if so, _, _ := runCLI(t, binary, state, "balances", "--json"); !strings.Contains(so, `"treasury": 970`) {
+		t.Fatalf("treasury changed after register retries:\n%s", so)
+	}
+}
+
+// TestCLIRegisterOverVotingIDConflicts：编号已属于投票提案时，register 仍是
+// 冲突（退出码 1、stderr），不会把投票提案当成登记重试，也不返回成功对象。
+func TestCLIRegisterOverVotingIDConflicts(t *testing.T) {
+	binary := buildCLI(t)
+	state := filepath.Join(t.TempDir(), "treasury.json")
+	if _, _, code := runCLI(t, binary, state, "init", "--balance", "1000"); code != 0 {
+		t.Fatal("init failed")
+	}
+	if _, se, code := runCLI(t, binary, state, "create-vote", "--id", "gip-v",
+		"--member", "a:1", "--quorum", "1", "--start", "0", "--deadline", "10", "--timelock", "10"); code != 0 {
+		t.Fatalf("create-vote: %s", se)
+	}
+	if so, se, code := runCLI(t, binary, state, "register", "--id", "gip-v",
+		"--timelock", "10", "--json"); code != 1 || so != "" || !strings.Contains(se, "belongs to a voting proposal") {
+		t.Fatalf("register over voting id code=%d so=%q se=%q", code, so, se)
+	}
+}
+
+// TestCLIRegisterRetryConcurrentWithExecute：跨进程并发登记重试与首次执行，
+// 每个登记响应的 state 按两次操作实际确认的先后为 passed 或 executed；
+// 余额只扣一次、凭据只有一份，登记重试不产生第二次资金变动。
+func TestCLIRegisterRetryConcurrentWithExecute(t *testing.T) {
+	binary := buildCLI(t)
+	state := filepath.Join(t.TempDir(), "treasury.json")
+	if _, _, code := runCLI(t, binary, state, "init", "--balance", "1000"); code != 0 {
+		t.Fatal("init failed")
+	}
+	if _, se, code := runCLI(t, binary, state, "register", "--id", "gip-race",
+		"--timelock", "0", "--action", "transfer:acct:1"); code != 0 {
+		t.Fatalf("register: %s", se)
+	}
+
+	const n = 24
+	var wg sync.WaitGroup
+	outs := make([]string, n)
+	start := make(chan struct{})
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			so, se, code := runCLI(t, binary, state, "register", "--id", "gip-race",
+				"--timelock", "0", "--action", "transfer:acct:1", "--json")
+			if code != 0 {
+				t.Errorf("register retry %d code=%d se=%s", i, code, se)
+				return
+			}
+			if !strings.Contains(so, `"already_registered": true`) {
+				t.Errorf("register retry %d not marked as retry:\n%s", i, so)
+			}
+			if !strings.Contains(so, `"state": "passed"`) && !strings.Contains(so, `"state": "executed"`) {
+				t.Errorf("register retry %d unexpected state:\n%s", i, so)
+			}
+			outs[i] = so
+		}(i)
+	}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		<-start
+		if _, se, code := runCLI(t, binary, state, "execute", "--id", "gip-race", "--now", "0"); code != 0 {
+			t.Errorf("execute code=%d se=%s", code, se)
+		}
+	}()
+	close(start)
+	wg.Wait()
+
+	states := map[string]bool{}
+	for _, out := range outs {
+		switch {
+		case strings.Contains(out, `"state": "executed"`):
+			states["executed"] = true
+		case strings.Contains(out, `"state": "passed"`):
+			states["passed"] = true
+		}
+	}
+	if !states["passed"] && !states["executed"] {
+		t.Fatal("no register retry observed a valid confirmed state")
+	}
+	if so, _, _ := runCLI(t, binary, state, "receipts", "--json"); strings.Count(so, `"proposal_id"`) != 1 {
+		t.Fatalf("expected exactly one receipt:\n%s", so)
+	}
+	if so, _, _ := runCLI(t, binary, state, "balances", "--json"); !strings.Contains(so, `"treasury": 999`) {
+		t.Fatalf("treasury must be 999 after a single execution:\n%s", so)
+	}
+	// 最终登记重试必须看到 executed。
+	if so, _, code := runCLI(t, binary, state, "register", "--id", "gip-race",
+		"--timelock", "0", "--action", "transfer:acct:1", "--json"); code != 0 ||
+		!strings.Contains(so, `"state": "executed"`) {
+		t.Fatalf("post-execution retry must report executed:\n%s", so)
+	}
+}

@@ -402,8 +402,29 @@ func newStoredState(treasury int64) *storedState {
 
 // Register 登记一项已通过（passed）的提案，保留时间锁与动作原文。
 // 编号必须非空；动作列表可为空（执行时会因动作为空被拒绝），动作原文不做改写。
-// 同编号且时间锁、动作原文与首次登记完全相同的重试返回 existed=true；
-// 内容不同则返回 ErrProposalConflict。
+// 返回的 existed 标识这次调用是确认了已有提案（true）还是首次登记（false），
+// 语义与历史调用方一致。
+//
+// 成功响应只报告这次登记在持锁确认时刻认可的那一条记录：同编号且时间锁、
+// 动作原文与首次登记完全相同的重试不改变任何状态，只再次确认已有记录，
+// 因此此时该提案若已被执行，重试仍报告 executed 而不会被改写成 passed；
+// 内容不同（含时间锁、动作原文或动作顺序不同）即使提案已经执行也返回
+// ErrProposalConflict。
+//
+// Register 保留原有签名与 existed 含义；需要取得这次确认的完整记录
+// （实际状态、编号、时间锁、动作原文及顺序）的调用方使用 RegisterRecord。
+func (s *Store) Register(id string, timelockEnd int64, actions []string) (existed bool, err error) {
+	_, existed, err = s.RegisterRecord(id, timelockEnd, actions)
+	return existed, err
+}
+
+// RegisterRecord 的登记规则与 Register 完全相同，但额外返回这次登记确认的
+// 那条提案记录。首次登记时记录状态为 passed；相同内容重试时返回已有记录在
+// 本次确认时刻的实际状态（passed 或 executed）。记录中的编号、时间锁、动作
+// 原文与动作顺序均以状态文件中被确认的同一条记录为准，不采用可能与已有
+// 记录不同的本次提交参数（内容冲突时根本不会成功返回）。并发场景下结果按
+// 登记确认与首次执行实际提交的先后定序：登记先确认则为 passed，执行先
+// 提交则为 executed；登记返回之后才发生的执行不改写这次登记的结果。
 //
 // 提案编号与每一项动作原文还必须是合法 UTF-8：状态文件以 JSON 保存，
 // encoding/json 会把字符串中的非法 UTF-8 字节悄悄改写成替换字符 U+FFFD
@@ -417,49 +438,52 @@ func newStoredState(treasury int64) *storedState {
 // 由反斜杠与普通字母组成的字面文本——登记参数不是 JSON 字符串，不做
 // 转义重解释）原样保留。编码合法但转账格式错误的动作照常登记，
 // 由执行操作按现有规则拒绝。
-func (s *Store) Register(id string, timelockEnd int64, actions []string) (existed bool, err error) {
+func (s *Store) RegisterRecord(id string, timelockEnd int64, actions []string) (ProposalRecord, bool, error) {
 	if id == "" {
-		return false, fmt.Errorf("%w: proposal id must not be empty", ErrInvalidRegistration)
+		return ProposalRecord{}, false, fmt.Errorf("%w: proposal id must not be empty", ErrInvalidRegistration)
 	}
 	if problem := invalidUTF8(id); problem != "" {
-		return false, fmt.Errorf("%w: proposal id is not valid UTF-8: %s", ErrInvalidRegistration, problem)
+		return ProposalRecord{}, false, fmt.Errorf("%w: proposal id is not valid UTF-8: %s", ErrInvalidRegistration, problem)
 	}
 	for i, action := range actions {
 		if problem := invalidUTF8(action); problem != "" {
-			return false, fmt.Errorf("%w: action %d text is not valid UTF-8: %s", ErrInvalidRegistration, i, problem)
+			return ProposalRecord{}, false, fmt.Errorf("%w: action %d text is not valid UTF-8: %s", ErrInvalidRegistration, i, problem)
 		}
 	}
 	commit, err := s.begin()
 	if err != nil {
-		return false, err
+		return ProposalRecord{}, false, err
 	}
 	defer commit()
 
 	state, err := s.loadLocked()
 	if err != nil {
-		return false, err
+		return ProposalRecord{}, false, err
 	}
 	stored := copyActions(actions)
 	if existing, ok := state.Proposals[id]; ok {
+		// 相同内容重试：只确认已有记录，不改变状态、余额或首次执行凭据。
+		// 记录按它在本次确认时刻的实际状态返回（passed/executed）。
 		if existing.TimelockEnd == timelockEnd && sameActions(existing.Actions, stored) {
-			return true, nil
+			return toProposalRecord(existing), true, nil
 		}
-		return false, fmt.Errorf("%w: proposal %s", ErrProposalConflict, id)
+		return ProposalRecord{}, false, fmt.Errorf("%w: proposal %s", ErrProposalConflict, id)
 	}
 	// 两种来源共用编号：register 不能覆盖投票提案或绕过其投票结论。
 	if vp, ok := state.VoteProposals[id]; ok {
-		return false, fmt.Errorf("%w: proposal id %s belongs to a voting proposal (state=%s)", ErrProposalConflict, id, vp.State)
+		return ProposalRecord{}, false, fmt.Errorf("%w: proposal id %s belongs to a voting proposal (state=%s)", ErrProposalConflict, id, vp.State)
 	}
-	state.Proposals[id] = &storedProposal{
+	record := &storedProposal{
 		ID:          id,
 		State:       "passed",
 		TimelockEnd: timelockEnd,
 		Actions:     stored,
 	}
+	state.Proposals[id] = record
 	if err := s.commitLocked(state); err != nil {
-		return false, err
+		return ProposalRecord{}, false, err
 	}
-	return false, nil
+	return toProposalRecord(record), false, nil
 }
 
 func copyActions(actions []string) []string {

@@ -126,10 +126,10 @@ func TestRegisterRejectsInvalidUTF8(t *testing.T) {
 		wantInErr []string
 	}{
 		{"proposal id illegal byte", "gip-\xff", []string{"transfer:a:1"}, []string{"proposal id", "UTF-8"}},
-		{"proposal id truncated rune", "gip-\xe4\xb8", []string{"transfer:a:1"}, []string{"proposal id", "UTF-8"}}, // “中”缺少最后一个字节
+		{"proposal id truncated rune", "gip-\xe4\xb8", []string{"transfer:a:1"}, []string{"proposal id", "UTF-8"}},        // “中”缺少最后一个字节
 		{"proposal id encoded surrogate", "gip-\xed\xa0\x80", []string{"transfer:a:1"}, []string{"proposal id", "UTF-8"}}, // UTF-8 形式直接编码的 U+D800
 		{"action text illegal byte", "gip-bad-a0", []string{"transfer:audits:\xff"}, []string{"action 0", "UTF-8"}},
-		{"action text truncated rune", "gip-bad-a1", []string{"transfer:a:1", "\xf0\x9f\x98"}, []string{"action 1", "UTF-8"}}, // 表情缺少最后一个字节
+		{"action text truncated rune", "gip-bad-a1", []string{"transfer:a:1", "\xf0\x9f\x98"}, []string{"action 1", "UTF-8"}},     // 表情缺少最后一个字节
 		{"action text encoded surrogate", "gip-bad-a2", []string{"ok", "also-ok", "\xed\xb0\x80"}, []string{"action 2", "UTF-8"}}, // UTF-8 形式直接编码的 U+DC00
 	}
 	for _, tc := range cases {
@@ -215,7 +215,6 @@ func TestRegisterPreservesValidText(t *testing.T) {
 		}
 	}
 }
-
 
 func TestExecuteHappyPathAndReceiptShape(t *testing.T) {
 	store, _ := openTempStore(t, 1000)
@@ -1927,5 +1926,187 @@ func TestOldStateWithoutVoteProposalsReadable(t *testing.T) {
 	}
 	if p, ok, _ := fresh.Proposal("gip-pending"); !ok || p.State != "passed" {
 		t.Fatalf("pending proposal = %+v ok=%v", p, ok)
+	}
+}
+
+// TestRegisterRecordReflectsActualState：登记成功结果必须反映这次登记实际
+// 认可的提案记录。首次登记返回 passed/existed=false；尚未执行时相同内容
+// 重试返回 passed/existed=true；提案执行之后相同内容重试必须返回
+// executed，而不是固定的 passed。返回记录的编号、时间锁、动作原文与顺序
+// 都以状态文件中被确认的同一条记录为准。
+func TestRegisterRecordReflectsActualState(t *testing.T) {
+	store, _ := openTempStore(t, 1000)
+	defer store.Close()
+
+	actions := []string{"transfer:acct:10", "transfer:legal:20"}
+
+	// 首次登记。
+	rec, existed, err := store.RegisterRecord("gip-1", 100, actions)
+	if err != nil || existed {
+		t.Fatalf("first register existed=%v err=%v", existed, err)
+	}
+	if rec.ID != "gip-1" || rec.State != "passed" || rec.TimelockEnd != 100 ||
+		len(rec.Actions) != 2 || rec.Actions[0] != actions[0] || rec.Actions[1] != actions[1] {
+		t.Fatalf("unexpected first record: %+v", rec)
+	}
+
+	// 尚未执行时的相同内容重试：仍为 passed。
+	rec, existed, err = store.RegisterRecord("gip-1", 100, []string{actions[0], actions[1]})
+	if err != nil || !existed {
+		t.Fatalf("pending retry existed=%v err=%v", existed, err)
+	}
+	if rec.State != "passed" || rec.TimelockEnd != 100 || len(rec.Actions) != 2 ||
+		rec.Actions[0] != actions[0] || rec.Actions[1] != actions[1] {
+		t.Fatalf("pending retry record wrong: %+v", rec)
+	}
+
+	// 首次执行。
+	if _, err := store.Execute("gip-1", 100); err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	if bal, _ := store.TreasuryBalance(); bal != 970 {
+		t.Fatalf("treasury after execute = %d, want 970", bal)
+	}
+
+	// 已执行提案的相同内容重试：状态必须是 executed，不能报告成 passed。
+	rec, existed, err = store.RegisterRecord("gip-1", 100, []string{actions[0], actions[1]})
+	if err != nil || !existed {
+		t.Fatalf("executed retry existed=%v err=%v", existed, err)
+	}
+	if rec.State != "executed" {
+		t.Fatalf("executed retry state=%q, want executed", rec.State)
+	}
+	if rec.ID != "gip-1" || rec.TimelockEnd != 100 ||
+		len(rec.Actions) != 2 || rec.Actions[0] != actions[0] || rec.Actions[1] != actions[1] {
+		t.Fatalf("executed retry record fields wrong: %+v", rec)
+	}
+	// 重试不改变余额或追加凭据。
+	if bal, _ := store.TreasuryBalance(); bal != 970 {
+		t.Fatalf("treasury changed by retry: %d", bal)
+	}
+	if receipts, _ := store.Receipts(); len(receipts) != 1 {
+		t.Fatalf("retry appended receipt: %d receipts", len(receipts))
+	}
+
+	// 时间锁不同仍报冲突，即使提案已经执行。
+	if _, existed, err := store.RegisterRecord("gip-1", 101, []string{actions[0], actions[1]}); !errors.Is(err, ErrProposalConflict) || existed {
+		t.Fatalf("timelock conflict after execute err=%v existed=%v", err, existed)
+	}
+	// 调换动作顺序（支出总额相同）仍报冲突。
+	if _, existed, err := store.RegisterRecord("gip-1", 100, []string{actions[1], actions[0]}); !errors.Is(err, ErrProposalConflict) || existed {
+		t.Fatalf("action-order conflict after execute err=%v existed=%v", err, existed)
+	}
+	// 动作条数不同仍报冲突。
+	if _, existed, err := store.RegisterRecord("gip-1", 100, []string{actions[0]}); !errors.Is(err, ErrProposalConflict) || existed {
+		t.Fatalf("action-count conflict after execute err=%v existed=%v", err, existed)
+	}
+	// 冲突失败不改变状态与余额。
+	if bal, _ := store.TreasuryBalance(); bal != 970 {
+		t.Fatalf("treasury changed after failed retries: %d", bal)
+	}
+	if got, ok, _ := store.Proposal("gip-1"); !ok || got.State != "executed" {
+		t.Fatalf("proposal after conflicts: %+v ok=%v", got, ok)
+	}
+
+	// 旧接口 Register 的 existed 语义保持不变。
+	if existed, err := store.Register("gip-1", 100, []string{actions[0], actions[1]}); err != nil || !existed {
+		t.Fatalf("legacy Register existed=%v err=%v", existed, err)
+	}
+
+	// 编号属于投票提案时，登记仍报冲突而不是当成登记重试。
+	if _, _, err := store.CreateVoteProposal(&CreateVoteInput{
+		ID: "gip-vote", Members: []VoteMember{{ID: "a", Weight: 1}},
+		Quorum: 1, StartAt: 0, Deadline: 10, TimelockEnd: 10,
+	}); err != nil {
+		t.Fatalf("create vote: %v", err)
+	}
+	if _, existed, err := store.RegisterRecord("gip-vote", 10, nil); !errors.Is(err, ErrProposalConflict) || existed {
+		t.Fatalf("register over voting id err=%v existed=%v", err, existed)
+	}
+}
+
+// TestRegisterRecordEmptyActionsStoredAsCanonical：空动作与未提供动作视为
+// 相同内容，重试确认的记录沿用状态文件里已保存的那一份动作列表。
+func TestRegisterRecordEmptyActionsStoredAsCanonical(t *testing.T) {
+	store, _ := openTempStore(t, 100)
+	defer store.Close()
+
+	rec, existed, err := store.RegisterRecord("gip-empty", 0, nil)
+	if err != nil || existed || rec.State != "passed" {
+		t.Fatalf("first register: rec=%+v existed=%v err=%v", rec, existed, err)
+	}
+	// 空切片与 nil 等价：确认已有记录。
+	rec, existed, err = store.RegisterRecord("gip-empty", 0, []string{})
+	if err != nil || !existed || rec.State != "passed" {
+		t.Fatalf("empty retry: rec=%+v existed=%v err=%v", rec, existed, err)
+	}
+	if len(rec.Actions) != 0 {
+		t.Fatalf("canonical actions should be empty, got %v", rec.Actions)
+	}
+}
+
+// TestRegisterRetryConcurrentWithExecute：相同内容登记重试与首次执行并发时，
+// 每个登记响应按两次操作实际确认的先后报告状态：登记先确认则 passed，
+// 执行先提交则 executed；随后发生的执行不改写已确认的登记结果。所有登记
+// 只确认已有提案，余额只扣一次，凭据只产生一份。
+func TestRegisterRetryConcurrentWithExecute(t *testing.T) {
+	store, _ := openTempStore(t, 1000)
+	defer store.Close()
+	mustRegister(t, store, "gip-race", 0, "transfer:acct:1")
+
+	const n = 32
+	var wg sync.WaitGroup
+	states := make([]string, n)
+	start := make(chan struct{})
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			rec, existed, err := store.RegisterRecord("gip-race", 0, []string{"transfer:acct:1"})
+			if err != nil {
+				t.Errorf("register retry %d: %v", i, err)
+				return
+			}
+			if !existed {
+				t.Errorf("register retry %d reported first registration", i)
+			}
+			if rec.State != "passed" && rec.State != "executed" {
+				t.Errorf("register retry %d state=%q", i, rec.State)
+			}
+			states[i] = rec.State
+		}(i)
+	}
+	// 与登记重试同时发起首次执行。
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		<-start
+		if _, err := store.Execute("gip-race", 0); err != nil {
+			t.Errorf("execute: %v", err)
+		}
+	}()
+	close(start)
+	wg.Wait()
+
+	sawPassed, sawExecuted := false, false
+	for _, st := range states {
+		sawPassed = sawPassed || st == "passed"
+		sawExecuted = sawExecuted || st == "executed"
+	}
+	// 32 个登记与 1 次执行在同一把锁上竞争：两种先后顺序至少应出现一种；
+	// 关键不变量是每个登记响应的状态都来自它自己持锁确认时的记录，
+	// 不存在第三种状态，且最终记录为 executed、余额只扣一次。
+	if !sawPassed && !sawExecuted {
+		t.Fatal("no register retry observed a valid state")
+	}
+	if got, ok, _ := store.Proposal("gip-race"); !ok || got.State != "executed" {
+		t.Fatalf("final proposal = %+v ok=%v", got, ok)
+	}
+	if bal, _ := store.TreasuryBalance(); bal != 999 {
+		t.Fatalf("treasury = %d, want 999", bal)
+	}
+	if receipts, _ := store.Receipts(); len(receipts) != 1 {
+		t.Fatalf("receipts = %d, want 1", len(receipts))
 	}
 }
