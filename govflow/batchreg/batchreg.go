@@ -993,6 +993,27 @@ var (
 	renameTempFile   = os.Rename
 )
 
+// SetSaveStepsForTest replaces the two failure-prone steps of the atomic
+// save — writing the new content into the temporary file, and replacing the
+// target with it — and returns a function restoring the production steps. It
+// exists so that regression tests outside this package (the batch-import
+// command tests) can make a chosen step of a real save fail deterministically,
+// on the save's actual target, exactly as this package's own save-failure
+// tests do through the variables directly. A nil argument keeps the current
+// step. Production behavior is untouched unless a test installs a replacement;
+// tests must call the returned restore function (typically via t.Cleanup) and
+// must not run in parallel with any save.
+func SetSaveStepsForTest(write func(f *os.File, data []byte) (int, error), rename func(oldpath, newpath string) error) (restore func()) {
+	oldWrite, oldRename := writeTempContent, renameTempFile
+	if write != nil {
+		writeTempContent = write
+	}
+	if rename != nil {
+		renameTempFile = rename
+	}
+	return func() { writeTempContent, renameTempFile = oldWrite, oldRename }
+}
+
 // Save atomically writes reg to path, replacing the file only after the new
 // content is fully on disk so an existing registry stays usable on failure.
 // Records are serialized in their current order; the file is created with
