@@ -787,6 +787,18 @@ func verifyBallots(id string, ballots []storedBallot, spec *proposalSpec) (ballo
 // 只有最终代表本人可投赞成/反对票，每位代表一张票，票重为归集到其名下的
 // 全部原始权重。相同选择的重试始终返回首次记录；改投报冲突。
 // 首次投票只接受 start <= now < deadline；计票之后拒绝一切新票。
+//
+// 保存失败按发生位置分两种结果：
+//   - 失败在状态文件替换之前（临时文件写入、fsync 或原子改名失败）：返回
+//     具体错误与 nil 票据，上次完整状态保留，这张票没有写入、不占用该代表
+//     的首次投票机会；保存条件恢复后的首次投票仍受同一投票窗口约束。
+//   - 状态文件已替换成功、仅随后的目录同步失败：票据其实已经完整写入状态
+//     文件——代表、归集权重、赞成或反对选择与首次投票时间均来自当次提交，
+//     先前票据的内容与顺序不变。此时返回 nil 票据与 ErrDurabilityUnconfirmed
+//     （*DurabilityError，Cause 为具体保存失败原因），表示“已写入，但持久性
+//     未确认”，既不是普通成功，也不是投票资格不符。该告警不撤销已写入的票；
+//     恢复正常读取条件后查询即可看到它，相同选择的重试仍返回这张首次记录，
+//     到期计票必须把它计入，已委托成员的权重不得因此被重复累计。
 func (s *Store) CastVote(id, voter string, support bool, now int64) (*BallotView, error) {
 	if voter == "" {
 		return nil, voteReject("voter id must not be empty")
