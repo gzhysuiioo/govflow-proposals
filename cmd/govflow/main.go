@@ -490,6 +490,19 @@ func runExecute(args []string) {
 	defer store.Close()
 	receipt, err := store.Execute(*id, now)
 	if err != nil {
+		var derr *govflow.DurabilityError
+		if receipt != nil && errors.As(err, &derr) {
+			// 状态文件已替换成功：转账、executed 状态与凭据已写入，只是
+			// 目录同步失败、持久性未确认。标准输出照常给出已写入的凭据，
+			// 标准错误说明告警（提案编号 + 具体失败原因），退出码仍为 1。
+			if cf.asJSON {
+				emitJSON(receipt)
+			} else {
+				printReceiptText(receipt, false)
+			}
+			fmt.Fprintf(os.Stderr, "warning: proposal %s: execution record written but durability not confirmed: %v\n", *id, derr.Cause)
+			os.Exit(1)
+		}
 		fail(err)
 	}
 	if cf.asJSON {

@@ -29,7 +29,28 @@ var (
 	ErrProposalConflict = errors.New("proposal already registered with different timelock or actions")
 	// ErrInvalidRegistration：登记参数非法（编号为空、初始余额越界等）。
 	ErrInvalidRegistration = errors.New("invalid registration")
+	// ErrDurabilityUnconfirmed：提交时状态文件已替换成功，但随后的目录同步
+	// 失败。变更（转账、executed 状态、执行凭据等）其实已经写入状态文件，
+	// 只是这次写入的持久性未得到确认——它与“尚未写入，操作失败”是两种
+	// 不同结果，调用方必须能区分。具体保存失败原因见 DurabilityError.Cause。
+	ErrDurabilityUnconfirmed = errors.New("state written but durability not confirmed")
 )
+
+// DurabilityError 表示“已写入，但持久性未确认”的提交结果：状态文件已通过
+// 原子改名替换成功，随后的目录同步失败。它不是“没有写入”：已提交的转账、
+// 状态与凭据都保留在状态文件中；它也不承诺这次变更的持久性已得到确认。
+// Cause 保留具体的保存失败原因；errors.Is(err, ErrDurabilityUnconfirmed)
+// 可明确识别这种情况。
+type DurabilityError struct {
+	Cause error
+}
+
+func (e *DurabilityError) Error() string {
+	return fmt.Sprintf("%s: %v", ErrDurabilityUnconfirmed, e.Cause)
+}
+
+func (e *DurabilityError) Is(target error) bool { return target == ErrDurabilityUnconfirmed }
+func (e *DurabilityError) Unwrap() error        { return e.Cause }
 
 const (
 	stateMagic   = "govflow-treasury-state"
@@ -347,6 +368,11 @@ func InitTreasury(path string, treasury int64) (*Store, error) {
 	if err := store.commitLocked(newStoredState(treasury)); err != nil {
 		_ = store.funlock()
 		_ = lockFD.Close()
+		if errors.Is(err, ErrDurabilityUnconfirmed) {
+			// 状态文件已替换成功，初始状态其实已经写入：不能当作
+			// “尚未写入”删掉文件，只报告持久性未确认。
+			return nil, err
+		}
 		_ = os.Remove(path)
 		return nil, err
 	}
@@ -623,6 +649,19 @@ func proposalOwnerState(state *storedState, id string) (string, int64, []string,
 // 成功后状态变为 executed 并返回凭据。资格不符、动作格式错误、余额不足、
 // 金额计算溢出都返回明确原因，整项提案不产生部分转账，也不消耗执行机会。
 // 已完成提案再次执行（即使 now 不同）直接返回首次成功凭据。
+//
+// 保存失败按发生位置分两种结果：
+//   - 失败在状态文件替换之前（临时文件写入、fsync 或原子改名失败）：返回
+//     具体错误与 nil 凭据，上次完整状态保留，提案保持 passed，条件满足后
+//     仍可执行；
+//   - 状态文件已替换成功、仅随后的目录同步失败：转账、executed 状态与执行
+//     凭据其实已经写入。此时同时返回完整的首次执行凭据与
+//     ErrDurabilityUnconfirmed（*DurabilityError，Cause 为具体保存失败
+//     原因），表示“已写入，但持久性未确认”，而不是“尚未写入，执行失败”。
+//     该告警不撤销转账、不退回 passed、不删除凭据；随后正常查询即可看到
+//     整项提案已执行，再次执行仍返回同一份首次凭据。
+//
+// 登记来源与投票通过来源的提案适用同一规则。
 func (s *Store) Execute(id string, now int64) (*Receipt, error) {
 	commit, err := s.begin()
 	if err != nil {
@@ -684,6 +723,12 @@ func (s *Store) Execute(id string, now int64) (*Receipt, error) {
 	state.Receipts = append(state.Receipts, receipt)
 
 	if err := s.commitLocked(state); err != nil {
+		if errors.Is(err, ErrDurabilityUnconfirmed) {
+			// 状态文件已替换成功：转账、executed 状态与凭据都已写入，只是
+			// 目录同步失败、持久性未确认。返回完整凭据与可识别的告警错误，
+			// 不回滚转账、不退回 passed、不删除凭据。
+			return cloneReceipt(receipt), err
+		}
 		return nil, err
 	}
 	return cloneReceipt(receipt), nil
@@ -907,7 +952,9 @@ func (s *Store) loadLocked() (*storedState, error) {
 }
 
 // commitLocked 序列化状态并以“临时文件 + fsync + 原子改名 + 目录 fsync”提交。
-// 任一步失败都保留上次完整状态。调用方必须持锁。
+// 状态文件替换之前的任何失败都保留上次完整状态；原子改名已成功、仅随后的
+// 目录同步失败时，变更其实已经写入状态文件，返回 *DurabilityError
+// （ErrDurabilityUnconfirmed）标明“已写入，但持久性未确认”。调用方必须持锁。
 func (s *Store) commitLocked(state *storedState) error {
 	if err := validateState(state); err != nil {
 		return fmt.Errorf("refusing to persist invalid state: %w", err)
@@ -948,7 +995,9 @@ func (s *Store) commitLocked(state *storedState) error {
 		return err
 	}
 	if err := syncDir(dir); err != nil {
-		return err
+		// 原子改名已成功：状态文件内容已是本次提交，只是目录同步失败，
+		// 这次写入的持久性未得到确认。明确区别于“尚未写入”的失败。
+		return &DurabilityError{Cause: err}
 	}
 	return nil
 }
