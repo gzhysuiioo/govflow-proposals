@@ -123,6 +123,239 @@ govflow: batch-import: manifest record 3 (batch "B1") conflicts with manifest re
 
 读取任一文件失败、记录非法、发生冲突或保存失败时退出码非零，原因写入标准错误，标准输出不出现成功结果；已有登记文件保持原样，原本不存在则不留下登记文件。
 
+## 通过 Go 库导入到货清单：batchreg
+
+`govflow/batchreg` 包把命令行 `batch-import` 的同一套能力作为公开入口提供，可在自己的 Go 程序里把一份清单导入指定的本地登记文件。导入路径为 `github.com/gzhysuiioo/govflow-proposals/govflow/batchreg`（仅用标准库）：
+
+1. `batchreg.ParseManifest(data []byte) ([]batchreg.Input, error)`：解析清单文件字节。清单文件始终**只读**：由调用方自己读入，库只校验和转换这些字节，绝不创建或改写清单文件。
+2. `batchreg.Load(path string) (reg *batchreg.Registry, existed bool, err error)`：读取前文公开格式的登记文件。文件不存在不是错误：返回一个空登记表和 `existed == false`；已有但无法按公开格式读取的文件按错误拒绝，绝不覆盖。
+3. `batchreg.Import(reg *batchreg.Registry, inputs []batchreg.Input) (results []batchreg.ImportResult, err error)`：在**内存中**把清单合并进 `reg`，返回按清单顺序排列的逐条结果。
+4. `batchreg.Save(path string, reg *batchreg.Registry) error`：临时文件加原子替换，把登记表写入登记文件；此前不存在的文件在**保存成功后**创建（权限 0644），符号链接路径的规则与命令行章节完全相同。
+
+`ImportResult` 含合并后的 `Batch`（四个字段）和 `Created bool`：`true` 表示该编号是本次新出现并追加的，`false` 表示重复确认。**`Import` 的返回值只是内存处理结果，不是登记完成的凭据**：新批次此刻只存在于内存中的 `reg`；只有随后 `Save` 成功返回，它们才真正被登记文件接受。
+
+### 完整最小示例
+
+```go
+package main
+
+import (
+	"fmt"
+	"log"
+	"os"
+	"path/filepath"
+
+	"github.com/gzhysuiioo/govflow-proposals/govflow/batchreg"
+)
+
+func main() {
+	dir, err := os.MkdirTemp("", "arrivals-*")
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer os.RemoveAll(dir)
+	manifestPath := filepath.Join(dir, "arrivals.json")
+	registryPath := filepath.Join(dir, "batches.json")
+
+	// A registry that already holds B-100. The seed file is only needed for
+	// the demo; with no registry at all, Load returns an empty registry and
+	// Save creates the file.
+	if err := os.WriteFile(registryPath, []byte(`{
+  "version": 1,
+  "batches": [
+    {"batch": "B-100", "product": "P-7", "quantity": 120, "unit": "kg"}
+  ]
+}`), 0o644); err != nil {
+		log.Fatal(err)
+	}
+
+	// Read-only manifest: a new batch (padded with whitespace), a batch
+	// identical to the registered record, and the same new batch repeated.
+	manifestJSON := `[
+  {"batch": " B-200 ", "product": " P-8 ", "quantity": 30, "unit": " box "},
+  {"batch": "B-100", "product": "P-7", "quantity": 120, "unit": "kg"},
+  {"batch": "B-200", "product": "P-8", "quantity": 30, "unit": "box"}
+]`
+	if err := os.WriteFile(manifestPath, []byte(manifestJSON), 0o644); err != nil {
+		log.Fatal(err)
+	}
+
+	// 1) Parse the manifest. ParseManifest trims the three text fields and
+	//    validates every record; the manifest bytes are never written.
+	inputs, err := batchreg.ParseManifest(mustReadFile(manifestPath))
+	if err != nil {
+		log.Fatalf("invalid manifest %q: %v", manifestPath, err)
+	}
+
+	// 2) Load the registry: *Registry plus whether the file existed.
+	reg, existed, err := batchreg.Load(registryPath)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	// 3) Import into memory. On error the whole manifest was rejected and reg
+	//    is untouched; results is nil.
+	results, err := batchreg.Import(reg, inputs)
+	if err != nil {
+		log.Fatalf("import rejected: %v", err)
+	}
+
+	// results is the IN-MEMORY outcome only — nothing has been saved yet.
+	anyCreated := false
+	for i, r := range results {
+		status := "duplicate"
+		if r.Created {
+			status = "created"
+			anyCreated = true
+		}
+		fmt.Printf("result %d: %s / %s / %d / %s -> %s\n",
+			i+1, r.Batch.Batch, r.Batch.Product, r.Batch.Quantity, r.Batch.Unit, status)
+	}
+
+	// 4) Persist. Save only when at least one record was created: an
+	//    all-duplicate import must leave the file's bytes and mtime untouched.
+	if anyCreated {
+		if err := batchreg.Save(registryPath, reg); err != nil {
+			// reg already carries the new batches in memory, but the disk file
+			// does NOT — report the path and the cause, never "imported".
+			log.Fatalf("registry %q not saved: %v", registryPath, err)
+		}
+		fmt.Printf("saved %s (file existed beforehand: %v)\n", registryPath, existed)
+	} else {
+		fmt.Println("every record already existed; the registry file was not touched")
+	}
+
+	// Re-load to show what the disk accepted.
+	saved, _, err := batchreg.Load(registryPath)
+	if err != nil {
+		log.Fatal(err)
+	}
+	fmt.Printf("registry on disk now holds %d record(s)\n", len(saved.Batches))
+}
+
+func mustReadFile(path string) []byte {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		log.Fatalf("cannot read manifest %q: %v", path, err)
+	}
+	return data
+}
+```
+
+运行输出（`/tmp/arrivals-*` 是程序随机生成的临时目录，每次不同）：
+
+```text
+result 1: B-200 / P-8 / 30 / box -> created
+result 2: B-100 / P-7 / 120 / kg -> duplicate
+result 3: B-200 / P-8 / 30 / box -> duplicate
+saved /tmp/arrivals-2218460593/batches.json (file existed beforehand: true)
+registry on disk now holds 2 record(s)
+```
+
+从输出可以逐条读出：
+
+- 第 1 条 `B-200` 尚未登记，标为 `created`；清单字段首尾的空白在解析时去掉，保存为 `B-200 / P-8 / 30 / box`。
+- 第 2 条 `B-100` 与登记文件中的记录**完全一致**，标为 `duplicate`，是重复确认而不是新增。
+- 第 3 条 `B-200` 与本清单第 1 条相同，同样标为 `duplicate`；同一新编号在整个清单中**只保存一次**。
+- `results` 始终保持清单原顺序。保存后登记文件里原有 `B-100` 的内容和位置不变，`B-200` 只在末尾追加一次：
+
+```json
+{
+  "version": 1,
+  "batches": [
+    {
+      "batch": "B-100",
+      "product": "P-7",
+      "quantity": 120,
+      "unit": "kg"
+    },
+    {
+      "batch": "B-200",
+      "product": "P-8",
+      "quantity": 30,
+      "unit": "box"
+    }
+  ]
+}
+```
+
+### 全部记录都已存在且内容一致
+
+把同一份清单（或只含 `B-100`、`B-200` 的清单）再导一次时，每条结果的 `Created` 都是 `false`。此时使用方式与上面示例相同：扫描结果，只有 `anyCreated == true` 才调用 `Save`；全重复时**不要**为了打印结果或“保险”而再保存一次——`Save` 每次都会重写文件，多余调用会平白改变修改时间。跳过 `Save` 时登记文件的字节内容和修改时间都保持不变，可用下面的断言确认：
+
+```go
+before, _ := os.ReadFile(registryPath)
+infoBefore, _ := os.Stat(registryPath)
+
+results, err := batchreg.Import(reg, inputs) // 全部 duplicate
+// ... 打印 results 不需要触碰磁盘；anyCreated == false，因此不调用 Save
+
+after, _ := os.ReadFile(registryPath)
+infoAfter, _ := os.Stat(registryPath)
+fmt.Println(string(before) == string(after), infoBefore.ModTime().Equal(infoAfter.ModTime())) // true true
+```
+
+重复确认是幂等的，可以安全重试；只有出现至少一个 `created` 结果时，成功保存才会更新文件。
+
+### 文本与数量规则：按入口区分
+
+**解析清单文件（`ParseManifest`）**与**在 Go 代码里直接构造 `batchreg.Input` 提交（`Import`）**共用同一套登记文件格式和编号比对，但文本处理不同：
+
+| 规则 | 清单文件经 `ParseManifest` | 直接构造 `Input` 经 `Import` |
+| --- | --- | --- |
+| 批次、产品、单位的首尾空白 | 去掉；去掉后不能为空，空或纯空白的字段拒绝该记录 | **不去**，按原样保存和逐字节比较 |
+| 纯空白字符串（`" "`、`"\t"`） | 视为空白，拒绝 | 属于现有库接受的**非空**值，照常保存 |
+| 空字符串 `""` | 拒绝 | 拒绝（库要求三个文本字段非空） |
+| 大小写与内部字符（含内部空白） | 保留，`B1` 与 `b1` 是不同批次 | 同样保留，同样逐字节比较 |
+| 非法 UTF-8 字节、孤立代理转义（`\ud800`） | 拒绝，绝不替换成 `�` | 拒绝，绝不替换成 `�` |
+| 用户真实输入的替换字符 `�`（U+FFFD）、中文、emoji | 普通文本，接受 | 普通文本，接受 |
+| 数量 | 必须是 **JSON 整数**文字，范围 1 到 9223372036854775807；字符串 `"120"`、小数 `1.0`/`1.5`、指数 `1e3`、零、负数、超范围一律拒绝 | `int64` 字段，有效值范围同为 1 到 9223372036854775807；没有 JSON 文字形状问题，零、负数和超范围值拒绝 |
+
+直接构造记录的写法如下，注意首尾空白会成为值的一部分：
+
+```go
+results, err := batchreg.Import(reg, []batchreg.Input{
+	{Batch: " B-200 ", Product: " P-8 ", Quantity: 30, Unit: " box "}, // 空白原样保留
+	{Batch: " ", Product: "\t", Quantity: 1, Unit: "\n"},              // 纯空白也是非空值
+})
+```
+
+因此从清单文件导入时，`" B-200 "` 只会与 `"B-200"` 相撞；直接构造 `Input` 时它们是两个不同批次。需要与命令行相同的去空白语义时，可在构造前调用公开的 `batchreg.NormalizeField`。
+
+### 失败时的使用约定
+
+**记录非法，或同编号内容冲突：整份导入被拒绝。** `Import` 先校验全部记录、在副本上合并，任何一条不合法或冲突都返回错误、`results` 为 `nil`、内存中的 `reg` 保持调用前内容。调用方不能展示部分成功，也不能继续调用 `Save`；即使非法记录排在最后，前面看似 `created` 的记录也不会留下。
+
+- 非法记录（空文本、非法 UTF-8、数量越界等；`ParseManifest` 解析出的清单记录问题也是同一类型）返回 `*batchreg.ManifestRecordError`，用 `errors.As` 取出：`Position` 是清单中**从 1 开始**的记录位置；`Batch` 仅在批次编号自身合法且能唯一确定时给出，否则为空（绝不用替换后的 `�` 值指认批次）；具体字段写在错误信息里。例如：
+
+  ```text
+  manifest record 2 (batch "B2"): field "quantity" must be a JSON integer between 1 and 9223372036854775807
+  ```
+
+  清单文件整体为空、为空数组、不是 JSON 数组或 JSON 本身不合法时，`ParseManifest` 返回普通错误（无记录位置）。
+
+- 同一批次编号已在登记文件中、或已在本次清单更早位置出现，但产品、数量、单位任一不同，返回 `*batchreg.ManifestConflictError`：`Position`（从 1 开始）、`Batch`、`Fields`（按 product、quantity、unit 顺序列出冲突字段）和冲突来源。`Source == "registry"` 表示与登记文件中的记录冲突；`Source == "manifest"` 时 `PrevPos` 给出该编号在清单中**首次出现**的从 1 开始位置：
+
+  ```text
+  manifest record 2 (batch "B1") conflicts with manifest record 1 on field(s): quantity; the whole manifest is rejected
+  manifest record 1 (batch "B1") conflicts with the registered record on field(s): product, unit; the whole manifest is rejected
+  ```
+
+  ```go
+  var conflict *batchreg.ManifestConflictError
+  if errors.As(err, &conflict) {
+      // conflict.Position, conflict.Batch, conflict.Fields
+      // conflict.Source: "registry" 或 "manifest"
+      // conflict.PrevPos: Source == "manifest" 时的更早记录位置
+  }
+  ```
+
+**保存失败：必须报告登记文件路径与原因，先前返回的新增结果不算已完成登记。** `Save` 的错误形如 `cannot save registry "<登记文件路径>": <原因>`（原子保存：写入临时文件或最终替换失败时，已有文件字节与修改时间保持不变、仍可正常读取，原本不存在的路径仍不存在，临时文件会被清理）。此刻状态是分裂的：`Import` 已经成功，`results` 里标为 `created` 的新批次**已经进入内存中的 `reg`**（这是库的实际行为；重试前可检查 `len(reg.Batches)`），但磁盘登记文件还没有接受这些新增批次。因此：
+
+- 向调用方报告登记文件**路径**和失败**原因**，不能把内存结果当作登记成功继续后续业务；
+- 可以用同一个 `reg` 重试 `batchreg.Save(registryPath, reg)`（它仍持有完整、合法的新登记表），或放弃本次操作并重新 `batchreg.Load` 与磁盘对齐；
+- 只有 `Save` 返回 `nil` 后，这批新增才算真正登记完成。
+
 ## 技术方向
 
 dao, governance, voting, proposal, multisig, treasury-management, reputation-system
