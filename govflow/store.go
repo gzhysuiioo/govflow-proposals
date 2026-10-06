@@ -1517,6 +1517,10 @@ func init() {
 	// （未知字段、重复键等不放松），见 schemaKind.kindLaxArray。
 	voteProposalFields := storedStateSchema.fields["vote_proposals"].elem.fields
 	voteProposalFields["ballots"].kind = kindLaxArray
+	// 投票提案的 start_at 同理：缺失/空值/类型不符的判定需要带上提案编号，
+	// 统一由 validateVoteProposalStartAt 报错，结构扫描在此叶子位置保持宽松，
+	// 不抢在解码器之后的校验函数之前给出不含提案编号的通用整数叶子错误。
+	voteProposalFields["start_at"].kind = kindAny
 	// 凭据的 executed_at 同理：缺失/空值/类型不符/早于时间锁的判定需要带上
 	// 提案编号与凭据位置，统一由 validateReceiptExecutedAt 报错，结构扫描在此
 	// 叶子位置保持宽松。

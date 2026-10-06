@@ -300,6 +300,16 @@ func validateStoredTally(id string, t *storedTally) error {
 // 列表补成空数组。解码时保留 ballots 的原始 JSON，由
 // validateVoteProposalBallots 区分“缺失/空值/类型不符”。明确写出的空数组
 // 仍表示确实无人投票。
+//
+// start_at 同样必须明确写出且为 int64 范围内的 JSON 整数：它决定投票窗口
+// 何时开启，字段缺失、为 null 或类型不符绝不能被折叠成 0——原本在 100
+// 开始、200 截止的提案，缺失开始时间若被读成 0，窗口会被悄悄向前扩大，
+// 开始之前投出的票就可能被当成窗口内的首次投票接受。取值不得从票据时间、
+// 截止时间、时间锁或其它记录推算补齐，也不能补零后继续使用；即使票据、
+// 计票结论与执行凭据都能与其余内容核对一致也不宽免。解码时保留 start_at
+// 的原始 JSON，由 validateVoteProposalStartAt 区分“缺失/空值/类型不符”。
+// 明确写出的 0 是合法开始时间，不与缺失混同；合法整数仍须满足既有的
+// 0 <= start < deadline <= timelock 规则（specOf 复核）。
 type storedVoteProposal struct {
 	ID          string             `json:"id"`
 	State       string             `json:"state"`
@@ -312,6 +322,8 @@ type storedVoteProposal struct {
 	Actions     []string           `json:"actions"`
 	Ballots     []storedBallot     `json:"ballots"`
 	Tally       *storedTally       `json:"tally,omitempty"`
+
+	startAtRaw json.RawMessage
 
 	delegationsRaw json.RawMessage
 	// delegationsShapeErr 记录数组元素形状与 []storedDelegation 不符时的解码
@@ -329,14 +341,14 @@ type storedVoteProposal struct {
 }
 
 // storedVoteProposalJSONShape 只用于解码，按保存格式的字段名逐字接住
-// delegations 与 ballots 的原始 JSON；其余字段直接按目标类型解码。
+// delegations、ballots 与 start_at 的原始 JSON；其余字段直接按目标类型解码。
 type storedVoteProposalJSONShape struct {
 	ID          string          `json:"id"`
 	State       string          `json:"state"`
 	Members     []storedMember  `json:"members"`
 	Delegations json.RawMessage `json:"delegations"`
 	Quorum      int64           `json:"quorum"`
-	StartAt     int64           `json:"start_at"`
+	StartAt     json.RawMessage `json:"start_at"`
 	Deadline    int64           `json:"deadline"`
 	TimelockEnd int64           `json:"timelock_end"`
 	Actions     []string        `json:"actions"`
@@ -360,13 +372,17 @@ func (p *storedVoteProposal) UnmarshalJSON(data []byte) error {
 	p.State = shape.State
 	p.Members = shape.Members
 	p.Quorum = shape.Quorum
-	p.StartAt = shape.StartAt
+	p.startAtRaw = shape.StartAt
 	p.Deadline = shape.Deadline
 	p.TimelockEnd = shape.TimelockEnd
 	p.Actions = shape.Actions
 	p.Tally = shape.Tally
 	p.delegationsRaw = shape.Delegations
 	p.ballotsRaw = shape.Ballots
+	// 仅当 start_at 确实是 int64 整数时才填充开始时间；缺失/null/类型不符
+	// 留待 validateVoteProposalStartAt 拒绝，绝不能让缺失字段悄悄落成 0 并
+	// 参与窗口判断或查询展示。
+	fillInt64(shape.StartAt, &p.StartAt)
 	if jsonValueType(shape.Delegations) == "array" {
 		// 元素形状非法时不在此返回：让整份文档解码通过，由
 		// validateVoteProposalDelegations 统一给出带提案编号与字段名的
@@ -656,9 +672,10 @@ func (s *Store) CreateVoteProposal(in *CreateVoteInput) (view *VoteProposalView,
 		stored.Delegations = append(stored.Delegations, storedDelegation{From: d.From, To: d.To})
 	}
 	// 同步填上字段原始片段，使“提交前校验”与“打开重放校验”走同一份
-	// delegations/ballots 判定时不会把本进程新建的提案误判为字段缺失。
-	// 创建时不提供委托、尚无投票都是合法的：空数组明确写出即表示无人委托、
-	// 无人投票。
+	// start_at/delegations/ballots 判定时不会把本进程新建的提案误判为字段
+	// 缺失。开始时间为 0 时写出的也是明确的 0；创建时不提供委托、尚无投票
+	// 都是合法的：空数组明确写出即表示无人委托、无人投票。
+	stored.startAtRaw, _ = json.Marshal(stored.StartAt)
 	stored.delegationsRaw, _ = json.Marshal(stored.Delegations)
 	stored.ballotsRaw, _ = json.Marshal(stored.Ballots)
 	state.VoteProposals[in.ID] = stored
@@ -1054,6 +1071,25 @@ func validateVoteProposalBallots(p *storedVoteProposal) error {
 	return nil
 }
 
+// validateVoteProposalStartAt 严格判定一项已保存投票提案的 start_at：
+// 字段必须明确写出、非 null 且为 int64 范围内的 JSON 整数字面量。字段未写出、
+// 显式为 null 或写成字符串/布尔/对象/数组/小数/指数形式/超出范围都返回带
+// 提案编号与字段名的错误，由 validateState 判整份状态文件损坏——开始时间
+// 决定投票窗口何时开启，缺失字段被折叠成 0 会把窗口向前扩大，让开始之前
+// 投出的票被当成窗口内的首次投票接受；取值不得从票据时间、截止时间、时间
+// 锁或其它记录推算补齐，也不能补零后继续使用。即使票据、计票结论与执行
+// 凭据都能与其余内容核对一致也不宽免：voting/passed/rejected/executed 适用
+// 同一条要求。明确写出的 0 是合法开始时间，不与缺失混同；合法整数仍须
+// 满足既有的 0 <= start < deadline <= timelock 规则（由 specOf 复核）。
+// “缺失/空值/类型不符”的判定与逐票明细、计票结果、执行凭据共用同一份规则
+// （requiredScalarProblem），此处只补充投票提案的业务位置：提案编号。
+func validateVoteProposalStartAt(p *storedVoteProposal) error {
+	if problem := requiredScalarProblem(p.startAtRaw, scalarInteger); problem != "" {
+		return fmt.Errorf("voting proposal %q field %q %s", p.ID, "start_at", problem)
+	}
+	return nil
+}
+
 // validateVoteProposals 在打开状态文件时严格校验全部投票提案：
 // 编号与 register 来源不冲突；状态机与计票结论一致；票重/代表与名单及委托明细一致；
 // 首次投票时间落在窗口内；首次计票不早于截止且结论可由明细重放。
@@ -1086,6 +1122,15 @@ func validateVoteProposals(state *storedState) error {
 		// 查询、接受重复投票或复核出零参与权重的拒绝结论。voting/passed/
 		// rejected/executed 适用同一条要求。
 		if err := validateVoteProposalBallots(p); err != nil {
+			return err
+		}
+		// start_at 决定投票窗口何时开启，必须明确写出且为 int64 整数。先于
+		// specOf 的时间规则派生核对执行：字段缺损时直接判整份文件损坏，绝不
+		// 能把缺失的开始时间折叠成 0 后扩大投票窗口（开始之前投出的票会被
+		// 当成窗口内的首次投票），也不能从票据时间、截止时间、时间锁或其它
+		// 记录推算补齐。voting/passed/rejected/executed 适用同一条要求；
+		// 明确写出的 0 是合法开始时间。
+		if err := validateVoteProposalStartAt(p); err != nil {
 			return err
 		}
 		spec, err := specOf(p)
