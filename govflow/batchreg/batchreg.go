@@ -1064,6 +1064,16 @@ var (
 // A dangling symbolic link or a link loop — on the final component or on a
 // directory leading to it — is an error: the save must not create the target
 // or overwrite the link as if this were a first registration.
+//
+// One more shape is rejected rather than resolved: a path that would have to
+// enter a directory that does not exist yet and then step back out of it
+// through a later ".." component, as in store/missing/../batches.json. The
+// kernel cannot follow such a prefix (the missing directory has no parent to
+// return to), so collapsing the "missing/.." pair lexically would silently
+// retarget the save at a same-named file the user path never reached — or
+// create one there — and pre-creating the missing directory would make an
+// unreachable path valid behind the user's back. Neither is allowed: the
+// save fails naming the missing directory and the ".." that follows it.
 func resolveRegistryTarget(path string) (string, error) {
 	// Climb through components missing from the filesystem by stripping raw
 	// path segments, never by lexical cleaning: filepath.Clean would collapse
@@ -1106,9 +1116,31 @@ func resolveRegistryTarget(path string) (string, error) {
 			// in the process working directory, just as a plain open would.
 			return filepath.Clean(path), nil
 		}
+		if base != "." && base != ".." && base != "" && tailStepsBackUp(tail) {
+			// Reaching cur's file would require entering a directory that
+			// does not exist and later leaving it again through a ".." that
+			// is already in the tail: the kernel cannot follow the path as
+			// written, and collapsing the pair lexically would point the
+			// save at a file the user path never named. Refuse instead of
+			// resolving — and never create the missing directory to make
+			// the path traversable after the fact.
+			return "", fmt.Errorf("directory %q does not exist, yet a later \"..\" component asks to step back out of it; the registry path cannot be resolved as written and must not be collapsed lexically", cur)
+		}
 		tail = append(tail, base)
 		cur = parent
 	}
+}
+
+// tailStepsBackUp reports whether any component stripped so far is "..",
+// meaning the not-yet-existing prefix still being climbed would have to be
+// exited again further along the path.
+func tailStepsBackUp(tail []string) bool {
+	for _, c := range tail {
+		if c == ".." {
+			return true
+		}
+	}
+	return false
 }
 
 // rawParent splits path at its final separator without resolving "..", so the
@@ -1140,6 +1172,19 @@ func rawParent(path string) (parent, base string) {
 // or a link loop, on the file or on a leading directory, rejects the save
 // with an error naming path — the target is never created and the link is
 // never replaced.
+//
+// A path that can only be reached by entering a directory that does not
+// exist and then stepping back out of it through a later ".." component —
+// store/missing/../batches.json with store/missing absent — is rejected the
+// same way, with an error naming path and the missing directory: the kernel
+// cannot follow the path as written, so collapsing the pair lexically would
+// silently retarget the save at a same-named file the user path never
+// reached (overwriting an existing registry there, or creating one the user
+// never asked for), and creating the missing directory first would make an
+// unreachable path valid behind the user's back. A ".." that only crosses
+// directories which actually exist keeps its ordinary physical meaning, and
+// a first registration in a not-yet-existing directory without any ".."
+// (store/new/batches.json) is still created normally.
 //
 // Every record must satisfy the same effective-value rules Load enforces, so
 // a registry saved successfully always reads back: batch, product and unit

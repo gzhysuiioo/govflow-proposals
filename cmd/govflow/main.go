@@ -159,7 +159,12 @@ directory, so a read-only work directory (read and enter, but not create)
 does not block the save and nothing is created under work; only an
 unwritable real target directory rejects it. A link whose target does not
 exist, or a loop of links, is rejected — the target is never created and
-the link is never replaced. An
+the link is never replaced. A registry path that would have to enter a
+directory that does not exist and then step back out of it through a later
+".." (store/missing/../batches.json with store/missing absent) is rejected
+too: the file cannot be reached as written, so the same-named file the
+collapsed path would name is neither overwritten nor created, and the
+missing directory is never created to make the path traversable. An
 existing file that is empty, cannot be read in this format, or contains
 several records with the same batch number is rejected outright and never
 overwritten. "This format"
