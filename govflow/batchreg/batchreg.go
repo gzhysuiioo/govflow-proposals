@@ -25,6 +25,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"unicode/utf8"
@@ -1044,30 +1045,224 @@ var (
 )
 
 // resolveRegistryTarget returns the file a save to path must actually
-// replace. When path is a symbolic link, the link is followed to its target
-// — an absolute target, or a relative one resolved against the link's own
+// replace, together with the directory the atomic save must prepare its
+// temporary file in — the physical directory holding target, with every
+// symbolic link in path's ancestry and every ".." resolved by the kernel's
+// rules rather than folded as plain text.
+//
+// The link-aware resolution matters whenever an ancestor directory is a
+// symbolic link. filepath.Dir and os.CreateTemp treat ".." lexically: with
+// work/alias -> store/child, "work/alias/../batches.json" folds to
+// "work/batches.json" even though the file the user reads is
+// store/batches.json. Resolving the existing part of the directory chain
+// through the kernel makes a save land in the exact file Load read and lets
+// it succeed with write permission on that one directory alone — a
+// directory named earlier in the user's path (e.g. work) never needs to be
+// writable, and a sibling file that merely shares the lexical spelling
+// (work/batches.json) is never created or replaced.
+//
+// The split keeps ".." un-cleaned on purpose: only the longest existing
+// ancestor is resolved, and missing tail directories are reattached verbatim
+// so a first registration can still create them next to the real file. When
+// the file itself is a symbolic link, the link is followed to its target —
+// an absolute target, or a relative one resolved against the link's own
 // directory, never against the process working directory — so the save
-// updates the file the user sees through the link instead of replacing the
-// link with a regular file. A dangling link or a link loop is an error: the
-// save must not create the target or overwrite the link as if this were a
-// first registration. A non-link path (existing or not) is returned
-// unchanged.
-func resolveRegistryTarget(path string) (string, error) {
-	info, err := os.Lstat(path)
-	if err != nil {
-		if errors.Is(err, fs.ErrNotExist) {
-			return path, nil
+// updates the file seen through the link instead of replacing the link with
+// a regular file. A dangling link, a chain of links forming a loop, or any
+// other unresolvable component is an error: the save must not create the
+// target, overwrite the link, or write into the lexical ".." sibling
+// directory as if this were a first registration. When path needs no
+// resolution its spelling (relative or absolute) is returned unchanged.
+func resolveRegistryTarget(path string) (target, dir string, err error) {
+	// A symbolic link in the final component keeps its long-standing rule:
+	// follow it to the linked file, reject a dangling or looping link.
+	if info, lerr := os.Lstat(path); lerr == nil {
+		if info.Mode()&os.ModeSymlink != 0 {
+			resolved, ferr := filepath.EvalSymlinks(path)
+			if ferr != nil {
+				return "", "", fmt.Errorf("registry path is a symbolic link whose target cannot be resolved: %w", ferr)
+			}
+			return resolved, filepath.Dir(resolved), nil
 		}
-		return "", fmt.Errorf("cannot inspect registry path: %w", err)
+	} else if !errors.Is(lerr, fs.ErrNotExist) {
+		return "", "", fmt.Errorf("cannot inspect registry path: %w", lerr)
 	}
-	if info.Mode()&os.ModeSymlink == 0 {
-		return path, nil
+
+	// Split on the final separator without cleaning: a ".." immediately after
+	// a symlinked directory must be resolved by the kernel, not folded
+	// lexically into the link's sibling.
+	parent, base := filepath.Split(path)
+	parent = strings.TrimSuffix(parent, string(filepath.Separator))
+	if parent == "" {
+		parent = "."
 	}
-	target, err := filepath.EvalSymlinks(path)
-	if err != nil {
-		return "", fmt.Errorf("registry path is a symbolic link whose target cannot be resolved: %w", err)
+
+	// Walk every parent segment from the root, concatenating prefixes
+	// verbatim (never filepath.Clean: that would fold "link/.." away). The
+	// walk records whether any symbolic link is crossed, where the crossed
+	// path physically ends, and where a not-yet-created tail begins.
+	cur := "."
+	if filepath.IsAbs(parent) {
+		cur = string(filepath.Separator)
 	}
-	return target, nil
+	joinRaw := func(dir, seg string) string {
+		if dir == string(filepath.Separator) {
+			return dir + seg
+		}
+		return dir + string(filepath.Separator) + seg
+	}
+	crossedLink := false
+	segs := splitPathSegments(parent)
+	i := 0
+walk:
+	for ; i < len(segs); i++ {
+		seg := segs[i]
+		if seg == "." {
+			continue
+		}
+		next := joinRaw(cur, seg)
+		if seg == ".." {
+			// Every component before a ".." must already resolve.
+			if _, e := os.Stat(next); e != nil {
+				return "", "", fmt.Errorf("registry path is a symbolic link whose target cannot be resolved: %w", e)
+			}
+			cur = next
+			continue
+		}
+		li, e := os.Lstat(next)
+		switch {
+		case e == nil:
+			if li.Mode()&os.ModeSymlink != 0 {
+				crossedLink = true
+				if _, f := os.Stat(next); f != nil {
+					// A dangling or looping link in the ancestry.
+					return "", "", fmt.Errorf("registry path is a symbolic link whose target cannot be resolved: %w", f)
+				}
+			}
+			cur = next
+		case errors.Is(e, fs.ErrNotExist):
+			// First missing component: the rest of the walk is the
+			// not-yet-created tail.
+			break walk
+		default:
+			return "", "", fmt.Errorf("cannot inspect registry path: %w", e)
+		}
+	}
+	// tail holds the not-yet-existing creation segments, if any.
+	tail := segs[i:]
+
+	// Past a crossed link the kernel can only resolve the tail after the
+	// save creates every missing directory itself; a ".." in such a tail
+	// cannot be located ahead of time, so refuse rather than guessing. With
+	// no link crossed the path keeps its exact legacy spelling — MkdirAll and
+	// CreateTemp resolve an ordinary ".." against directories they create.
+	if crossedLink && slices.Contains(tail, "..") {
+		return "", "", errors.New("registry path passes a symbolic link but cannot be resolved to an existing directory: a component before \"..\" does not exist")
+	}
+
+	// cur now names an existing directory using the kernel-meaningful
+	// crossing (with work/alias -> store/child, cur for "work/alias/.." maps
+	// onto store). Follow it textually and reattach a genuinely missing
+	// creation tail verbatim.
+	physAncestor, rerr := filepath.EvalSymlinks(cur)
+	if rerr != nil {
+		return "", "", fmt.Errorf("registry path is a symbolic link whose target cannot be resolved: %w", rerr)
+	}
+	physDir := physAncestor
+	for _, seg := range tail {
+		physDir = filepath.Join(physDir, seg)
+	}
+
+	// Diverge from the caller's spelling only when the lexical directory and
+	// the physical directory are different directories. ".." that crosses no
+	// link, or a symlinked /tmp-style prefix that lands back in the same
+	// directory, keeps the exact established target, temporary-file location
+	// and error wording. Identity compares the deepest existing ancestor
+	// followed to its real directory plus the remaining tail text.
+	lexParent := filepath.Dir(filepath.Clean(path))
+	lexAnchor, lexTail := longestExistingAncestor(lexParent)
+	same := false
+	if resolvedLexAnchor, e2 := filepath.EvalSymlinks(lexAnchor); e2 == nil {
+		if a1, e1 := os.Stat(physAncestor); e1 == nil {
+			if a2, e3 := os.Stat(resolvedLexAnchor); e3 == nil && os.SameFile(a1, a2) {
+				same = equalSegments(tail, lexTail)
+			}
+		}
+	}
+	if same {
+		return path, filepath.Dir(path), nil
+	}
+
+	target = filepath.Join(physDir, base)
+	// The computed file may itself be a dangling or looping link reached
+	// through the resolved ancestry; refuse it like a direct dangling link
+	// rather than replacing it with a regular file on rename.
+	if info, lerr := os.Lstat(target); lerr == nil && info.Mode()&os.ModeSymlink != 0 {
+		if _, ferr := filepath.EvalSymlinks(target); ferr != nil {
+			return "", "", fmt.Errorf("registry path is a symbolic link whose target cannot be resolved: %w", ferr)
+		}
+	} else if lerr != nil && !errors.Is(lerr, fs.ErrNotExist) {
+		return "", "", fmt.Errorf("cannot inspect registry path: %w", lerr)
+	}
+	return target, physDir, nil
+}
+
+// equalSegments reports whether two path tail lists are textually equal.
+func equalSegments(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// splitPathSegments breaks dir into its slash-separated segments, dropping
+// empty pieces from leading, trailing and repeated separators. "." and ".."
+// are kept as real segments for the caller to resolve.
+func splitPathSegments(dir string) []string {
+	var segs []string
+	for _, seg := range strings.Split(dir, string(filepath.Separator)) {
+		if seg != "" {
+			segs = append(segs, seg)
+		}
+	}
+	return segs
+}
+
+// longestExistingAncestor walks dir up to the longest ancestor that exists,
+// returning it together with the tail segments that were stripped, in
+// top-to-bottom order. Lstat resolves ".." the way the kernel does, so a
+// missing component past a symlinked directory is removed without ever
+// collapsing the link; a first registration reattaches the tail verbatim
+// once the real ancestor is known.
+func longestExistingAncestor(dir string) (existing string, missing []string) {
+	existing = dir
+	if existing == "" {
+		existing = "."
+	}
+	for {
+		if _, err := os.Lstat(existing); err == nil {
+			return existing, missing
+		} else if !errors.Is(err, fs.ErrNotExist) {
+			return existing, missing
+		}
+		upper, seg := filepath.Split(existing)
+		if seg == "" {
+			return existing, missing // reached a filesystem root
+		}
+		missing = append([]string{seg}, missing...)
+		if upper == "" {
+			return ".", missing // top of a relative chain: the working dir
+		}
+		existing = strings.TrimSuffix(upper, string(filepath.Separator))
+		if existing == "" {
+			existing = string(filepath.Separator)
+		}
+	}
 }
 
 // Save atomically writes reg to path, replacing the file only after the new
@@ -1079,9 +1274,17 @@ func resolveRegistryTarget(path string) (string, error) {
 // new content is prepared next to the target and moved over it, so the link
 // stays a link to the same target and the target keeps its permissions,
 // while reads through either the link or the real path see the saved
-// records. A link whose target does not exist, or a link loop, rejects the
-// save with an error naming path — the target is never created and the link
-// is never replaced.
+// records. The same holds when only an ancestor DIRECTORY is a link — even
+// with a ".." after it, as in work/alias/../batches.json where alias points
+// at store/child: lexical path cleaning would fold that to
+// work/batches.json, but the kernel resolves "alias/.." to store, and so
+// does the save. The temporary file is prepared in the real target
+// directory (store), so write permission on that directory alone is enough;
+// the link-side directory (work) is never written to and its own
+// batches.json, if any, is never touched. A link whose target does not
+// exist, or a link loop — whether the link is the registry file itself or
+// sits in a parent directory — rejects the save with an error naming path;
+// the target is never created and the link is never replaced.
 //
 // Every record must satisfy the same effective-value rules Load enforces, so
 // a registry saved successfully always reads back: batch, product and unit
@@ -1100,7 +1303,7 @@ func Save(path string, reg *Registry) error {
 	if err := validateForSave(reg); err != nil {
 		return fmt.Errorf("cannot save registry %q: %w", path, err)
 	}
-	target, err := resolveRegistryTarget(path)
+	target, dir, err := resolveRegistryTarget(path)
 	if err != nil {
 		return fmt.Errorf("cannot save registry %q: %w", path, err)
 	}
@@ -1111,7 +1314,7 @@ func Save(path string, reg *Registry) error {
 		return fmt.Errorf("cannot inspect registry %q: %w", path, err)
 	}
 
-	if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return fmt.Errorf("cannot save registry %q: %w", path, err)
 	}
 
@@ -1129,7 +1332,7 @@ func Save(path string, reg *Registry) error {
 		return fmt.Errorf("cannot encode registry %q: %w", path, err)
 	}
 
-	tmp, err := os.CreateTemp(filepath.Dir(target), ".govflow-registry-*.tmp")
+	tmp, err := os.CreateTemp(dir, ".govflow-registry-*.tmp")
 	if err != nil {
 		return fmt.Errorf("cannot save registry %q: %w", path, err)
 	}

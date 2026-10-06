@@ -149,8 +149,21 @@ A missing file is created on first registration. The registry path may be a
 symbolic link to an existing registry file: new batches are saved into the
 linked file (a relative link target is resolved against the link's own
 directory), the link itself is left untouched and the target keeps its
-permissions. A link whose target does not exist, or a loop of links, is
-rejected — the target is never created and the link is never replaced. An
+permissions. The file itself may be ordinary while an ancestor DIRECTORY is
+a link, even with a ".." after it: work/alias -> store/child and
+work/alias/../batches.json means store/batches.json, not work/batches.json,
+so reads and saves always address the same physical file. The temporary
+file is prepared in that real directory, so write permission on it alone is
+enough — work may stay read-and-execute only, work/batches.json is never
+created or touched, and no registry, temporary file or directory is ever
+created under work. A link whose target does not exist, or a loop of links
+— whether the link is the registry file itself or one of its parent
+directories — is rejected: the target is never created and the link is
+never replaced. When the real target directory is not writable, or saving
+there fails, the command exits non-zero: stderr names the registry path as
+passed and the concrete reason, stdout carries no result, the existing
+registry keeps its exact bytes and modification time, and no temporary
+file is left behind. An
 existing file that is empty, cannot be read in this format, or contains
 several records with the same batch number is rejected outright and never
 overwritten. "This format"

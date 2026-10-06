@@ -98,6 +98,18 @@ func runWrappedBatchImport() int {
 		// Part of the new content genuinely reaches the temporary file, then
 		// the write stops with the new table incomplete.
 		batchreg.WriteTempContent = func(f *os.File, data []byte) (int, error) {
+			// With WRAP_REAL_TARGET the registry is addressed through a
+			// directory symlink plus "..": the temporary file must be prepared
+			// next to the physical target, never on the link side.
+			if rt := os.Getenv("WRAP_REAL_TARGET"); rt != "" {
+				td, e1 := os.Stat(filepath.Dir(f.Name()))
+				rd, e2 := os.Stat(filepath.Dir(rt))
+				if e1 != nil || e2 != nil || !os.SameFile(td, rd) {
+					fmt.Fprintf(os.Stderr, "wrap harness: temporary file prepared in %q, want the real target directory of %q\n",
+						filepath.Dir(f.Name()), rt)
+					os.Exit(3)
+				}
+			}
 			half := len(data) / 2
 			if _, err := f.Write(data[:half]); err != nil {
 				fmt.Fprintf(os.Stderr, "wrap harness: setup write failed: %v\n", err)
@@ -110,7 +122,20 @@ func runWrappedBatchImport() int {
 		// refused; markers are checked on the prepared temporary file.
 		markers := strings.Split(os.Getenv("WRAP_MARKERS"), ",")
 		batchreg.RenameTempFile = func(oldpath, newpath string) error {
-			if newpath != registry {
+			if rt := os.Getenv("WRAP_REAL_TARGET"); rt != "" {
+				// Through a directory link the rename must replace the
+				// physical registry and the prepared file must sit beside it.
+				got, e1 := os.Stat(newpath)
+				want, e2 := os.Stat(rt)
+				if e1 != nil || e2 != nil || !os.SameFile(got, want) {
+					return harnessExit("rename must replace the real target %q, got %q", rt, newpath)
+				}
+				td, e3 := os.Stat(filepath.Dir(oldpath))
+				rd, e4 := os.Stat(filepath.Dir(rt))
+				if e3 != nil || e4 != nil || !os.SameFile(td, rd) {
+					return harnessExit("temporary file %q must be prepared next to the real target", oldpath)
+				}
+			} else if newpath != registry {
 				return harnessExit("rename must target %q, got %q", registry, newpath)
 			}
 			prepared, err := os.ReadFile(oldpath)

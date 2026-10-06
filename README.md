@@ -26,7 +26,7 @@ govflow batch-register \
   --unit kg
 ```
 
-- `--registry`：登记文件路径。文件不存在时在首次登记时创建。路径也可以是指向已有登记文件的符号链接：登记结果保存到链接指向的文件（相对目标以链接所在目录为基准），链接本身保持原样，目标文件保留原有权限；链接目标不存在或链接成环时，本次操作被拒绝，不会创建目标文件或改动链接。
+- `--registry`：登记文件路径。文件不存在时在首次登记时创建。路径也可以是指向已有登记文件的符号链接：登记结果保存到链接指向的文件（相对目标以链接所在目录为基准），链接本身保持原样，目标文件保留原有权限；链接目标不存在或链接成环时，本次操作被拒绝，不会创建目标文件或改动链接。登记文件本身是普通文件时，其**父目录也可以是符号链接**，即使路径里在目录链接之后还有 `..`：例如 `work/alias` 是指向 `store/child` 的目录链接，传入 `work/alias/../batches.json` 时，内核会把它解析到 `store/batches.json`（而不是按纯文本折叠成 `work/batches.json`），读取与保存始终指向同一份真实登记表，新记录追加到该文件末尾；临时文件只在真实目录 `store` 内创建，因此 `work` 即使只允许读取和进入、不允许创建文件，保存仍能成功，操作期间不会在 `work` 下创建登记表、临时文件或新目录，`work/batches.json`（若存在）与目录链接本身均保持原样。真实目标目录不可写、或在真实目标处保存失败时，操作按既有约定失败：退出码非零，stderr 指明用户传入的登记路径与具体原因，stdout 不输出成功结果，原登记表的字节与修改时间不变，也不留下临时文件。
 - `--batch`：批次编号，在同一登记文件内唯一。
 - `--product`：产品编号。
 - `--quantity`：数量，仅接受 `0`–`9` 组成的十进制正整数，允许前导零（如 `000120` 保存为 `120`），按整数值保存与比对，最大为 `9223372036854775807`。零、负数、小数、非 ASCII 数字和超范围值一律拒绝。
@@ -130,7 +130,7 @@ govflow: batch-import: manifest record 3 (batch "B1") conflicts with manifest re
 1. `batchreg.ParseManifest(data []byte) ([]batchreg.Input, error)`：解析清单文件字节。清单文件始终**只读**：由调用方自己读入，库只校验和转换这些字节，绝不创建或改写清单文件。
 2. `batchreg.Load(path string) (reg *batchreg.Registry, existed bool, err error)`：读取前文公开格式的登记文件。文件不存在不是错误：返回一个空登记表和 `existed == false`；已有但无法按公开格式读取的文件按错误拒绝，绝不覆盖。
 3. `batchreg.Import(reg *batchreg.Registry, inputs []batchreg.Input) (results []batchreg.ImportResult, err error)`：在**内存中**把清单合并进 `reg`，返回按清单顺序排列的逐条结果。
-4. `batchreg.Save(path string, reg *batchreg.Registry) error`：临时文件加原子替换，把登记表写入登记文件；此前不存在的文件在**保存成功后**创建（权限 0644），符号链接路径的规则与命令行章节完全相同。
+4. `batchreg.Save(path string, reg *batchreg.Registry) error`：临时文件加原子替换，把登记表写入登记文件；此前不存在的文件在**保存成功后**创建（权限 0644），符号链接路径（含父目录为目录符号链接、路径中带 `..` 的情形）的规则与命令行章节完全相同：临时文件始终建在真实目标目录，真实目标不可写或保存失败时原样拒绝并报错。
 
 `ImportResult` 含合并后的 `Batch`（四个字段）和 `Created bool`：`true` 表示该编号是本次新出现并追加的，`false` 表示重复确认。**`Import` 的返回值只是内存处理结果，不是登记完成的凭据**：新批次此刻只存在于内存中的 `reg`；只有随后 `Save` 成功返回，它们才真正被登记文件接受。
 
