@@ -29,6 +29,16 @@ var (
 	ErrProposalConflict = errors.New("proposal already registered with different timelock or actions")
 	// ErrInvalidRegistration：登记参数非法（编号为空、初始余额越界等）。
 	ErrInvalidRegistration = errors.New("invalid registration")
+	// ErrExecutionWrittenButDurabilityUnconfirmed：首次执行时状态文件的原子
+	// 替换已经成功——全部转账、proposal 的 executed 状态与首次执行凭据都已
+	// 写入——但替换后的目录 fsync 失败，这次变更的崩溃持久性尚未确认。
+	// 此时 Execute 仍返回非空的完整首次执行凭据，错误为
+	// *ExecutionWriteUnconfirmedError（携带提案编号、已写入凭据与原始保存
+	// 失败原因）。该结果不回滚：不撤销转账、不把提案退回 passed、不删除
+	// 凭据；再次执行同一编号只返回首次凭据，不重复扣款。它也不承诺持久化
+	// 已经确认——调用方应按“已写入但持久性未确认”告警，并用凭据查询复核。
+	// 发生在状态文件替换之前的保存失败不匹配本错误，仍按普通失败处理。
+	ErrExecutionWrittenButDurabilityUnconfirmed = errors.New("execution record written but durability unconfirmed")
 )
 
 const (
@@ -623,6 +633,20 @@ func proposalOwnerState(state *storedState, id string) (string, int64, []string,
 // 成功后状态变为 executed 并返回凭据。资格不符、动作格式错误、余额不足、
 // 金额计算溢出都返回明确原因，整项提案不产生部分转账，也不消耗执行机会。
 // 已完成提案再次执行（即使 now 不同）直接返回首次成功凭据。
+//
+// 保存结果分两种，调用方必须能够区分：
+//   - 保存失败发生在状态文件替换之前：按普通失败处理——返回具体错误、
+//     凭据为 nil，磁盘上仍是执行前的完整状态，提案条件满足后仍可执行。
+//   - 状态文件已经原子替换（转账、executed 状态与首次凭据都已写入），
+//     随后的保存目录 fsync 失败：返回非空的完整首次执行凭据，同时返回
+//     *ExecutionWriteUnconfirmedError（errors.Is 匹配
+//     ErrExecutionWrittenButDurabilityUnconfirmed，Unwrap 保留原始保存失败
+//     原因）。这不撤销已写入的转账、不把提案退回 passed、不删除凭据；
+//     正常重开同一资金库应看到整项提案已执行，余额与动作留痕对应，投票与
+//     计票记录保留；再次执行同一编号即使传入不同时间也只返回首次凭据，
+//     不再次扣款或追加成功记录。它也不承诺本次变更的持久性已经确认。
+//
+// 登记来源与投票通过来源的提案共用同一条执行与保存路径，规则相同。
 func (s *Store) Execute(id string, now int64) (*Receipt, error) {
 	commit, err := s.begin()
 	if err != nil {
@@ -683,10 +707,57 @@ func (s *Store) Execute(id string, now int64) (*Receipt, error) {
 	target.markExecuted()
 	state.Receipts = append(state.Receipts, receipt)
 
-	if err := s.commitLocked(state); err != nil {
+	swapped, err := s.commitPhasedLocked(state)
+	if err != nil && !swapped {
+		// 保存失败发生在状态文件替换之前：磁盘上仍是执行前的完整状态，
+		// 内存中的执行结果随栈上副本丢弃，按普通失败返回具体原因、无凭据。
 		return nil, err
 	}
-	return cloneReceipt(receipt), nil
+	written := cloneReceipt(receipt)
+	if err != nil {
+		// 状态文件已原子替换：全部转账、executed 状态与首次凭据均已写入，
+		// 只是替换后的目录 fsync 失败。返回完整首次凭据 + 可程序识别的错误，
+		// 不回滚、不退回 passed、不删除凭据，也不承诺持久性已确认。
+		return written, newExecutionWriteUnconfirmedError(id, written, err)
+	}
+	return written, nil
+}
+
+// ExecutionWriteUnconfirmedError 表示首次执行的写入已经到达状态文件
+// （原子改名已成功：转账、executed 状态与首次执行凭据都已写入），但保存
+// 目录的同步失败，这次变更的崩溃持久性尚未确认。
+//
+// 这不是“执行失败、没有写入”：ProposalID 给出提案编号，Receipt 是与正常
+// 查询完全一致的完整首次执行凭据（首次执行时间、提交序号、动作原文与
+// 各项余额变化均已落盘），Unwrap 保留目录同步的原始失败原因。
+// 调用方应当告警并在之后用 receipt 查询/重开资金库复核；不要重试执行、
+// 不要按失败回滚。
+type ExecutionWriteUnconfirmedError struct {
+	// ProposalID 是本次执行的提案编号。
+	ProposalID string
+	// Receipt 是已经写入状态文件的完整首次执行凭据副本，与随后正常查询
+	// 取得的记录一致。
+	Receipt *Receipt
+
+	cause error
+}
+
+func newExecutionWriteUnconfirmedError(id string, receipt *Receipt, cause error) *ExecutionWriteUnconfirmedError {
+	return &ExecutionWriteUnconfirmedError{ProposalID: id, Receipt: receipt, cause: cause}
+}
+
+// Is 让 errors.Is(err, ErrExecutionWrittenButDurabilityUnconfirmed) 成立，
+// 调用方可以在不关心具体类型的情况下程序识别这种结果。
+func (e *ExecutionWriteUnconfirmedError) Is(target error) bool {
+	return target == ErrExecutionWrittenButDurabilityUnconfirmed
+}
+
+// Unwrap 返回保存目录同步的原始失败原因，具体失败原因不丢失。
+func (e *ExecutionWriteUnconfirmedError) Unwrap() error { return e.cause }
+
+func (e *ExecutionWriteUnconfirmedError) Error() string {
+	return fmt.Sprintf("execution record written but durability unconfirmed for proposal %s: %v",
+		e.ProposalID, e.cause)
 }
 
 func findReceipt(receipts []*Receipt, id string) *Receipt {
@@ -907,50 +978,78 @@ func (s *Store) loadLocked() (*storedState, error) {
 }
 
 // commitLocked 序列化状态并以“临时文件 + fsync + 原子改名 + 目录 fsync”提交。
-// 任一步失败都保留上次完整状态。调用方必须持锁。
+// 任一步失败都返回错误。调用方必须持锁。
+//
+// 注意：失败发生的阶段对调用方有不同含义。原子改名（os.Rename）成功后，
+// 状态文件路径上读到的已是新状态（转账、executed 状态与凭据已经写入）；
+// 若随后的目录 fsync 失败，只是“这次变更能否在崩溃后仍保留”尚未确认。
+// 需要区分“尚未写入”与“已经写入但持久性未确认”的调用方使用
+// commitPhasedLocked；本方法只用于两种失败等价的路径（登记、投票、初始化）。
 func (s *Store) commitLocked(state *storedState) error {
+	if _, err := s.commitPhasedLocked(state); err != nil {
+		return err
+	}
+	return nil
+}
+
+// commitPhasedLocked 与 commitLocked 执行同一条“临时文件 + fsync + 原子改名
+// + 目录 fsync”提交，并额外返回 swapped：原子改名是否已经成功。
+//
+// swapped=false 且 err 非 nil：失败发生在状态文件替换之前，磁盘上仍是上次
+// 完整状态，本次没有任何写入（调用方按普通失败处理即可）。
+// swapped=true 且 err 非 nil：状态文件已经被原子替换为新内容，只是随后的
+// 目录 fsync 失败；调用方必须把这次结果表达为“已经写入，但持久性未确认”，
+// 不得回滚已写入的内容，也不得承诺持久化已确认。调用方必须持锁。
+func (s *Store) commitPhasedLocked(state *storedState) (swapped bool, err error) {
 	if err := validateState(state); err != nil {
-		return fmt.Errorf("refusing to persist invalid state: %w", err)
+		return false, fmt.Errorf("refusing to persist invalid state: %w", err)
 	}
 	payload, err := json.MarshalIndent(state, "", "  ")
 	if err != nil {
-		return err
+		return false, err
 	}
 	payload = append(payload, '\n')
 
 	dir := filepath.Dir(s.path)
 	tmp, err := os.CreateTemp(dir, ".govflow-state-*")
 	if err != nil {
-		return err
+		return false, err
 	}
 	tmpName := tmp.Name()
 	cleanup := func() { _ = os.Remove(tmpName) }
 	if _, err := tmp.Write(payload); err != nil {
 		_ = tmp.Close()
 		cleanup()
-		return err
+		return false, err
 	}
 	if err := tmp.Sync(); err != nil {
 		_ = tmp.Close()
 		cleanup()
-		return err
+		return false, err
 	}
 	if err := tmp.Close(); err != nil {
 		cleanup()
-		return err
+		return false, err
 	}
 	if err := os.Chmod(tmpName, 0o600); err != nil {
 		cleanup()
-		return err
+		return false, err
+	}
+	if ferr := commitBeforeRenameFault(); ferr != nil {
+		cleanup()
+		return false, ferr
 	}
 	if err := os.Rename(tmpName, s.path); err != nil {
 		cleanup()
-		return err
+		return false, err
 	}
-	if err := syncDir(dir); err != nil {
-		return err
+	// 原子改名成功：状态文件路径上的内容已是新状态。此后的失败不能再把结果
+	// 解释成“尚未写入”。
+	swapped = true
+	if ferr := syncDirFault(dir); ferr != nil {
+		return true, ferr
 	}
-	return nil
+	return true, nil
 }
 
 func syncDir(dir string) error {
@@ -960,6 +1059,29 @@ func syncDir(dir string) error {
 	}
 	defer d.Close()
 	return d.Sync()
+}
+
+// 以下两个环境变量只用于确定性测试，生产路径上不设置它们，行为与直接
+// 调用 os.Rename / syncDir 完全一致：
+//   - GOVFLOW_TEST_FAIL_COMMIT_BEFORE_RENAME：值非空时，commitPhasedLocked 在
+//     原子改名之前直接返回该错误（临时文件清理、磁盘状态保持原样），模拟
+//     “保存失败发生在状态文件替换之前”；
+//   - GOVFLOW_TEST_FAIL_DIR_SYNC：值非空时，commitPhasedLocked 在原子改名成功
+//     之后跳过目录 fsync 并返回该错误，模拟“状态文件已替换但目录同步失败”。
+//
+// 两者都在持锁区间内生效，且不改变正常保存路径的任何步骤。
+func commitBeforeRenameFault() error {
+	if msg := os.Getenv("GOVFLOW_TEST_FAIL_COMMIT_BEFORE_RENAME"); msg != "" {
+		return errors.New(msg)
+	}
+	return nil
+}
+
+func syncDirFault(dir string) error {
+	if msg := os.Getenv("GOVFLOW_TEST_FAIL_DIR_SYNC"); msg != "" {
+		return errors.New(msg)
+	}
+	return syncDir(dir)
 }
 
 // validateState 做结构校验并重放全部凭据，确认余额与凭据完全一致。

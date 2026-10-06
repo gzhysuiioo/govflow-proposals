@@ -490,6 +490,23 @@ func runExecute(args []string) {
 	defer store.Close()
 	receipt, err := store.Execute(*id, now)
 	if err != nil {
+		// 状态文件已经替换成功、随后保存目录同步失败：执行记录（转账、
+		// executed 状态、首次凭据）已经写入，但这次变更的持久性未确认。
+		// 凭据本身照常输出到标准输出（文本/--json 与成功时同一份对象），
+		// 告警与原始原因写到 stderr，仍以退出码 1 结束；不能把它报成
+		// “完全没有执行”，也不能输出空凭据或失败前余额。
+		var unconfirmed *govflow.ExecutionWriteUnconfirmedError
+		if errors.As(err, &unconfirmed) {
+			if cf.asJSON {
+				emitJSON(unconfirmed.Receipt)
+			} else {
+				printReceiptText(unconfirmed.Receipt, false)
+			}
+			fmt.Fprintf(os.Stderr,
+				"warning: 执行记录已写入，但持久性未确认：提案 %s 的转账、executed 状态与首次执行凭据已写入状态文件，保存目录同步失败：%v\n",
+				unconfirmed.ProposalID, errors.Unwrap(err))
+			os.Exit(1)
+		}
 		fail(err)
 	}
 	if cf.asJSON {
