@@ -145,7 +145,17 @@ registry file format (UTF-8 JSON, human-inspectable):
       {"batch": "B-001", "product": "P-7", "quantity": 120, "unit": "kg"}
     ]
   }
-A missing file is created on first registration. The registry path may be a
+A missing file is created on first registration, and a registry whose parent
+directory does not yet exist is created together with that directory, as long
+as the path never climbs back out of a directory it just descended into. A
+path that first passes through a directory that does not exist and then steps
+back with ".." — store/missing/../batches.json while store/missing is absent —
+names no file the way the filesystem resolves names and is rejected outright:
+the missing directory is not created to make the path valid, the name left
+after dropping the missing segment is not written (an existing registry there
+is never overwritten), and no temporary file remains. A ".." that follows a
+directory which really exists keeps working by the real directory relations.
+The registry path may be a
 symbolic link to an existing registry file: new batches are saved into the
 linked file (a relative link target is resolved against the link's own
 directory), the link itself is left untouched and the target keeps its

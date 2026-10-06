@@ -1061,6 +1061,16 @@ var (
 // verbatim onto the longest existing prefix, so creating a new file needs
 // write permission only in the directory that really holds it.
 //
+// A path that descends into a directory that does not exist and only then
+// climbs back with ".." — store/missing/../batches.json with no store/missing
+// — cannot reach any file the way the kernel resolves names, so it is an
+// error rather than a first registration: the save neither creates the
+// missing directory (which would turn an unresolvable path into a live one)
+// nor writes the lexically cleaned name (store/batches.json), which may be an
+// unrelated existing registry. A path that only creates new directories
+// without climbing back out (store/new/batches.json), or climbs ".." after a
+// prefix that really exists, is resolved and saved normally.
+//
 // A dangling symbolic link or a link loop — on the final component or on a
 // directory leading to it — is an error: the save must not create the target
 // or overwrite the link as if this were a first registration.
@@ -1076,6 +1086,13 @@ func resolveRegistryTarget(path string) (string, error) {
 	for {
 		info, err := os.Lstat(cur)
 		if err == nil {
+			// Refuse a ".." among the not-yet-existing components that climbs
+			// back out of a directory which would first have to be created:
+			// the user's path itself cannot name anything there, and creating
+			// the directory would make a previously unresolvable path valid.
+			if missing, escape := missingDirDotDotEscape(tail); escape {
+				return "", errEscapeThroughMissingDir(missing)
+			}
 			// cur is the longest existing prefix. Resolve it physically: an
 			// absolute link target, or a relative one resolved against the
 			// link's own directory (never the process working directory), is
@@ -1101,14 +1118,67 @@ func resolveRegistryTarget(path string) (string, error) {
 			return "", fmt.Errorf("cannot inspect registry path: %w", err)
 		}
 		parent, base := rawParent(cur)
+		tail = append(tail, base)
 		if parent == cur {
 			// A bare relative name with no existing prefix: it names a file
-			// in the process working directory, just as a plain open would.
+			// in the process working directory, just as a plain open would —
+			// unless it climbs ".." out of a directory that does not exist.
+			if missing, escape := missingDirDotDotEscape(tail); escape {
+				return "", errEscapeThroughMissingDir(missing)
+			}
 			return filepath.Clean(path), nil
 		}
-		tail = append(tail, base)
 		cur = parent
 	}
+}
+
+// missingDirDotDotEscape inspects the raw components stripped while climbing
+// to the longest existing prefix. tail holds them from the registry file end
+// (tail[0] is the final, registry-file component) toward the existing prefix
+// (tail[len-1] sits next to it). A ".." that climbs out of a directory
+// descended into only within the not-yet-existing tail marks exactly the
+// unresolvable shape — store/missing/../batches.json — that must be refused:
+// the kernel cannot resolve the ".." until "missing" exists, and it never
+// legitimately exists on this path.
+//
+// The final component is the registry file name, never a directory descent,
+// so tail[0] is not counted. ".." steps matched by an equally non-existent
+// descent keep the lexical depth positive and do not cancel the violation:
+// the first ".." that leaves a missing directory is already fatal. The
+// returned name is the missing directory that ".." immediately tries to
+// leave. Symlinked or genuinely existing components never reach tail, so
+// this never trips over a physical ".." (as after work/alias -> store/child).
+func missingDirDotDotEscape(tail []string) (missing string, escape bool) {
+	depth := 0
+	lastMissing := ""
+	// Walk from the existing-prefix side toward the file.
+	for i := len(tail) - 1; i >= 1; i-- {
+		switch tail[i] {
+		case ".", "":
+			// A "." (or the empty segment of a doubled separator) is a
+			// lexical no-op even in the not-yet-existing tail.
+		case "..":
+			if depth > 0 {
+				return lastMissing, true
+			}
+			depth--
+		default:
+			depth++
+			lastMissing = tail[i]
+		}
+	}
+	return "", false
+}
+
+// errEscapeThroughMissingDir is the refusal reason for a registry path that
+// descends into a non-existent directory and then climbs back with "..". The
+// Save wrapper adds the user-supplied path; the missing directory is named so
+// the user can see which component made the path unresolvable.
+func errEscapeThroughMissingDir(missing string) error {
+	return fmt.Errorf(
+		"the path descends through directory %s, which does not exist, and then climbs back with \"..\"; "+
+			"such a path cannot reach an existing file and the missing directory is not created to make it valid, so the registry is not written",
+		strconv.Quote(missing))
 }
 
 // rawParent splits path at its final separator without resolving "..", so the
@@ -1140,6 +1210,17 @@ func rawParent(path string) (parent, base string) {
 // or a link loop, on the file or on a leading directory, rejects the save
 // with an error naming path — the target is never created and the link is
 // never replaced.
+//
+// A path that descends through a directory that does not exist and only then
+// climbs back with ".." (store/missing/../batches.json with store/missing
+// absent) is likewise rejected before anything is written: such a path
+// reaches no file the way the kernel resolves names, so the save neither
+// creates the missing directory — which would turn the unresolvable path into
+// a live one — nor writes the lexically cleaned name, where an unrelated
+// registry could be overwritten. A ".." after a directory that genuinely
+// exists, including the real target of a directory symlink, still resolves by
+// real directory relations, and a not-yet-existing parent that is never
+// climbed out of (store/new/batches.json) is created as on any first save.
 //
 // Every record must satisfy the same effective-value rules Load enforces, so
 // a registry saved successfully always reads back: batch, product and unit
