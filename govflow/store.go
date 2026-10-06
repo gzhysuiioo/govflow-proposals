@@ -282,6 +282,14 @@ func (p *storedProposal) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
+// storedState 是状态文件的顶层形状。
+//
+// initial_treasury 与 treasury 都必须明确写出且为 int64 整数：字段缺失、为
+// null 或类型不符都不得被折叠成 0 再当作合法余额读出——某个余额本来应为 0
+// 时（初始为零的资金库、全部转出后的当前余额），缺失字段与明确写出的 0 在
+// 解码后必须仍可区分。资金记录是否完整独立判断，不能只凭其余记录（账户余额、
+// 执行凭据）恰好能与零核对一致就认可缺损文件，也不能据此推算补齐。因此解码时
+// 保留两个字段的原始 JSON，由 validateTreasuryFields 区分“缺失/空值/类型不符”。
 type storedState struct {
 	Magic           string                         `json:"magic"`
 	Version         int                            `json:"version"`
@@ -291,6 +299,44 @@ type storedState struct {
 	Proposals       map[string]*storedProposal     `json:"proposals"`
 	Receipts        []*Receipt                     `json:"receipts"`
 	VoteProposals   map[string]*storedVoteProposal `json:"vote_proposals"`
+
+	initialTreasuryRaw json.RawMessage
+	treasuryRaw        json.RawMessage
+}
+
+// storedStateJSONShape 只用于解码，按保存格式的字段名逐字接住每个字段的原始 JSON。
+type storedStateJSONShape struct {
+	Magic           string                         `json:"magic"`
+	Version         int                            `json:"version"`
+	InitialTreasury json.RawMessage                `json:"initial_treasury"`
+	Treasury        json.RawMessage                `json:"treasury"`
+	Balances        map[string]int64               `json:"balances"`
+	Proposals       map[string]*storedProposal     `json:"proposals"`
+	Receipts        []*Receipt                     `json:"receipts"`
+	VoteProposals   map[string]*storedVoteProposal `json:"vote_proposals"`
+}
+
+// UnmarshalJSON 保留 initial_treasury/treasury 是否出现及其原始写法（缺失为
+// nil、null 为 "null"），使“字段缺失”与“显式写出 0”在解码后仍可区分：
+// encoding/json 直接解进 int64 会把缺失/null/类型不符都折叠成 0，缺失余额的
+// 文件就会在其余记录恰好与零核对一致时被误当成完整资金库。判定统一交给
+// validateTreasuryFields，此处只在字段确实是 int64 整数时填充值。
+func (s *storedState) UnmarshalJSON(data []byte) error {
+	var shape storedStateJSONShape
+	if err := json.Unmarshal(data, &shape); err != nil {
+		return err
+	}
+	s.Magic = shape.Magic
+	s.Version = shape.Version
+	s.Balances = shape.Balances
+	s.Proposals = shape.Proposals
+	s.Receipts = shape.Receipts
+	s.VoteProposals = shape.VoteProposals
+	s.initialTreasuryRaw = shape.InitialTreasury
+	s.treasuryRaw = shape.Treasury
+	fillInt64(shape.InitialTreasury, &s.InitialTreasury)
+	fillInt64(shape.Treasury, &s.Treasury)
+	return nil
 }
 
 // Store 是绑定到单个本地状态文件的资金库句柄。
@@ -480,6 +526,9 @@ func (s *Store) begin() (func(), error) {
 }
 
 func newStoredState(treasury int64) *storedState {
+	// 同步填上字段原始片段，使“提交前校验”与“打开重放校验”走同一份
+	// initial_treasury/treasury 判定时不会把本进程新建的状态误判为字段缺失。
+	treasuryRaw, _ := json.Marshal(treasury)
 	return &storedState{
 		Magic:           stateMagic,
 		Version:         stateVersion,
@@ -489,6 +538,9 @@ func newStoredState(treasury int64) *storedState {
 		Proposals:       map[string]*storedProposal{},
 		Receipts:        []*Receipt{},
 		VoteProposals:   map[string]*storedVoteProposal{},
+
+		initialTreasuryRaw: treasuryRaw,
+		treasuryRaw:        treasuryRaw,
 	}
 }
 
@@ -718,6 +770,9 @@ func (s *Store) Execute(id string, now int64) (*Receipt, error) {
 	// 提交前 validateState 才能与读取路径走同一份“数组且非空”判定。
 	receipt.actionsRaw, _ = json.Marshal(receipt.Actions)
 	state.Treasury = simTreasury
+	// 同步更新字段原始片段：提交前 validateState 与读取路径走同一份
+	// treasury 判定，本进程刚写入的余额不得被误判为字段缺失。
+	state.treasuryRaw, _ = json.Marshal(simTreasury)
 	state.Balances = simBalances
 	target.markExecuted()
 	state.Receipts = append(state.Receipts, receipt)
@@ -1019,6 +1074,13 @@ func validateState(state *storedState) error {
 	if state.Version != stateVersion {
 		return fmt.Errorf("unsupported state version %d", state.Version)
 	}
+	// initial_treasury 与 treasury 是资金记录的根基，两个字段都必须明确写出：
+	// 缺失、为 null 或类型不符（字符串/布尔/小数/指数/超界）都判整份状态损坏，
+	// 错误指出是哪一个字段。不能根据另一项余额、账户余额或执行凭据推算补齐——
+	// 即使其余记录恰好能与零核对一致；明确写出的 0 是合法余额，不得当成缺失。
+	if err := validateTreasuryFields(state); err != nil {
+		return err
+	}
 	if state.InitialTreasury < 0 {
 		return errors.New("initial treasury balance is negative")
 	}
@@ -1209,6 +1271,23 @@ func quoteAccounts(accounts []string) []string {
 		quoted[i] = strconv.Quote(account)
 	}
 	return quoted
+}
+
+// validateTreasuryFields 严格判定状态文件顶层的两个资金库余额字段：
+// initial_treasury 与 treasury 都必须明确写出、非 null 且为 int64 范围内的
+// JSON 整数。任一字段缺失都判整份状态损坏，错误指出缺失的是 initial_treasury
+// 还是 treasury；资金记录是否完整独立判断，不能根据另一项余额、账户余额或
+// 执行凭据推算补齐——即使其余记录恰好能与零核对一致。明确写出的整数 0 是合法
+// 余额（初始为零且尚无凭据的资金库、全部转出后的当前余额），不得当成缺失。
+// “缺失/空值/类型不符”的判定与凭据、提案时间锁等必填字段共用同一份规则
+// （validateRawFields），此处只补充业务位置：状态文件顶层字段。
+func validateTreasuryFields(state *storedState) error {
+	return validateRawFields([]rawField{
+		{name: "initial_treasury", kind: scalarInteger, raw: state.initialTreasuryRaw},
+		{name: "treasury", kind: scalarInteger, raw: state.treasuryRaw},
+	}, func(field, problem string) error {
+		return fmt.Errorf("state field %q %s", field, problem)
+	})
 }
 
 // validateProposalTimelock 严格判定一条已登记提案的 timelock_end：
@@ -1405,6 +1484,12 @@ func schemaOf(t reflect.Type) *schemaNode {
 var storedStateSchema = schemaOf(reflect.TypeOf(storedState{}))
 
 func init() {
+	// 顶层的 initial_treasury 与 treasury 由 validateTreasuryFields 判定
+	// “缺失/空值/类型不符”，其错误原因需要指出具体是哪一个余额字段；
+	// 因此结构扫描在这两个叶子位置保持宽松（kindAny），不抢在解码器之前
+	// 用不含字段归属的通用信息报错。
+	storedStateSchema.fields["initial_treasury"].kind = kindAny
+	storedStateSchema.fields["treasury"].kind = kindAny
 	// 票据的四个标量字段（representative/weight/support/voted_at）由
 	// validateStoredBallot 逐票判定“缺失/空值/类型不符”，其错误原因需要带上
 	// 提案编号、票据下标与字段名；因此结构扫描在这些叶子位置保持宽松（kindAny），
