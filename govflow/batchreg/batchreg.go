@@ -1043,31 +1043,83 @@ var (
 	RenameTempFile   = os.Rename
 )
 
-// resolveRegistryTarget returns the file a save to path must actually
-// replace. When path is a symbolic link, the link is followed to its target
-// — an absolute target, or a relative one resolved against the link's own
-// directory, never against the process working directory — so the save
-// updates the file the user sees through the link instead of replacing the
-// link with a regular file. A dangling link or a link loop is an error: the
-// save must not create the target or overwrite the link as if this were a
-// first registration. A non-link path (existing or not) is returned
-// unchanged.
+// resolveRegistryTarget returns the real file a save to path must replace,
+// resolved the same way the kernel resolves path for reads: every symbolic
+// link is chased — links on DIRECTORY components included — and every ".."
+// steps out of the directory it really leaves, not out of the link's own
+// parent name. The result is a cleaned path with no link or ".." component
+// naming exactly the file Load read, so the temporary file and the rename
+// land in the target's real directory (a relative path stays relative,
+// resolved against the process working directory as the input was).
+//
+// Physical resolution is what keeps read and save locations identical when a
+// directory link is followed by "..": with work/alias -> store/child, the
+// path work/alias/../batches.json means store/batches.json. Lexical cleaning
+// (filepath.Clean, filepath.Dir) collapses alias/.. to work and would save
+// next to the link — into an unrelated, possibly read-only directory.
+// Components missing from the filesystem (a first registration) are appended
+// verbatim onto the longest existing prefix, so creating a new file needs
+// write permission only in the directory that really holds it.
+//
+// A dangling symbolic link or a link loop — on the final component or on a
+// directory leading to it — is an error: the save must not create the target
+// or overwrite the link as if this were a first registration.
 func resolveRegistryTarget(path string) (string, error) {
-	info, err := os.Lstat(path)
-	if err != nil {
-		if errors.Is(err, fs.ErrNotExist) {
-			return path, nil
+	// Climb through components missing from the filesystem by stripping raw
+	// path segments, never by lexical cleaning: filepath.Clean would collapse
+	// "alias/.." against the link's own parent name before the kernel ever
+	// resolves alias, sending the save at work/x.json instead of store/x.json.
+	// os.Lstat resolves every component but the last exactly as the kernel
+	// does, so each surviving prefix is checked with its real meaning.
+	cur := path
+	var tail []string
+	for {
+		info, err := os.Lstat(cur)
+		if err == nil {
+			// cur is the longest existing prefix. Resolve it physically: an
+			// absolute link target, or a relative one resolved against the
+			// link's own directory (never the process working directory), is
+			// followed; a dangling link or a loop fails here and is reported
+			// as an unusable symbolic link rather than a fresh-registry path.
+			base, eerr := filepath.EvalSymlinks(cur)
+			if eerr != nil {
+				if info.Mode()&os.ModeSymlink != 0 {
+					return "", fmt.Errorf("registry path is a symbolic link whose target cannot be resolved: %w", eerr)
+				}
+				return "", fmt.Errorf("cannot inspect registry path: %w", eerr)
+			}
+			// Append the not-yet-existing components verbatim: a first
+			// registration needs write permission only in the real directory
+			// that will hold the file, never in directories merely traversed.
+			target := base
+			for i := len(tail) - 1; i >= 0; i-- {
+				target = filepath.Join(target, tail[i])
+			}
+			return filepath.Clean(target), nil
 		}
-		return "", fmt.Errorf("cannot inspect registry path: %w", err)
+		if !errors.Is(err, fs.ErrNotExist) {
+			return "", fmt.Errorf("cannot inspect registry path: %w", err)
+		}
+		parent, base := rawParent(cur)
+		if parent == cur {
+			// A bare relative name with no existing prefix: it names a file
+			// in the process working directory, just as a plain open would.
+			return filepath.Clean(path), nil
+		}
+		tail = append(tail, base)
+		cur = parent
 	}
-	if info.Mode()&os.ModeSymlink == 0 {
-		return path, nil
+}
+
+// rawParent splits path at its final separator without resolving "..", so the
+// caller can climb one raw component at a time and keep physical resolution of
+// any directory link in the surviving prefix.
+func rawParent(path string) (parent, base string) {
+	i := strings.LastIndexByte(path, os.PathSeparator)
+	if i < 0 {
+		return path, path
 	}
-	target, err := filepath.EvalSymlinks(path)
-	if err != nil {
-		return "", fmt.Errorf("registry path is a symbolic link whose target cannot be resolved: %w", err)
-	}
-	return target, nil
+	return path[:i], path[i+1:]
 }
 
 // Save atomically writes reg to path, replacing the file only after the new
@@ -1075,13 +1127,19 @@ func resolveRegistryTarget(path string) (string, error) {
 // Records are serialized in their current order; the file is created with
 // 0644 permissions or, when replacing an existing file, with its permissions.
 //
-// When path is a symbolic link, the link's target is the file replaced: the
-// new content is prepared next to the target and moved over it, so the link
-// stays a link to the same target and the target keeps its permissions,
-// while reads through either the link or the real path see the saved
-// records. A link whose target does not exist, or a link loop, rejects the
-// save with an error naming path — the target is never created and the link
-// is never replaced.
+// When path reaches the registry through a symbolic link, the link's target
+// is the file replaced: the new content is prepared next to the target and
+// moved over it, so the link stays a link to the same target and the target
+// keeps its permissions, while reads through either the link or the real
+// path see the saved records. This holds for a link on the final component
+// and for a link on a DIRECTORY component, including a ".." that steps back
+// after it: with work/alias -> store/child, work/alias/../batches.json is
+// store/batches.json, and the save writes there even though the directory
+// containing the link (here work) is not writable — write access is needed
+// only in the target's real directory. A link whose target does not exist,
+// or a link loop, on the file or on a leading directory, rejects the save
+// with an error naming path — the target is never created and the link is
+// never replaced.
 //
 // Every record must satisfy the same effective-value rules Load enforces, so
 // a registry saved successfully always reads back: batch, product and unit
