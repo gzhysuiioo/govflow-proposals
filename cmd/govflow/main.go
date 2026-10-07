@@ -147,7 +147,15 @@ registry file format (UTF-8 JSON, human-inspectable):
   }
 A missing file is created on first registration, and a registry whose parent
 directory does not yet exist is created together with that directory, as long
-as the path never climbs back out of a directory it just descended into. A
+as the path never climbs back out of a directory it just descended into.
+The --registry path must name a FILE: a path ending in one or more separators
+("store/new.json/") or whose final component is "." or ".." ("store/new/.",
+"store/new/..") denotes a directory and is rejected outright — whether that
+location is absent, already a directory, or the name left after dropping the
+trailing component happens to be an existing registry file, which is then left
+exactly as it was. Relative and absolute paths are handled the same way; a "."
+or ".." in the middle of a path is not a directory spelling and keeps working
+as described below. A
 path that first passes through a directory that does not exist and then steps
 back with ".." — store/missing/../batches.json while store/missing is absent —
 names no file the way the filesystem resolves names and is rejected outright:
