@@ -642,6 +642,31 @@ func countField(fields []objectField, name string) int {
 	return n
 }
 
+// storedDuplicateID reports the first batch id held by two records of the
+// registry as handed in, scanning in stored order: Batch is that id, First
+// the 1-based position of its first record and Second the position of its
+// earliest repeat. It returns nil when every stored id is unique. Ids compare
+// byte for byte, so "B1", "b1" and " B1 " are different ids.
+//
+// Register and Import run this check because a Go caller may hand them a
+// Registry assembled directly — without Load — whose records already share an
+// id. Neither entry point may then treat one of those records as the id's
+// record (confirming a repeat against it, conflicting with it or appending
+// next to it), and neither may repair the registry by dropping or merging a
+// record: the only honest answer is the DuplicateIDError Load would have
+// raised.
+func storedDuplicateID(reg *Registry) *DuplicateIDError {
+	seen := make(map[string]int, len(reg.Batches))
+	for i, b := range reg.Batches {
+		pos := i + 1
+		if first, dup := seen[b.Batch]; dup {
+			return &DuplicateIDError{Batch: b.Batch, First: first, Second: pos}
+		}
+		seen[b.Batch] = pos
+	}
+	return nil
+}
+
 func validate(reg *Registry) error {
 	seen := make(map[string]int, len(reg.Batches))
 	for i, b := range reg.Batches {
@@ -883,7 +908,13 @@ func validateManifestInput(in Input, pos int) error {
 // field or a quantity outside 1..MaxQuantity — whether its batch id is new,
 // already stored or seen earlier in this submission — or if any record
 // conflicts with a stored record or with an earlier manifest record, and reg
-// is left untouched on error. Directly submitted text is kept verbatim. New
+// is left untouched on error. A reg that already holds two records under one
+// batch id (only possible when it was assembled directly, since Load refuses
+// such files) likewise fails the whole submission with a *DuplicateIDError
+// naming the id and the two 1-based stored positions — checked after the
+// version and record validations above, before any create, duplicate
+// confirmation or conflict, and leaving reg exactly as handed in. Directly
+// submitted text is kept verbatim. New
 // batch ids are appended in first-occurrence order; an id already stored or
 // introduced earlier in the same manifest is confirmed as a duplicate only
 // when product, quantity and unit all match. Results come back in manifest
@@ -906,6 +937,16 @@ func Import(reg *Registry, inputs []Input) (results []ImportResult, err error) {
 		if err := validateManifestInput(in, i+1); err != nil {
 			return nil, err
 		}
+	}
+
+	// A registry that already holds two records under one id — possible only
+	// when the caller assembled it directly, since Load refuses such files —
+	// rejects the whole submission before any create, duplicate confirmation
+	// or conflict is weighed: the existing records are ambiguous and Import
+	// must neither pick one of them as the id's record nor repair the
+	// registry on its own.
+	if dup := storedDuplicateID(reg); dup != nil {
+		return nil, dup
 	}
 
 	// Work on a copy: a rejected manifest must never partially land in reg.
@@ -960,8 +1001,13 @@ func diffFields(existing Batch, in Input) []string {
 
 // Register adds in to reg, or confirms the identical record already stored
 // under the same batch id. A batch id held by a record differing in product,
-// quantity or unit produces a *ConflictError and leaves reg untouched. The
-// zero Outcome is returned together with the error.
+// quantity or unit produces a *ConflictError and leaves reg untouched. A reg
+// that already holds two records under one batch id (only possible when it
+// was assembled directly, since Load refuses such files) produces a
+// *DuplicateIDError naming the id and the two 1-based stored positions —
+// reported after the version and input validations above, before any stored
+// record is consulted, and leaving reg exactly as handed in. The zero Outcome
+// is returned together with the error.
 func Register(reg *Registry, in Input) (Outcome, error) {
 	if reg.Version != FormatVersion {
 		return Outcome{}, fmt.Errorf("unsupported registry version %d", reg.Version)
@@ -977,6 +1023,14 @@ func Register(reg *Registry, in Input) (Outcome, error) {
 	}
 	if !quantityInRange(in.Quantity) {
 		return Outcome{}, fmt.Errorf("quantity must be a positive integer no greater than %d", MaxQuantity)
+	}
+	// A registry already holding two records under one id — possible only
+	// when the caller assembled it directly, since Load refuses such files —
+	// rejects the registration before the stored records are consulted: no
+	// record may be picked as the id's record for a confirmation or a
+	// conflict, and the ambiguous records are never merged or pruned.
+	if dup := storedDuplicateID(reg); dup != nil {
+		return Outcome{}, dup
 	}
 	for _, b := range reg.Batches {
 		if b.Batch != in.Batch {
