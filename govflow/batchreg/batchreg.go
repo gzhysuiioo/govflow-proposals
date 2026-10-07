@@ -1173,6 +1173,68 @@ var (
 // fs.ErrNotExist alone, and only the former is a first registration.
 var errUnreachablePathLink = errors.New("a symbolic link in the registry path has a target that does not exist or cannot be resolved")
 
+// registryPathPrefix is the result of climbing one registry path to its
+// longest existing prefix. existing is that prefix exactly as spelled by the
+// caller (never lexically cleaned), with isLink reporting whether the prefix
+// itself is a symbolic link; when no component exists yet existing is "". tail
+// holds the raw components still missing beyond the prefix, ordered from the
+// registry file end (tail[0] is the final, registry-file component) toward the
+// prefix (tail[len-1] sits next to it). A Lstat failure on a missing component
+// other than "not exist" is carried in err for the caller that distinguishes
+// such failures; the read check deliberately lets the later read report it.
+type registryPathPrefix struct {
+	existing string
+	isLink   bool
+	tail     []string
+	err      error
+}
+
+// longestExistingRegistryPrefix holds the reachability climb shared by Load
+// and Save: it strips raw path segments — never lexical cleaning, which would
+// collapse "alias/.." before the kernel resolves alias — until Lstat names an
+// existing prefix, recording every stripped segment so each caller can apply
+// its own rules to the same facts.
+//
+// A ".." among the stripped components means different things to the two
+// callers and is therefore NOT judged here: after an ordinary missing
+// directory it is harmless for a read (the read creates nothing and Save runs
+// its own stricter refusal before writing), while a save must reject the shape
+// outright; after a dangling symbolic-link prefix it is fatal for both. The
+// callers own those verdicts; the climb itself only calls Lstat, so it never
+// creates a directory, registry file or temporary file and never modifies a
+// link.
+func longestExistingRegistryPrefix(path string) registryPathPrefix {
+	var p registryPathPrefix
+	cur := path
+	for {
+		info, err := os.Lstat(cur)
+		if err == nil {
+			p.existing = cur
+			p.isLink = info.Mode()&os.ModeSymlink != 0
+			return p
+		}
+		parent, base := rawParent(cur)
+		p.tail = append(p.tail, base)
+		if parent == cur {
+			// No existing prefix at all: a bare relative name resolved
+			// against the process working directory, the same way an ordinary
+			// open would. No symbolic link could have been encountered. The
+			// final component stays in tail, so the save's escape check still
+			// sees a ".." that climbs out of a missing leading directory.
+			return p
+		}
+		if !errors.Is(err, fs.ErrNotExist) && p.err == nil {
+			// Remember the first non-not-exist failure met while climbing (the
+			// deepest component, exactly the one the save used to report on
+			// immediately); the read check leaves it for the read itself to
+			// report, while the save refuses on it before creating or writing
+			// anything.
+			p.err = err
+		}
+		cur = parent
+	}
+}
+
 // checkRegistryPathReachable decides, before the registry bytes are read,
 // whether path can reach anything the way the kernel resolves names. It
 // exists because os.ReadFile reports fs.ErrNotExist both for a registry file
@@ -1183,53 +1245,37 @@ var errUnreachablePathLink = errors.New("a symbolic link in the registry path ha
 // a directory the link never reaches, on work/alias/../batches.json too —
 // returns exactly the not-exist error even when work/batches.json exists.
 //
-// The check climbs through the raw components missing from the filesystem
-// (never by lexical cleaning, which would collapse "alias/.." before the
-// kernel resolves alias) to the longest existing prefix. A ".." among the
-// missing components is harmless here: without a symbolic link in the path
-// the prefix genuinely exists, so such a path is either a real file (read
-// normally) or a path through missing ordinary directories, and reading is
-// allowed either way — the read creates nothing and Save runs its own
-// stricter refusal before writing. What must fail is an existing prefix that
-// is itself a symbolic link which cannot be chased to a real directory:
-// EvalSymlinks on the prefix names exactly that failure for a dangling
-// link or a link loop, including one reached through several links. A
-// relative link target is resolved by EvalSymlinks against the link's own
-// directory, matching the kernel. The check only calls Lstat and
-// EvalSymlinks, so it never creates a directory, registry file or temporary
-// file and never modifies a link.
+// The reachability facts come from longestExistingRegistryPrefix, the same
+// raw-component climb Save uses. A ".." among the missing components is
+// harmless here: without a symbolic link in the path the prefix genuinely
+// exists, so such a path is either a real file (read normally) or a path
+// through missing ordinary directories, and reading is allowed either way —
+// the read creates nothing and Save runs its own stricter refusal before
+// writing. What must fail is an existing prefix that is itself a symbolic
+// link which cannot be chased to a real directory: EvalSymlinks on the
+// prefix names exactly that failure for a dangling link or a link loop,
+// including one reached through several links. A relative link target is
+// resolved by EvalSymlinks against the link's own directory, matching the
+// kernel. Any other failure at a deeper component (for example permission
+// denied) is left for the read itself to report. The check only calls Lstat
+// and EvalSymlinks, so it never creates a directory, registry file or
+// temporary file and never modifies a link.
 func checkRegistryPathReachable(path string) error {
-	cur := path
-	for {
-		info, err := os.Lstat(cur)
-		if err == nil {
-			// cur is the longest existing prefix. A prefix that is itself a
-			// symbolic link which cannot be chased to a real directory is the
-			// one failure that looks like a never-created registry file: the
-			// final read reports fs.ErrNotExist either way. EvalSymlinks
-			// resolves an absolute link target, or a relative one against the
-			// link's own directory (never the process working directory),
-			// through every hop of a chain; a dangling link or a loop fails
-			// here. Any other failure at a deeper component (for example
-			// permission denied) is left for the read itself to report.
-			if info.Mode()&os.ModeSymlink != 0 {
-				if _, eerr := filepath.EvalSymlinks(cur); eerr != nil {
-					return errUnreachablePathLink
-				}
-			}
-			return nil
-		}
-		parent, _ := rawParent(cur)
-		if parent == cur {
-			// No existing prefix at all: a bare relative name resolved
-			// against the process working directory, the same way an
-			// ordinary open would. No symbolic link could have been
-			// encountered, so a not-exist is an ordinary first registration
-			// and any other failure is the read's own to report.
-			return nil
-		}
-		cur = parent
+	p := longestExistingRegistryPrefix(path)
+	if p.existing == "" || !p.isLink {
+		return nil
 	}
+	// The longest existing prefix is itself a symbolic link which cannot be
+	// chased to a real directory: the one failure that looks like a
+	// never-created registry file, since the final read reports
+	// fs.ErrNotExist either way. EvalSymlinks resolves an absolute link
+	// target, or a relative one against the link's own directory (never the
+	// process working directory), through every hop of a chain; a dangling
+	// link or a loop fails here.
+	if _, err := filepath.EvalSymlinks(p.existing); err != nil {
+		return errUnreachablePathLink
+	}
+	return nil
 }
 
 // resolveRegistryTarget returns the real file a save to path must replace,
@@ -1264,61 +1310,57 @@ func checkRegistryPathReachable(path string) error {
 // directory leading to it — is an error: the save must not create the target
 // or overwrite the link as if this were a first registration.
 func resolveRegistryTarget(path string) (string, error) {
-	// Climb through components missing from the filesystem by stripping raw
-	// path segments, never by lexical cleaning: filepath.Clean would collapse
-	// "alias/.." against the link's own parent name before the kernel ever
-	// resolves alias, sending the save at work/x.json instead of store/x.json.
-	// os.Lstat resolves every component but the last exactly as the kernel
-	// does, so each surviving prefix is checked with its real meaning.
-	cur := path
-	var tail []string
-	for {
-		info, err := os.Lstat(cur)
-		if err == nil {
-			// Refuse a ".." among the not-yet-existing components that climbs
-			// back out of a directory which would first have to be created:
-			// the user's path itself cannot name anything there, and creating
-			// the directory would make a previously unresolvable path valid.
-			if missing, escape := missingDirDotDotEscape(tail); escape {
-				return "", errEscapeThroughMissingDir(missing)
-			}
-			// cur is the longest existing prefix. Resolve it physically: an
-			// absolute link target, or a relative one resolved against the
-			// link's own directory (never the process working directory), is
-			// followed; a dangling link or a loop fails here and is reported
-			// as an unusable symbolic link rather than a fresh-registry path.
-			base, eerr := filepath.EvalSymlinks(cur)
-			if eerr != nil {
-				if info.Mode()&os.ModeSymlink != 0 {
-					return "", fmt.Errorf("registry path is a symbolic link whose target cannot be resolved: %w", eerr)
-				}
-				return "", fmt.Errorf("cannot inspect registry path: %w", eerr)
-			}
-			// Append the not-yet-existing components verbatim: a first
-			// registration needs write permission only in the real directory
-			// that will hold the file, never in directories merely traversed.
-			target := base
-			for i := len(tail) - 1; i >= 0; i-- {
-				target = filepath.Join(target, tail[i])
-			}
-			return filepath.Clean(target), nil
-		}
-		if !errors.Is(err, fs.ErrNotExist) {
-			return "", fmt.Errorf("cannot inspect registry path: %w", err)
-		}
-		parent, base := rawParent(cur)
-		tail = append(tail, base)
-		if parent == cur {
-			// A bare relative name with no existing prefix: it names a file
-			// in the process working directory, just as a plain open would —
-			// unless it climbs ".." out of a directory that does not exist.
-			if missing, escape := missingDirDotDotEscape(tail); escape {
-				return "", errEscapeThroughMissingDir(missing)
-			}
-			return filepath.Clean(path), nil
-		}
-		cur = parent
+	// The same raw-component climb Load runs before reading finds the longest
+	// existing prefix and the not-yet-existing tail; filepath.Clean must not
+	// collapse "alias/.." against the link's own parent name before the kernel
+	// ever resolves alias, which would send the save at work/x.json instead of
+	// store/x.json.
+	p := longestExistingRegistryPrefix(path)
+
+	// A Lstat failure on a missing component other than "not exist"
+	// (permission denied and similar) is the save's own to refuse before
+	// creating anything; the read check leaves the same class of failure to
+	// the read itself.
+	if p.err != nil {
+		return "", fmt.Errorf("cannot inspect registry path: %w", p.err)
 	}
+
+	// Refuse a ".." among the not-yet-existing components that climbs back out
+	// of a directory which would first have to be created: the user's path
+	// itself cannot name anything there, and creating the directory would make
+	// a previously unresolvable path valid. This is the read/save split the
+	// shared climb leaves to each caller: a read through such a path merely
+	// misses the file and stays a first registration, a save must reject it.
+	if missing, escape := missingDirDotDotEscape(p.tail); escape {
+		return "", errEscapeThroughMissingDir(missing)
+	}
+
+	if p.existing == "" {
+		// A bare relative name with no existing prefix: it names a file in the
+		// process working directory, just as a plain open would.
+		return filepath.Clean(path), nil
+	}
+
+	// Resolve the longest existing prefix physically: an absolute link target,
+	// or a relative one resolved against the link's own directory (never the
+	// process working directory), is followed; a dangling link or a loop fails
+	// here and is reported as an unusable symbolic link rather than a
+	// fresh-registry path.
+	base, err := filepath.EvalSymlinks(p.existing)
+	if err != nil {
+		if p.isLink {
+			return "", fmt.Errorf("registry path is a symbolic link whose target cannot be resolved: %w", err)
+		}
+		return "", fmt.Errorf("cannot inspect registry path: %w", err)
+	}
+	// Append the not-yet-existing components verbatim: a first registration
+	// needs write permission only in the real directory that will hold the
+	// file, never in directories merely traversed.
+	target := base
+	for i := len(p.tail) - 1; i >= 0; i-- {
+		target = filepath.Join(target, p.tail[i])
+	}
+	return filepath.Clean(target), nil
 }
 
 // missingDirDotDotEscape inspects the raw components stripped while climbing
