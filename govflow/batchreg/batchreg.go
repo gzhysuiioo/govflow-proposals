@@ -317,14 +317,33 @@ func hex4(p []byte) (int, bool) {
 // does not exist, or a chain of links forming a loop, is an error naming
 // path and the reason — never a fresh-registry signal: treating it as a
 // first registration would either replace the link with a regular file or
-// create the target the user never asked for.
+// create the target the user never asked for. This holds for a link on the
+// final component AND for a link on a DIRECTORY component: when work/alias
+// points at a directory that does not exist, neither work/alias/batches.json
+// nor work/alias/../batches.json reaches any file the way the kernel
+// resolves names (the ".." cannot leave a directory the link never reached),
+// so both fail even if a same-named work/batches.json exists beside the
+// link — an os.ReadFile on such a path reports only fs.ErrNotExist,
+// indistinguishable from a registry file that has never been created, and
+// the reachability check below tells the two cases apart. The check only
+// inspects the path (Lstat/EvalSymlinks): it creates no directory, file or
+// temporary file and changes no link. A valid directory link into a real
+// directory where the registry file is merely absent stays an ordinary
+// first registration, and a valid link mixed with ".." resolves by real
+// directory relations.
 func Load(path string) (reg *Registry, existed bool, err error) {
+	if err := checkRegistryPathReachable(path); err != nil {
+		return nil, true, fmt.Errorf("cannot read registry %q: %w; refusing to treat the unreachable path as a new registry", path, err)
+	}
 	data, err := os.ReadFile(path)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
 			// A dangling symbolic link also reports "not exist", but the path
 			// is occupied: the caller must not treat it as a first
-			// registration.
+			// registration. checkRegistryPathReachable above already refuses
+			// a link that is dangling now (on the final component or on a
+			// leading directory); this Lstat is the backstop for a link that
+			// became dangling between the check and the read.
 			if info, lerr := os.Lstat(path); lerr == nil && info.Mode()&os.ModeSymlink != 0 {
 				return nil, true, fmt.Errorf("cannot read registry %q: symbolic link target does not exist; refusing to treat the link as a new registry", path)
 			}
@@ -1096,6 +1115,73 @@ var (
 	WriteTempContent = func(f *os.File, data []byte) (int, error) { return f.Write(data) }
 	RenameTempFile   = os.Rename
 )
+
+// errUnreachablePathLink is the refusal reason for a registry path that runs
+// into a symbolic link whose target cannot be resolved — a dangling link or a
+// link loop, on a directory component as well as on the final component. It
+// is deliberately worded as an unusable link, not as a registry file that has
+// merely not been created: the two are indistinguishable from ReadFile's
+// fs.ErrNotExist alone, and only the former is a first registration.
+var errUnreachablePathLink = errors.New("a symbolic link in the registry path has a target that does not exist or cannot be resolved")
+
+// checkRegistryPathReachable decides, before the registry bytes are read,
+// whether path can reach anything the way the kernel resolves names. It
+// exists because os.ReadFile reports fs.ErrNotExist both for a registry file
+// that has never been created (a legitimate first registration) and for a
+// path that descends through a dangling directory symbolic link (not one):
+// with work/alias pointing at a missing directory, ReadFile on
+// work/alias/batches.json — and, because the kernel cannot step ".." out of
+// a directory the link never reaches, on work/alias/../batches.json too —
+// returns exactly the not-exist error even when work/batches.json exists.
+//
+// The check climbs through the raw components missing from the filesystem
+// (never by lexical cleaning, which would collapse "alias/.." before the
+// kernel resolves alias) to the longest existing prefix. A ".." among the
+// missing components is harmless here: without a symbolic link in the path
+// the prefix genuinely exists, so such a path is either a real file (read
+// normally) or a path through missing ordinary directories, and reading is
+// allowed either way — the read creates nothing and Save runs its own
+// stricter refusal before writing. What must fail is an existing prefix that
+// is itself a symbolic link which cannot be chased to a real directory:
+// EvalSymlinks on the prefix names exactly that failure for a dangling
+// link or a link loop, including one reached through several links. A
+// relative link target is resolved by EvalSymlinks against the link's own
+// directory, matching the kernel. The check only calls Lstat and
+// EvalSymlinks, so it never creates a directory, registry file or temporary
+// file and never modifies a link.
+func checkRegistryPathReachable(path string) error {
+	cur := path
+	for {
+		info, err := os.Lstat(cur)
+		if err == nil {
+			// cur is the longest existing prefix. A prefix that is itself a
+			// symbolic link which cannot be chased to a real directory is the
+			// one failure that looks like a never-created registry file: the
+			// final read reports fs.ErrNotExist either way. EvalSymlinks
+			// resolves an absolute link target, or a relative one against the
+			// link's own directory (never the process working directory),
+			// through every hop of a chain; a dangling link or a loop fails
+			// here. Any other failure at a deeper component (for example
+			// permission denied) is left for the read itself to report.
+			if info.Mode()&os.ModeSymlink != 0 {
+				if _, eerr := filepath.EvalSymlinks(cur); eerr != nil {
+					return errUnreachablePathLink
+				}
+			}
+			return nil
+		}
+		parent, _ := rawParent(cur)
+		if parent == cur {
+			// No existing prefix at all: a bare relative name resolved
+			// against the process working directory, the same way an
+			// ordinary open would. No symbolic link could have been
+			// encountered, so a not-exist is an ordinary first registration
+			// and any other failure is the read's own to report.
+			return nil
+		}
+		cur = parent
+	}
+}
 
 // resolveRegistryTarget returns the real file a save to path must replace,
 // resolved the same way the kernel resolves path for reads: every symbolic
