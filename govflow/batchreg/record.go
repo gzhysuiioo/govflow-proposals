@@ -9,12 +9,13 @@ import (
 	"unicode/utf8"
 )
 
-// This file holds the single-record rules shared by the two on-disk sources:
-// the registry file (decode, where stored text is already authoritative) and
-// an import manifest (ParseManifest, where text is normalized on the way in).
-// Both sources accept exactly the same four lowercase fields with the same
-// strict JSON decoding — case-sensitive names, escaped spellings counted,
-// duplicates visible, strict UTF-8 and strict JSON-integer quantities. The
+// This file holds the single-record rules shared by the entry points. The
+// first group serves the two on-disk sources: the registry file (decode,
+// where stored text is already authoritative) and an import manifest
+// (ParseManifest, where text is normalized on the way in). Both sources
+// accept exactly the same four lowercase fields with the same strict JSON
+// decoding — case-sensitive names, escaped spellings counted, duplicates
+// visible, strict UTF-8 and strict JSON-integer quantities. The
 // source-specific differences live in the callers:
 //
 //   - text policy: registry records are read verbatim (an empty string is a
@@ -24,6 +25,12 @@ import (
 //     records reject any duplicated field before an unknown one, manifest
 //     records reject whichever anomaly appears first in source order;
 //   - error types and reason wording, which remain owned by each caller.
+//
+// The second group serves the two registration entry points: once a record
+// has passed validation, Register and Import decide its fate with the single
+// acceptance rule at the end of this file (new id appended, identical repeat
+// confirmed, any differing field refused), so the create/duplicate/conflict
+// decision is maintained in exactly one place.
 type textPolicy int
 
 const (
@@ -359,4 +366,84 @@ func manifestQuantityError(token []byte) (int64, error) {
 	default: // qtyNotNumeric
 		return 0, fmt.Errorf(`field %q must be a JSON integer between 1 and %d`, "quantity", MaxQuantity)
 	}
+}
+
+// admission is the single definition of how one already-validated record is
+// accepted by a set of stored batches — the rule both registration entry
+// points (Register for a single record, Import for a whole manifest) apply
+// after their own input validation:
+//
+//   - an id the set does not hold is appended after the existing records as
+//     a new batch;
+//   - an id the set does hold is confirmed as a duplicate only when product,
+//     quantity and unit all match the stored record, which is returned
+//     unchanged — the submitted values never replace it;
+//   - any differing field refuses the record, with every mismatch listed in
+//     the fixed product, quantity, unit order.
+//
+// Ids compare byte for byte: casing and interior whitespace matter, and the
+// text is compared exactly as the caller handed it in (the command-line and
+// manifest entries trim before constructing the Input; direct Go submissions
+// are kept verbatim). The caller owns everything around the decision —
+// input validation, the stored-duplicate-id refusal, working on a copy, and
+// wrapping a refusal in its own error type — so this type never validates
+// and never reports errors itself.
+type admission struct {
+	batches   []Batch
+	indexByID map[string]int
+}
+
+// newAdmission starts an acceptance set from stored, which must already be
+// free of duplicate ids (both callers run storedDuplicateID first). The
+// slice is taken over, not copied: appended records land in it and the
+// caller reads the result back from the batches field.
+func newAdmission(stored []Batch) *admission {
+	a := &admission{batches: stored, indexByID: make(map[string]int, len(stored))}
+	for i, b := range stored {
+		a.indexByID[b.Batch] = i
+	}
+	return a
+}
+
+// acceptance reports how one record fared under the acceptance rule: the
+// stored or newly created record and whether it was created. When the id is
+// already held by a conflicting record, only diffs is set — the differing
+// members among product, quantity and unit, in that order — and the set is
+// left untouched.
+type acceptance struct {
+	batch   Batch
+	created bool
+	diffs   []string
+}
+
+// admit applies the acceptance rule to one validated record, appending it
+// when its id is new.
+func (a *admission) admit(in Input) acceptance {
+	if idx, known := a.indexByID[in.Batch]; known {
+		existing := a.batches[idx]
+		if diffs := diffFields(existing, in); len(diffs) > 0 {
+			return acceptance{diffs: diffs}
+		}
+		return acceptance{batch: existing}
+	}
+	b := Batch{Batch: in.Batch, Product: in.Product, Quantity: in.Quantity, Unit: in.Unit}
+	a.batches = append(a.batches, b)
+	a.indexByID[in.Batch] = len(a.batches) - 1
+	return acceptance{batch: b, created: true}
+}
+
+// diffFields lists the members of product, quantity and unit in which in
+// differs from existing, in that fixed order.
+func diffFields(existing Batch, in Input) []string {
+	var diffs []string
+	if existing.Product != in.Product {
+		diffs = append(diffs, "product")
+	}
+	if existing.Quantity != in.Quantity {
+		diffs = append(diffs, "quantity")
+	}
+	if existing.Unit != in.Unit {
+		diffs = append(diffs, "unit")
+	}
+	return diffs
 }

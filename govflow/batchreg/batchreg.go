@@ -1043,53 +1043,31 @@ func Import(reg *Registry, inputs []Input) (results []ImportResult, err error) {
 	}
 
 	// Work on a copy: a rejected manifest must never partially land in reg.
-	working := append([]Batch(nil), reg.Batches...)
-	indexByID := make(map[string]int, len(working))
-	for i, b := range working {
-		indexByID[b.Batch] = i
-	}
+	// Every record is admitted by the shared acceptance rule; the only
+	// manifest-specific state is firstPos, which pins a newly introduced id
+	// to its first manifest position so a later conflict names the right
+	// source — an intermediate duplicate confirmation never moves it.
+	admit := newAdmission(append([]Batch(nil), reg.Batches...))
 	firstPos := make(map[string]int, len(inputs)) // manifest 1-based position of a newly introduced id
 
 	out := make([]ImportResult, len(inputs))
 	for i, in := range inputs {
 		pos := i + 1
-		if idx, known := indexByID[in.Batch]; known {
-			existing := working[idx]
-			diffs := diffFields(existing, in)
-			if len(diffs) > 0 {
-				if prev, inManifest := firstPos[in.Batch]; inManifest {
-					return nil, &ManifestConflictError{Position: pos, Batch: in.Batch, Fields: diffs, Source: "manifest", PrevPos: prev}
-				}
-				return nil, &ManifestConflictError{Position: pos, Batch: in.Batch, Fields: diffs, Source: "registry"}
+		accepted := admit.admit(in)
+		if len(accepted.diffs) > 0 {
+			if prev, inManifest := firstPos[in.Batch]; inManifest {
+				return nil, &ManifestConflictError{Position: pos, Batch: in.Batch, Fields: accepted.diffs, Source: "manifest", PrevPos: prev}
 			}
-			out[i] = ImportResult{Batch: existing, Created: false}
-			continue
+			return nil, &ManifestConflictError{Position: pos, Batch: in.Batch, Fields: accepted.diffs, Source: "registry"}
 		}
-		b := Batch{Batch: in.Batch, Product: in.Product, Quantity: in.Quantity, Unit: in.Unit}
-		working = append(working, b)
-		indexByID[in.Batch] = len(working) - 1
-		firstPos[in.Batch] = pos
-		out[i] = ImportResult{Batch: b, Created: true}
+		if accepted.created {
+			firstPos[in.Batch] = pos
+		}
+		out[i] = ImportResult{Batch: accepted.batch, Created: accepted.created}
 	}
 
-	reg.Batches = working
+	reg.Batches = admit.batches
 	return out, nil
-}
-
-// diffFields lists the members of product, quantity and unit in which in
-// differs from existing, in that fixed order.
-func diffFields(existing Batch, in Input) []string {
-	var diffs []string
-	if existing.Product != in.Product {
-		diffs = append(diffs, "product")
-	}
-	if existing.Quantity != in.Quantity {
-		diffs = append(diffs, "quantity")
-	}
-	if existing.Unit != in.Unit {
-		diffs = append(diffs, "unit")
-	}
-	return diffs
 }
 
 // Register adds in to reg, or confirms the identical record already stored
@@ -1125,18 +1103,15 @@ func Register(reg *Registry, in Input) (Outcome, error) {
 	if dup := storedDuplicateID(reg); dup != nil {
 		return Outcome{}, dup
 	}
-	for _, b := range reg.Batches {
-		if b.Batch != in.Batch {
-			continue
-		}
-		if diffs := diffFields(b, in); len(diffs) > 0 {
-			return Outcome{}, &ConflictError{Batch: in.Batch, Fields: diffs}
-		}
-		return Outcome{Batch: b, Created: false}, nil
+	// The shared acceptance rule decides: append a new id, confirm an
+	// identical repeat, or refuse a conflicting one.
+	admit := newAdmission(reg.Batches)
+	accepted := admit.admit(in)
+	if len(accepted.diffs) > 0 {
+		return Outcome{}, &ConflictError{Batch: in.Batch, Fields: accepted.diffs}
 	}
-	b := Batch{Batch: in.Batch, Product: in.Product, Quantity: in.Quantity, Unit: in.Unit}
-	reg.Batches = append(reg.Batches, b)
-	return Outcome{Batch: b, Created: true}, nil
+	reg.Batches = admit.batches
+	return Outcome{Batch: accepted.batch, Created: accepted.created}, nil
 }
 
 // validateForSave checks every record of reg against the rules Load enforces,
