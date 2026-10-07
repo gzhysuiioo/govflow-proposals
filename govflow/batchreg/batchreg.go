@@ -878,16 +878,40 @@ func validateManifestInput(in Input, pos int) error {
 	return nil
 }
 
+// duplicateStoredID reports the first batch id that appears more than once
+// among the records already stored in reg, as a *DuplicateIDError whose First
+// and Second are the 1-based positions of the first two occurrences in the
+// pre-call registry order. It returns nil when every stored id is unique.
+// Register and Import both run this check — after their own argument
+// validation, before matching the submission against stored records — so a
+// hand-assembled registry that Load or Save would have refused is rejected
+// identically at both entry points instead of being read as a duplicate
+// confirmation or a conflict depending on which record is matched first.
+func duplicateStoredID(reg *Registry) error {
+	seen := make(map[string]int, len(reg.Batches))
+	for i, b := range reg.Batches {
+		pos := i + 1
+		if first, dup := seen[b.Batch]; dup {
+			return &DuplicateIDError{Batch: b.Batch, First: first, Second: pos}
+		}
+		seen[b.Batch] = pos
+	}
+	return nil
+}
+
 // Import validates every record of inputs before appending anything: the
 // whole manifest fails if any record carries invalid UTF-8, an empty text
 // field or a quantity outside 1..MaxQuantity — whether its batch id is new,
 // already stored or seen earlier in this submission — or if any record
 // conflicts with a stored record or with an earlier manifest record, and reg
-// is left untouched on error. Directly submitted text is kept verbatim. New
-// batch ids are appended in first-occurrence order; an id already stored or
-// introduced earlier in the same manifest is confirmed as a duplicate only
-// when product, quantity and unit all match. Results come back in manifest
-// order; Created is false for duplicates.
+// is left untouched on error. A registry that already holds two records under
+// one batch id is rejected as a *DuplicateIDError before any of that, right
+// after the per-record validation: the stored duplicate is never read as a
+// confirmation, a conflict or a merge candidate. Directly submitted text is
+// kept verbatim. New batch ids are appended in first-occurrence order; an id
+// already stored or introduced earlier in the same manifest is confirmed as a
+// duplicate only when product, quantity and unit all match. Results come back
+// in manifest order; Created is false for duplicates.
 func Import(reg *Registry, inputs []Input) (results []ImportResult, err error) {
 	if reg.Version != FormatVersion {
 		return nil, fmt.Errorf("unsupported registry version %d", reg.Version)
@@ -906,6 +930,9 @@ func Import(reg *Registry, inputs []Input) (results []ImportResult, err error) {
 		if err := validateManifestInput(in, i+1); err != nil {
 			return nil, err
 		}
+	}
+	if err := duplicateStoredID(reg); err != nil {
+		return nil, err
 	}
 
 	// Work on a copy: a rejected manifest must never partially land in reg.
@@ -960,8 +987,12 @@ func diffFields(existing Batch, in Input) []string {
 
 // Register adds in to reg, or confirms the identical record already stored
 // under the same batch id. A batch id held by a record differing in product,
-// quantity or unit produces a *ConflictError and leaves reg untouched. The
-// zero Outcome is returned together with the error.
+// quantity or unit produces a *ConflictError and leaves reg untouched. A
+// registry that already stores two records under one batch id is rejected as
+// a *DuplicateIDError before the stored records are even matched — the
+// pre-existing duplicate is never confirmed as an identical repeat, never
+// reported as a conflict and never merged. The zero Outcome is returned
+// together with the error.
 func Register(reg *Registry, in Input) (Outcome, error) {
 	if reg.Version != FormatVersion {
 		return Outcome{}, fmt.Errorf("unsupported registry version %d", reg.Version)
@@ -977,6 +1008,9 @@ func Register(reg *Registry, in Input) (Outcome, error) {
 	}
 	if !quantityInRange(in.Quantity) {
 		return Outcome{}, fmt.Errorf("quantity must be a positive integer no greater than %d", MaxQuantity)
+	}
+	if err := duplicateStoredID(reg); err != nil {
+		return Outcome{}, err
 	}
 	for _, b := range reg.Batches {
 		if b.Batch != in.Batch {
