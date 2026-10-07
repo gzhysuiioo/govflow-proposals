@@ -1030,6 +1030,24 @@ func requiredArrayProblem(raw json.RawMessage) string {
 	return ""
 }
 
+// requiredObjectProblem 统一判定一个“出现时必须为 JSON 对象”的字段的原始
+// JSON：字段未写出返回 is missing、显式为 null 返回 is null、写成数组/字符串/
+// 数字/布尔等其它类型返回带期望与实际类型的类型不符原因；合法对象（含空
+// 对象 {}）返回空串。与 requiredArrayProblem 同理，显式 null 不能折叠成空
+// 对象；但与必填字段不同，缺失是否兼容由调用方按自己的旧版本约定决定
+// （见 validateVoteProposalsTable）。
+func requiredObjectProblem(raw json.RawMessage) string {
+	switch {
+	case raw == nil:
+		return "is missing"
+	case jsonValueType(raw) == "null":
+		return "is null"
+	case jsonValueType(raw) != "object":
+		return fmt.Sprintf("has wrong type: want object, got %s", jsonValueType(raw))
+	}
+	return ""
+}
+
 // validateVoteProposalDelegations 严格判定一项已保存投票提案的 delegations：
 // 字段必须明确写出且为 JSON 数组。字段缺失、显式为 null 或写成对象/字符串等
 // 其它类型都返回带提案编号与字段名的错误，由 validateState 判整份状态文件
@@ -1086,6 +1104,44 @@ func validateVoteProposalBallots(p *storedVoteProposal) error {
 func validateVoteProposalStartAt(p *storedVoteProposal) error {
 	if problem := requiredScalarProblem(p.startAtRaw, scalarInteger); problem != "" {
 		return fmt.Errorf("voting proposal %q field %q %s", p.ID, "start_at", problem)
+	}
+	return nil
+}
+
+// validateVoteProposalsTable 严格判定顶层 vote_proposals 整张表的形状，必须先
+// 于表内任何提案（validateVoteProposals）执行：
+//   - 字段未写出：只对真正没有 vote_proposals 字段的旧版本状态文件兼容，按
+//     空表处理。旧文件中其余内容（资金余额、登记提案、执行凭据）仍必须各自
+//     合法，且也能在空表下正常创建第一项投票提案；
+//   - 明确写出空对象 {}：表示确实没有投票提案，同样合法，不与缺失混同；
+//   - 显式 null：状态损坏。null 不能折叠成空表——原来尚在投票、已通过未执行
+//     或被拒绝的提案一旦随整表被替换成 null，折叠成空表会让查询成功却报告
+//     提案不存在，随后创建还可能重新占用原编号，而其余余额与执行凭据仍能
+//     核对一致；
+//   - 写成数组、字符串、数字、布尔：同样判状态损坏，不能当成空表。
+//
+// 这条规则不因资金库是否为零、有没有执行凭据或登记提案是否完整而放宽，也
+// 不从其它记录推测原来有哪些投票提案。兼容旧文件只允许“没有写出整张表”，
+// 不能借此放过表内提案已要求明确保存的字段：对象一旦给出，其中任何损坏仍
+// 由 validateVoteProposals 沿用整份拒绝的行为处理。
+func validateVoteProposalsTable(state *storedState) error {
+	const field = "vote_proposals"
+	switch problem := requiredObjectProblem(state.voteProposalsRaw); problem {
+	case "":
+		// 字段是 JSON 对象（含 {}）：映射已在解码时填充，表内校验随后执行。
+		if state.VoteProposals == nil {
+			state.VoteProposals = map[string]*storedVoteProposal{}
+		}
+	case "is missing":
+		// 仅旧版本状态文件可缺整张表：按空表兼容，登记提案、余额与执行凭据
+		// 照常读出，也能在其上创建第一项投票提案（提交时会明确写出该字段）。
+		// 同步把原始片段规范化为明确写出的空对象 {}：本进程随后提交时，
+		// commitLocked 的提交前校验与“明确写出空表”的读取校验走同一判定，
+		// 序列化本身始终输出 VoteProposals 映射，缺字段只在读取旧文件时出现。
+		state.VoteProposals = map[string]*storedVoteProposal{}
+		state.voteProposalsRaw = json.RawMessage("{}")
+	default:
+		return fmt.Errorf("field %q %s", field, problem)
 	}
 	return nil
 }

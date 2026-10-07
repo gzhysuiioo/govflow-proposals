@@ -290,6 +290,15 @@ func (p *storedProposal) UnmarshalJSON(data []byte) error {
 // 与零核对一致，也不能据此认可缺损文件；更不能根据另一项余额、账户余额或
 // 执行凭据推算补齐。资金记录是否完整独立判断。因此解码时保留这两个字段的
 // 原始 JSON，由 validateTreasuryFields 区分“缺失/空值/类型不符”。
+//
+// vote_proposals 整张表同理不能把显式 null 或错误类型折叠成空表：只有真正
+// 没有写出该字段的旧版本状态文件才按“没有投票提案”兼容；字段一旦出现就必须
+// 是 JSON 对象——显式 null、数组、字符串、数字、布尔都判整份状态损坏，即使
+// 余额与执行凭据仍能核对一致，也不能把缺损表当成正常空表继续查询或创建提案
+// （那样会把尚在投票/已通过未执行/已拒绝的提案报告成不存在，还可能重新占用
+// 原编号）。因此解码时保留整张表的原始 JSON，仅在它确实是对象时填充映射，
+// 由 validateVoteProposalsTable 区分“字段缺失/空值/类型不符”；明确写出的空
+// 对象 {} 与缺失字段不同，但同样表示确实没有投票提案，合法。
 type storedState struct {
 	Magic           string                         `json:"magic"`
 	Version         int                            `json:"version"`
@@ -302,26 +311,37 @@ type storedState struct {
 
 	initialTreasuryRaw json.RawMessage
 	treasuryRaw        json.RawMessage
+	// voteProposalsRaw 保留 vote_proposals 是否出现及其原始写法（缺失为 nil、
+	// null 为 "null"）。只有字段确实是 JSON 对象时 VoteProposals 才会被填充；
+	// 缺失与显式 null/错误类型在解码后必须仍可区分，判定交给
+	// validateVoteProposalsTable。
+	voteProposalsRaw json.RawMessage
 }
 
-// storedStateJSONShape 只用于解码，按保存格式的字段名逐字接住两个资金库
-// 余额字段的原始 JSON，其余字段按既有类型解码。
+// storedStateJSONShape 只用于解码，按保存格式的字段名逐字接住资金库两个余额
+// 字段与整张投票提案表的原始 JSON，其余字段按既有类型解码。
 type storedStateJSONShape struct {
-	Magic           string                         `json:"magic"`
-	Version         int                            `json:"version"`
-	InitialTreasury json.RawMessage                `json:"initial_treasury"`
-	Treasury        json.RawMessage                `json:"treasury"`
-	Balances        map[string]int64               `json:"balances"`
-	Proposals       map[string]*storedProposal     `json:"proposals"`
-	Receipts        []*Receipt                     `json:"receipts"`
-	VoteProposals   map[string]*storedVoteProposal `json:"vote_proposals"`
+	Magic           string                     `json:"magic"`
+	Version         int                        `json:"version"`
+	InitialTreasury json.RawMessage            `json:"initial_treasury"`
+	Treasury        json.RawMessage            `json:"treasury"`
+	Balances        map[string]int64           `json:"balances"`
+	Proposals       map[string]*storedProposal `json:"proposals"`
+	Receipts        []*Receipt                 `json:"receipts"`
+	VoteProposals   json.RawMessage            `json:"vote_proposals"`
 }
 
-// UnmarshalJSON 保留 initial_treasury/treasury 是否出现及其原始写法（缺失为
-// nil、null 为 "null"），使“字段缺失”与“显式写出 0”在解码后仍可区分：
-// encoding/json 直接解进 int64 会把缺失/null/类型不符都折叠成 0，缺失余额
-// 字段的缺损文件就会在其余记录恰好与零一致时被误当成合法资金库。判定统一
-// 交给 validateTreasuryFields，此处只在字段确实是 int64 整数时填充值。
+// UnmarshalJSON 保留 initial_treasury/treasury 与 vote_proposals 是否出现及
+// 其原始写法（缺失为 nil、null 为 "null"），使“字段缺失”与“显式写出 0/空
+// 对象/null/错误类型”在解码后仍可区分：
+//   - encoding/json 直接解进 int64 会把缺失/null/类型不符都折叠成 0，缺失
+//     余额字段的缺损文件就会在其余记录恰好与零一致时被误当成合法资金库；
+//   - 直接把 vote_proposals 解进 map 同样会把缺失、显式 null 与（解码失败
+//     的）错误类型都折叠成 nil，被一律当成旧版本空表，缺损表就会被当成
+//     “没有投票提案”继续使用。
+//
+// 判定统一交给 validateTreasuryFields 与 validateVoteProposalsTable；此处只在
+// 字段确实是 int64 整数时填充余额、在整张表确实是 JSON 对象时填充提案映射。
 func (s *storedState) UnmarshalJSON(data []byte) error {
 	var shape storedStateJSONShape
 	if err := json.Unmarshal(data, &shape); err != nil {
@@ -332,11 +352,21 @@ func (s *storedState) UnmarshalJSON(data []byte) error {
 	s.Balances = shape.Balances
 	s.Proposals = shape.Proposals
 	s.Receipts = shape.Receipts
-	s.VoteProposals = shape.VoteProposals
 	s.initialTreasuryRaw = shape.InitialTreasury
 	s.treasuryRaw = shape.Treasury
+	s.voteProposalsRaw = shape.VoteProposals
 	fillInt64(shape.InitialTreasury, &s.InitialTreasury)
 	fillInt64(shape.Treasury, &s.Treasury)
+	// 仅当 vote_proposals 确实是 JSON 对象时才填充映射；缺失/null/数组/标量
+	// 一律留空，由 validateVoteProposalsTable 区分“旧文件缺字段（兼容空表）”
+	// 与“显式空值或类型不符（整份损坏）”。表为对象但其中提案形状非法时，
+	// 解码错误在此直接返回——与 proposals 表既有行为一致，元素级字段缺损
+	// （如缺失 start_at）仍由各 validate 函数报带提案编号的原因。
+	if jsonValueType(shape.VoteProposals) == "object" {
+		if err := json.Unmarshal(shape.VoteProposals, &s.VoteProposals); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -1098,9 +1128,12 @@ func validateState(state *storedState) error {
 	if state.Receipts == nil {
 		return errors.New("receipts table is missing")
 	}
-	// VoteProposals 缺省视为空表：旧版本写出的状态文件不含投票提案，继续可读。
-	if state.VoteProposals == nil {
-		state.VoteProposals = map[string]*storedVoteProposal{}
+	// vote_proposals 表的形状必须先于表内任何提案校验确定：只有真正没有写出
+	// 该字段的旧版本状态文件才按空表兼容；字段一旦出现就必须是 JSON 对象，
+	// 显式 null 或错误类型一律判整份状态损坏，不能折叠成空表后继续返回余额、
+	// 报告提案不存在或用新记录覆盖文件。
+	if err := validateVoteProposalsTable(state); err != nil {
+		return err
 	}
 	for account, balance := range state.Balances {
 		if account == "" {
