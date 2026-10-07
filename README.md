@@ -106,6 +106,8 @@ govflow execute --state ./treasury.json --id gip-7 --now 5001 --json
 - 首次计票必须在截止时刻或之后，否则报“时间未到”且状态不变；未投权重不计入参与量。
   赞成与反对权重之和达到法定人数且赞成严格多于反对才通过；平票或参与不足均拒绝。
   计票只确定状态，不转账；再次计票返回首次结论；计票后拒绝新票，即使传入窗口内时间。
+  首次计票命令本身遇到保存失败时怎样判断结论是否已经产生，见下文
+  “首次计票保存失败：判断结论是否已经产生”。
 - 通过后的提案直接由 `execute` 执行，无须再登记；被拒绝的提案不能执行，
   已执行提案不退回通过。`register` 与投票提案共用编号：任何一方都不能覆盖另一方
   或绕过投票结论。
@@ -166,6 +168,83 @@ govflow execute --state ./treasury.json --id gip-7 --now 5001 --json
   选择和投票时间都以第一次写入为准，即使再次提交时已经截止也一样；改投另一
   选择仍报冲突，原票不会被覆盖。这张票是否计入到期计票，只取决于它是否已随
   替换成功写入，与调用方当时是否看到告警无关。
+- **首次计票保存失败：判断结论是否已经产生。** 到达截止时刻后的首次 `tally`
+  也可能遇到保存失败，同样按发生位置分两种结果；看到 `tally` 以退出码 1
+  结束时，先看标准错误区分位置，再决定是“重新计票”还是“查询确认已有结论”。
+  失败在状态文件替换之前（临时文件写入、fsync 或原子改名失败）：这次没有任何
+  计票结论写入，提案仍为 `voting`，已经保存的票据和委托关系一条不变；恢复保存
+  条件后再次计票即为首次成功计票，首次计票时间采用这次成功写入时提交的时间，
+  不沿用失败尝试里的时间。状态文件已替换成功、仅随后的目录同步失败：结论以及
+  `passed` 或 `rejected` 状态其实已经写入，只是这次写入的持久性尚未确认；
+  随后正常查询就能读到完整结论，再次计票返回该结论和原来的首次计票时间，
+  不会撤销结论，也不会把提案退回 `voting`。
+  两种失败当次的输出方式相同：普通文本与 `--json` 下都以退出码 1 结束，
+  标准输出没有任何计票结果（`--json` 也不输出结论对象），具体原因写到标准
+  错误。前一种失败的标准错误只保留具体保存原因；后一种还会明确
+  “state written but durability not confirmed（已写入但持久性未确认）”。
+  注意不要套用 `execute` 告警时的处理：`execute` 持久性告警会在标准输出照常
+  给出已写入的凭据，而 `tally` 在这两种失败下标准输出都为空——计票结论只能靠
+  随后查询或再次计票取得。Go 调用方在两种失败下都得到 nil 计票结果
+  （`TallyVote` 返回 `(nil, err)`）；用
+  `errors.Is(err, govflow.ErrDurabilityUnconfirmed)` 可区分：为 true 的是
+  后一种“已写入但持久性未确认”（`*govflow.DurabilityError`，`Cause` 为目录
+  同步的具体失败原因），为 false 的是前一种，按普通保存错误处理即可。
+  下面示例中的 `/abs/dir` 表示 `--state ./treasury.json` 所在目录解析出的
+  绝对路径（状态文件路径会先转成绝对路径再用于临时文件与加锁）。沿用本文
+  gip-8 的成员与委托：alice 归集 bob、carol 后代表的赞成票重 600，dave 的
+  反对票重 400，法定人数 600，截止时间 200；dave 已在 130 投反对、alice
+  已在 170 投赞成。在 200 的首次计票遇到保存失败，随后在 210 再次计票：
+
+  ```bash
+  # 情形一：200 的提交在状态文件替换之前失败（如目录不可写）
+  $ govflow tally --state ./treasury.json --id gip-8 --now 200
+  error: open /abs/dir/.govflow-state-2177519443: permission denied   # 具体保存原因在 stderr
+  # 退出码 1，stdout 为空；提案仍是 voting，没有计票结论，票据与委托不变
+
+  # 先查询确认：state=voting，且没有 tally 行（JSON 里没有 tally 字段）
+  $ govflow proposal --state ./treasury.json --id gip-8
+  proposal gip-8 source=vote state=voting quorum=600 voting=[100,200) timelock_end=300 actions=1 total_weight=1000
+  # ...（成员与委托行不变，此处省略）
+    ballot representative=dave choice=against weight=400 voted_at=130
+    ballot representative=alice choice=for weight=600 voted_at=170
+
+  # 恢复保存条件后于 210 再次计票：这才是首次成功计票，首次时间取 210
+  $ govflow tally --state ./treasury.json --id gip-8 --now 210
+  tally proposal=gip-8 for=600 against=400 turnout=1000 quorum=600 => passed (tallied_at=210)
+
+  # 情形二：200 的提交已完成原子改名，只有随后的目录同步失败
+  $ govflow tally --state ./treasury.json --id gip-8 --now 200
+  error: state written but durability not confirmed: open /abs/dir: permission denied
+  # 退出码 1，stdout 同样为空，但 stderr 明确“已写入但持久性未确认”
+
+  # 恢复正常读取条件后查询：结论其实已写入，state=passed
+  $ govflow proposal --state ./treasury.json --id gip-8
+  proposal gip-8 source=vote state=passed quorum=600 voting=[100,200) timelock_end=300 actions=1 total_weight=1000
+  # ...（成员、委托与两张票据照常列出，此处省略）
+    tally for=600 against=400 turnout=1000 => passed tallied_at=200
+
+  # 210 再次计票返回已写入的结论与原来的首次时间 200，退出码 0，不退回 voting
+  $ govflow tally --state ./treasury.json --id gip-8 --now 210
+  tally proposal=gip-8 for=600 against=400 turnout=1000 quorum=600 => passed (tallied_at=200)
+  ```
+
+  两种情况下 210 都得到赞成 600、反对 400、参与 1000 的通过结论，区别只在
+  首次计票时间：替换之前失败时是成功写入的 210，目录同步失败时是已经写入的
+  200。失败当次加 `--json` 行为一致：退出码 1、stdout 没有结论对象，原因
+  仍在 stderr；成功或再次计票时的 JSON 结论字段为 `for_weight`、
+  `against_weight`、`turnout`、`quorum`、`passed`、`tallied_at`。
+  这与“截止前计票被拒绝”不是一回事：`--now 199`（`now < 截止`）会得到
+  `error: tally rejected: voting for gip-8 is still open: now=199
+  deadline=200`，同样退出码 1、stdout 为空，但它是业务规则拒绝，标准错误里
+  是 `tally rejected ... still open` 而不是保存原因——截止前拒绝后提案必然
+  仍是 `voting`，与保存失败里“可能已经写入结论”的情形要靠 stderr 措辞区分。
+  保存失败后查询时重点看三处：`state` 是否仍为 `voting`（还是已是
+  `passed`/`rejected`）、有没有计票汇总行（`for/against/turnout` 与
+  `=> passed/rejected`）、以及 `tallied_at` 首次计票时间；JSON 查询对应
+  `state`、`tally`（含三个权重汇总）与 `tally.tallied_at`，结论尚未写入时
+  没有 `tally` 字段。整个投票、查询与计票过程都不转账，资金库与收款账户余额
+  保持原样，也不产生任何执行凭据；只有提案通过并在时间锁到期后 `execute`
+  成功时才扣款并产生凭据。
 - 委托权重下两种保存结果如何影响到期计票，可沿用上面 gip-8 的名单对照：
   alice 原始权重 300，bob 的 200 与 carol 的 100 都委托给 alice，故 alice
   一张票的票重是归集后的 600；dave 未委托，票重 400；法定人数 600，投票
