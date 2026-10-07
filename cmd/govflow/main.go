@@ -147,8 +147,22 @@ registry file format (UTF-8 JSON, human-inspectable):
   }
 A missing file is created on first registration, and a registry whose parent
 directory does not yet exist is created together with that directory, as long
-as the path never climbs back out of a directory it just descended into. A
-path that first passes through a directory that does not exist and then steps
+as the path never climbs back out of a directory it just descended into. The
+registry path must name a FILE: a path ending in one or more path separators
+("store/new.json/") or whose final component is "." or ".." ("store/new/.",
+"store/new/..") spells a DIRECTORY location and is rejected outright, no
+matter whether the location does not exist yet, already is a directory, or has
+a regular file directly beneath the spelled name. The trailing directory
+marker is never stripped to save a sibling plain file — "store/new.json/"
+would otherwise create "store/new.json" and "store/new/." the plain file
+"store/new", neither readable back through the path the user gave — no
+missing parent directory is created, no registry or temporary file is left at
+the stripped name, and an existing file, directory or symbolic link is never
+replaced. The error quotes the registry path exactly as passed and states
+that the target must be a file while this path denotes a directory; a "." or
+".." in a MIDDLE path component ("store/./b.json") keeps resolving by the
+ordinary rules.
+A path that first passes through a directory that does not exist and then steps
 back with ".." — store/missing/../batches.json while store/missing is absent —
 names no file the way the filesystem resolves names and is rejected outright:
 the missing directory is not created to make the path valid, the name left

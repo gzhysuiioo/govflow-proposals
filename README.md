@@ -26,7 +26,7 @@ govflow batch-register \
   --unit kg
 ```
 
-- `--registry`：登记文件路径。文件不存在时在首次登记时创建。路径也可以是指向已有登记文件的符号链接：登记结果保存到链接指向的文件（相对目标以链接所在目录为基准），链接本身保持原样，目标文件保留原有权限；链接目标不存在或链接成环时，本次操作被拒绝，不会创建目标文件或改动链接。符号链接也可以出现在路径的**目录**部分，并与 `..` 混用：读取和保存按文件系统的实际指向解析同一路径，例如 `work/alias` 是指向 `store/child` 的目录链接时，`work/alias/../batches.json` 指的是 `store/batches.json`，新增批次保存进该真实文件，绝不会因为链接名后面的 `..` 而改写链接上一级目录里的同名文件（`work/batches.json` 即使存在也与本次登记无关）；保存只在真实目标文件所在目录创建并替换临时文件，因此即使 `work` 目录只允许读取和进入、不允许创建文件，登记依然成功，也不会在 `work` 下留下登记文件、临时文件或新目录。真实目标目录不可写时按保存失败拒绝，错误指出用户传入的登记路径和原因，原文件字节与修改时间保持不变。
+- `--registry`：登记文件路径。文件不存在时在首次登记时创建（文件名不要求有 `.json` 后缀）。**路径必须表示一个文件**：以一个或多个路径分隔符结尾（`store/new.json/`），或最后一个路径分量是 `.`、`..`（`store/new/.`、`store/new/..`）时，它表示的是**目录位置**，无论该位置当前不存在、已经是目录，还是去掉末尾部分后恰好有一个普通文件，本次登记都被拒绝——不会创建缺失的父目录，也不会在去掉末尾部分的位置留下登记文件或临时文件（否则 `store/new.json/` 会创建普通文件 `store/new.json`、`store/new/.` 会创建普通文件 `store/new`，用户仍无法用自己传入的路径读回结果）；已存在文件的内容、权限和修改时间保持原样，已有目录和符号链接也不被替换。错误包含用户原样传入的登记路径，并明确说明登记目标必须是文件、这个路径要求的是目录；相对路径与绝对路径处理相同。路径**中间**合法的 `.`、`..`（如 `store/./b.json`）不属于目录标记，仍按原有规则解析。路径也可以是指向已有登记文件的符号链接：登记结果保存到链接指向的文件（相对目标以链接所在目录为基准），链接本身保持原样，目标文件保留原有权限；链接目标不存在或链接成环时，本次操作被拒绝，不会创建目标文件或改动链接。符号链接也可以出现在路径的**目录**部分，并与 `..` 混用：读取和保存按文件系统的实际指向解析同一路径，例如 `work/alias` 是指向 `store/child` 的目录链接时，`work/alias/../batches.json` 指的是 `store/batches.json`，新增批次保存进该真实文件，绝不会因为链接名后面的 `..` 而改写链接上一级目录里的同名文件（`work/batches.json` 即使存在也与本次登记无关）；保存只在真实目标文件所在目录创建并替换临时文件，因此即使 `work` 目录只允许读取和进入、不允许创建文件，登记依然成功，也不会在 `work` 下留下登记文件、临时文件或新目录。真实目标目录不可写时按保存失败拒绝，错误指出用户传入的登记路径和原因，原文件字节与修改时间保持不变。
 - `--batch`：批次编号，在同一登记文件内唯一。
 - `--product`：产品编号。
 - `--quantity`：数量，仅接受 `0`–`9` 组成的十进制正整数，允许前导零（如 `000120` 保存为 `120`），按整数值保存与比对，最大为 `9223372036854775807`。零、负数、小数、非 ASCII 数字和超范围值一律拒绝。
@@ -128,9 +128,9 @@ govflow: batch-import: manifest record 3 (batch "B1") conflicts with manifest re
 `govflow/batchreg` 包把命令行 `batch-import` 的同一套能力作为公开入口提供，可在自己的 Go 程序里把一份清单导入指定的本地登记文件。导入路径为 `github.com/gzhysuiioo/govflow-proposals/govflow/batchreg`（仅用标准库）：
 
 1. `batchreg.ParseManifest(data []byte) ([]batchreg.Input, error)`：解析清单文件字节。清单文件始终**只读**：由调用方自己读入，库只校验和转换这些字节，绝不创建或改写清单文件。
-2. `batchreg.Load(path string) (reg *batchreg.Registry, existed bool, err error)`：读取前文公开格式的登记文件。文件不存在不是错误：返回一个空登记表和 `existed == false`；已有但无法按公开格式读取的文件按错误拒绝，绝不覆盖。
+2. `batchreg.Load(path string) (reg *batchreg.Registry, existed bool, err error)`：读取前文公开格式的登记文件。文件不存在不是错误：返回一个空登记表和 `existed == false`；已有但无法按公开格式读取的文件按错误拒绝，绝不覆盖。`path` 必须表示一个文件：以一个或多个路径分隔符结尾、或最后分量为 `.`/`..` 的目录型路径（如 `store/new.json/`、`store/new/.`）直接返回 `*batchreg.DirectoryPathError`（其 `Path` 为原样传入的路径），不接触文件系统，也不视为“文件尚不存在”。
 3. `batchreg.Import(reg *batchreg.Registry, inputs []batchreg.Input) (results []batchreg.ImportResult, err error)`：在**内存中**把清单合并进 `reg`，返回按清单顺序排列的逐条结果。
-4. `batchreg.Save(path string, reg *batchreg.Registry) error`：临时文件加原子替换，把登记表写入登记文件；此前不存在的文件在**保存成功后**创建（权限 0644），符号链接路径的规则与命令行章节完全相同。
+4. `batchreg.Save(path string, reg *batchreg.Registry) error`：临时文件加原子替换，把登记表写入登记文件；此前不存在的文件在**保存成功后**创建（权限 0644，不要求 `.json` 后缀；`store/new/batches.json` 这类父目录尚不存在且没有用 `..` 回退的路径仍会一并创建目录与文件），符号链接路径的规则与命令行章节完全相同。目录型路径（尾分隔符、末分量为 `.` 或 `..`）在任何校验和文件系统操作之前返回 `*batchreg.DirectoryPathError`：不创建缺失父目录、不在去掉末尾部分的位置写登记文件或临时文件，已有文件的内容、权限、mtime 与已有目录、符号链接均不变，调用方传入的登记表内容和记录顺序也保持不变；错误信息形如 `registry path "<原样路径>" denotes a directory ...; the registry target must be a file ...`。中间分量的 `.`、`..` 照常解析。
 
 `ImportResult` 含合并后的 `Batch`（四个字段）和 `Created bool`：`true` 表示该编号是本次新出现并追加的，`false` 表示重复确认。**`Import` 的返回值只是内存处理结果，不是登记完成的凭据**：新批次此刻只存在于内存中的 `reg`；只有随后 `Save` 成功返回，它们才真正被登记文件接受。
 

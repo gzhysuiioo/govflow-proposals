@@ -139,6 +139,62 @@ func (e *EncodingError) Error() string {
 	return fmt.Sprintf("field %q contains bytes that are not valid UTF-8; the value is rejected instead of being replaced with U+FFFD", e.Field)
 }
 
+// DirectoryPathError reports a registry path that the user spelled as a
+// DIRECTORY location rather than a file: it ends in one or more path
+// separators ("store/new.json/"), or its final path component is "." or ".."
+// ("store/new/.", "store/new/.."). Such a spelling can never name the
+// registry file — no matter whether the location does not exist yet, already
+// is a directory, or happens to have a regular file directly beneath the
+// spelled directory name (a plain file named "new.json" beside a
+// "store/new.json/" request, or a plain file named "new" beside a
+// "store/new/." request). Saving there would either fail against the
+// directory or silently create that sibling regular file, so the success
+// would name a path the user cannot read the registry back through.
+//
+// Load and Save therefore refuse the path on its spelling alone, without
+// touching the filesystem: no missing parent directory is created, no
+// registry file or temporary file is written at the name left after stripping
+// the trailing directory marker, an existing file keeps its bytes,
+// permissions and modification time, and an existing directory or symbolic
+// link is never replaced. Path carries the registry path exactly as the
+// caller supplied it; the reason states that the registry target must be a
+// file while this path denotes a directory. A "." or ".." in a MIDDLE path
+// component is not a directory marker and keeps resolving by the ordinary
+// path rules.
+type DirectoryPathError struct {
+	Path string
+}
+
+func (e *DirectoryPathError) Error() string {
+	return fmt.Sprintf(
+		"registry path %s denotes a directory (the path ends with a separator or its last component is \".\" or \"..\"); "+
+			"the registry target must be a file, so this path cannot be used to save a registry",
+		strconv.Quote(e.Path))
+}
+
+// registryPathDenotesDirectory reports whether path is spelled as a directory
+// location rather than a file: it ends in one or more path separators, or its
+// final path component — the part after the last separator, with no trailing
+// separator present — is "." or "..". The check is purely lexical on the
+// caller's exact spelling: it never cleans the path (filepath cleaning would
+// erase exactly the trailing directory marker the caller typed) and never
+// inspects the filesystem, so a location that does not exist yet is refused
+// just like an existing directory, and a regular file sitting directly
+// beneath the spelled name never tempts a save into creating it. A "." or
+// ".." in a MIDDLE component is not a marker: "store/./b.json" and
+// "store/sub/../b.json" name files and keep their ordinary resolution. An
+// empty path is left to the caller's own missing-argument validation.
+func registryPathDenotesDirectory(path string) bool {
+	if path == "" {
+		return false
+	}
+	if strings.HasSuffix(path, string(os.PathSeparator)) {
+		return true
+	}
+	base := path[strings.LastIndexByte(path, os.PathSeparator)+1:]
+	return base == "." || base == ".."
+}
+
 // NormalizeField trims leading and trailing whitespace; the result must stay
 // non-empty and be valid UTF-8. Interior characters, including interior
 // whitespace, are kept, and casing is preserved so "B1" and "b1" are
@@ -331,7 +387,25 @@ func hex4(p []byte) (int, bool) {
 // directory where the registry file is merely absent stays an ordinary
 // first registration, and a valid link mixed with ".." resolves by real
 // directory relations.
+//
+// A path the caller spells as a DIRECTORY location — ending in one or more
+// path separators, or whose final component is "." or ".." — is a
+// *DirectoryPathError naming the exact supplied path, before any filesystem
+// inspection and for every underlying state alike: the location absent, an
+// existing directory there, or a regular file sitting directly beneath the
+// spelled directory name (a file "new.json" beside a "new.json/" request).
+// Such a path never names a registry file, so Load neither reads it nor
+// treats it as a fresh empty registry.
 func Load(path string) (reg *Registry, existed bool, err error) {
+	// Refuse a path spelled as a directory (trailing separator, or a final
+	// "."/".." component) before any filesystem call: it can never name a
+	// registry file, and the later Save must not be allowed to create a
+	// sibling regular file that this path cannot read back. This also stops a
+	// path over an existing directory being reported with the kernel's
+	// "is a directory" read error rather than the file-vs-directory rule.
+	if registryPathDenotesDirectory(path) {
+		return nil, true, &DirectoryPathError{Path: path}
+	}
 	if err := checkRegistryPathReachable(path); err != nil {
 		return nil, true, fmt.Errorf("cannot read registry %q: %w; refusing to treat the unreachable path as a new registry", path, err)
 	}
@@ -1362,6 +1436,21 @@ func rawParent(path string) (parent, base string) {
 // real directory relations, and a not-yet-existing parent that is never
 // climbed out of (store/new/batches.json) is created as on any first save.
 //
+// A path spelled as a DIRECTORY location — one ending in one or more path
+// separators ("store/new.json/"), or whose final component is "." or ".."
+// ("store/new/.", "store/new/..") — is rejected with a *DirectoryPathError
+// purely on the spelling, before validation or any filesystem change. The
+// rule is the same whether the location does not exist yet, already is a
+// directory, or has a regular file directly beneath the spelled name: the
+// save never creates a missing parent, never writes a registry file or
+// temporary file at the name left after stripping the trailing separator or
+// the final "."/"..", and never replaces an existing directory or symbolic
+// link. Stripping the marker would otherwise create a file the supplied path
+// cannot read back ("store/new.json/" would create plain file
+// "store/new.json"; "store/new/." would create plain file "store/new"). A
+// "." or ".." in a MIDDLE component is not a directory marker and keeps its
+// ordinary resolution.
+//
 // Every record must satisfy the same effective-value rules Load enforces, so
 // a registry saved successfully always reads back: batch, product and unit
 // must be non-empty valid UTF-8 text (kept verbatim — no trimming or case
@@ -1373,6 +1462,16 @@ func rawParent(path string) (parent, base string) {
 // no temporary file is left behind. A nil or empty Batches is a legal empty
 // registry and is written as "batches": [] without touching reg itself.
 func Save(path string, reg *Registry) error {
+	// The path's file-or-directory meaning is decided before anything else: a
+	// trailing separator or a final "."/".." component spells a directory
+	// location and can never hold a registry file. Refusing here — purely on
+	// the spelling, before version and record validation, directory creation,
+	// the temporary file or the rename — guarantees the table the caller
+	// handed in is untouched and nothing appears at the name left after
+	// stripping the trailing directory marker.
+	if registryPathDenotesDirectory(path) {
+		return &DirectoryPathError{Path: path}
+	}
 	if reg.Version != FormatVersion {
 		return fmt.Errorf("cannot write registry format version %d", reg.Version)
 	}
