@@ -1090,6 +1090,60 @@ func validateVoteProposalStartAt(p *storedVoteProposal) error {
 	return nil
 }
 
+// requiredObjectProblem 统一判定一个“一旦写出就必须是 JSON 对象”字段的原始
+// JSON：字段未写出返回 is missing、显式为 null 返回 is null、写成数组/字符串/
+// 数字/布尔等其它类型返回带期望与实际类型的类型不符原因；合法对象（含空
+// 对象 {}）返回空串。与 requiredArrayProblem 同理，null 不能顶替对象。
+func requiredObjectProblem(raw json.RawMessage) string {
+	switch {
+	case raw == nil:
+		return "is missing"
+	case jsonValueType(raw) == "null":
+		return "is null"
+	case jsonValueType(raw) != "object":
+		return fmt.Sprintf("has wrong type: want object, got %s", jsonValueType(raw))
+	}
+	return ""
+}
+
+// validateVoteProposalsTable 严格判定顶层 vote_proposals 表本身的形状：
+//   - 字段完全不出现：唯一保留的旧版本兼容情形。其余内容合法时按空表读取，
+//     余额、登记提案与执行凭据照常查询，也能在其上创建第一项投票提案；
+//   - 显式写出空对象 {}：确实没有投票提案，合法；
+//   - 显式 null：整张表缺损，判整份状态损坏。投票中、已通过未执行或已拒绝
+//     的提案可能就此消失，即使其余余额与执行凭据仍能核对一致，也不能把它
+//     当成“没有提案”的空表——查询会把原提案报成不存在，创建还可能重新占用
+//     原编号；
+//   - 数组、字符串、数字、布尔：同样判整份状态损坏，不能当成空表。
+//
+// 此判定不依据资金库是否为零、有没有执行凭据或登记提案是否完整而放宽，也
+// 不从其它记录推测原来有哪些投票提案。两种合法情形（字段缺失、空对象）在
+// 此规范化为非 nil 空映射，使后续创建第一项投票提案时可以直接写入；表内每
+// 一项提案的字段仍由 validateVoteProposals 按既有规则严格校验，旧版兼容不
+// 宽免表内缺损。
+func validateVoteProposalsTable(state *storedState) error {
+	raw := state.voteProposalsRaw
+	if raw == nil {
+		// 旧文件没有这张表：按空表接受，并把内存状态规范化成“明确写出的空
+		// 对象”。这样后续任意一次提交（登记、创建第一项投票提案等）重新校验
+		// 时，不会因 raw 仍缺失而把同一轮刚加入的映射重置为空；落盘形状也与
+		// 既有行为一致（任何变更都会把空表明确写出为 {}）。未发生提交时磁盘
+		// 上的旧文件保持原样。
+		state.VoteProposals = map[string]*storedVoteProposal{}
+		state.voteProposalsRaw = json.RawMessage("{}")
+		return nil
+	}
+	if problem := requiredObjectProblem(raw); problem != "" {
+		return fmt.Errorf("field %q %s", "vote_proposals", problem)
+	}
+	if state.VoteProposals == nil {
+		// 显式 {} 解码进 nil map 后仍为 nil：规范化为非 nil 空映射，
+		// 使第一项投票提案的创建写入不会落在 nil map 上。
+		state.VoteProposals = map[string]*storedVoteProposal{}
+	}
+	return nil
+}
+
 // validateVoteProposals 在打开状态文件时严格校验全部投票提案：
 // 编号与 register 来源不冲突；状态机与计票结论一致；票重/代表与名单及委托明细一致；
 // 首次投票时间落在窗口内；首次计票不早于截止且结论可由明细重放。
