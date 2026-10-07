@@ -169,7 +169,13 @@ directory, so a read-only work directory (read and enter, but not create)
 does not block the save and nothing is created under work; only an
 unwritable real target directory rejects it. A link whose target does not
 exist, or a loop of links, is rejected — the target is never created and
-the link is never replaced. An
+the link is never replaced. That includes a link sitting on a DIRECTORY
+component: if the directory link itself dangles, the registry path cannot
+be read, so the command fails before any registration, even when a ".."
+follows the link (work/alias/../batches.json while work/alias's target is
+absent) and even though a same-named file may exist beside the link; the
+error names the registry path you passed and the link that cannot be
+resolved. An
 existing file that is empty, cannot be read in this format, or contains
 several records with the same batch number is rejected outright and never
 overwritten. "This format"

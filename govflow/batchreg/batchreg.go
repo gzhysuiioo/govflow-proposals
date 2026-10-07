@@ -317,17 +317,35 @@ func hex4(p []byte) (int, bool) {
 // does not exist, or a chain of links forming a loop, is an error naming
 // path and the reason — never a fresh-registry signal: treating it as a
 // first registration would either replace the link with a regular file or
-// create the target the user never asked for.
+// create the target the user never asked for. This covers a link on the
+// final component and a link on a DIRECTORY component alike, even when a
+// ".." follows the unresolvable link: the kernel reports an ordinary
+// "no such file" for work/alias/batches.json and for
+// work/alias/../batches.json when work/alias is a dangling directory link,
+// so the path is walked component by component (without lexical cleaning)
+// to tell such an unreadable path from a genuinely missing registry.
 func Load(path string) (reg *Registry, existed bool, err error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
-		if errors.Is(err, fs.ErrNotExist) {
-			// A dangling symbolic link also reports "not exist", but the path
-			// is occupied: the caller must not treat it as a first
-			// registration.
-			if info, lerr := os.Lstat(path); lerr == nil && info.Mode()&os.ModeSymlink != 0 {
-				return nil, true, fmt.Errorf("cannot read registry %q: symbolic link target does not exist; refusing to treat the link as a new registry", path)
+		// A dangling symbolic link reports "not exist" (whether the link is
+		// the registry file itself or sits on a directory component — the
+		// latter also when a ".." follows it), while a loop reports a link
+		// resolution error. Either way the path is occupied or unreachable:
+		// the caller must not treat it as a first registration, since the
+		// later Save would create the target the user never asked for or
+		// write through a name the kernel cannot resolve. The detector only
+		// claims a broken link it can positively identify, so every other
+		// read failure keeps its concrete error below.
+		if linkPath, linkErr, broken := unreadableSymlinkOnPath(path); broken {
+			if linkPath == path {
+				if errors.Is(linkErr, fs.ErrNotExist) {
+					return nil, true, fmt.Errorf("cannot read registry %q: symbolic link target does not exist; refusing to treat the link as a new registry", path)
+				}
+				return nil, true, fmt.Errorf("cannot read registry %q: symbolic link target cannot be resolved (%v); refusing to treat the link as a new registry", path, linkErr)
 			}
+			return nil, true, fmt.Errorf("cannot read registry %q: symbolic link %q on a directory component of the path has a target that cannot be resolved: %v; refusing to treat the unreadable path as a new registry", path, linkPath, linkErr)
+		}
+		if errors.Is(err, fs.ErrNotExist) {
 			return &Registry{Version: FormatVersion}, false, nil
 		}
 		return nil, false, fmt.Errorf("cannot read registry %q: %w", path, err)
@@ -343,6 +361,69 @@ func Load(path string) (reg *Registry, existed bool, err error) {
 		return nil, true, fmt.Errorf("registry %q is not usable: %w", path, err)
 	}
 	return reg, true, nil
+}
+
+// unreadableSymlinkOnPath decides whether an ENOENT reading path is caused by
+// a symbolic link whose target cannot be resolved rather than by an ordinary
+// missing registry file or missing-but-creatable parent directories. It
+// returns broken == true and the raw path of the offending link when it finds
+// one; linkErr is the resolution error naming the reason.
+//
+// The kernel reports plain ENOENT in three link situations that the caller
+// must not read as a first registration:
+//
+//   - path itself is a dangling link (the registry-file link);
+//   - a dangling or looping link sits on a DIRECTORY component, e.g.
+//     work/alias -> ../store/missing with work/alias/batches.json;
+//   - such a link is followed by "..": work/alias/../batches.json, where the
+//     ".." cannot leave a target directory that does not exist — and must
+//     never fall back onto a same-named file beside the link.
+//
+// Components are stripped with rawParent, never with filepath.Clean: cleaning
+// would collapse "alias/.." to the link's own parent before the kernel
+// resolves alias. Lstat checks each surviving prefix without following links;
+// the longest existing prefix is then chased with filepath.EvalSymlinks,
+// which resolves a relative link target against the link's OWN directory
+// (not the process working directory) and detects dangling targets and
+// loops. Path components missing from the filesystem are ordinary first
+// registration territory and stop the walk without a refusal.
+func unreadableSymlinkOnPath(path string) (linkPath string, linkErr error, broken bool) {
+	// Strip one raw component at a time. Components are removed with
+	// rawParent, never with filepath.Clean: cleaning would collapse
+	// "alias/.." to the link's own parent before the kernel resolves alias.
+	// Lstat reports ELOOP (not ENOENT) when an intermediate link loops and
+	// EACCES when a parent is not searchable, so the walk keeps climbing on
+	// ANY lstat error — the operation is pure string math — and only judges a
+	// prefix it can actually inspect.
+	cur := path
+	for {
+		info, err := os.Lstat(cur)
+		if err == nil {
+			if info.Mode()&os.ModeSymlink == 0 {
+				// The longest inspectable existing prefix is a real file or
+				// directory; everything missing beyond it is an ordinary
+				// absent file or a creatable directory.
+				return "", nil, false
+			}
+			// A resolvable link on a prefix is harmless: if it names a
+			// directory, the kernel could traverse it and a missing name
+			// beyond it is an ordinary absent registry file. A link that does
+			// not resolve (dangling target, or a loop) is the fault.
+			if _, eerr := filepath.EvalSymlinks(cur); eerr != nil {
+				return cur, eerr, true
+			}
+			return "", nil, false
+		}
+		parent, _ := rawParent(cur)
+		if parent == cur {
+			// A bare relative name with no inspectable prefix names a file
+			// under the process working directory, exactly as a plain open
+			// would; any concrete failure (permission, ...) is reported by the
+			// caller, never relabeled as a link fault.
+			return "", nil, false
+		}
+		cur = parent
+	}
 }
 
 // decode parses data as the public registry format. The root must be a JSON
